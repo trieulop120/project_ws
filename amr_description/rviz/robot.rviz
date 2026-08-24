@@ -1,0 +1,73 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /RobotModel1
+    Tree Height: 600
+
+Visualization Manager:
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Reference Frame: base_link
+      Value: true
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Description Source: Parameter
+      Description Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Enabled: true
+      Visual Enabled: true
+      Collision Enabled: false
+      Links:
+        All Links Enabled: true
+        Expand Tree: false
+        base_link:
+          Value: true
+        base_footprint:
+          Value: true
+        base_lift_link:
+          Value: true
+        encoder_lift_link:
+          Value: true
+        left_fork_link:
+          Value: true
+        right_fork_link:
+          Value: true
+        camera_link:
+          Value: true
+        lidar_link:
+          Value: true
+        imu_link:
+          Value: true
+        front_encoder_wheel_left_link:
+          Value: true
+        front_encoder_wheel_right_link:
+          Value: true
+        rear_caster_steer_left_link:
+          Value: true
+        rear_caster_wheel_left_link:
+          Value: true
+        rear_caster_steer_right_link:
+          Value: true
+        rear_caster_wheel_right_link:
+          Value: true
+  Global Options:
+    Fixed Frame: base_link
+    Background Color: 48 48 48
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Target Frame: base_link
+      Distance: 1.5
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.2
+      Value: Orbit (rviz)
