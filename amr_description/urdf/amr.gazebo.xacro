@@ -21,14 +21,37 @@
 
   <gazebo reference="front_encoder_wheel_left_link">
     <material>Gazebo/Black</material>
-    <mu1>1.0</mu1>
-    <mu2>1.0</mu2>
+    <mu1>0.8</mu1>
+    <mu2>0.8</mu2>
+    <kp>1e8</kp>
+    <kd>100</kd>
   </gazebo>
 
   <gazebo reference="front_encoder_wheel_right_link">
     <material>Gazebo/Black</material>
-    <mu1>1.0</mu1>
-    <mu2>1.0</mu2>
+    <mu1>0.8</mu1>
+    <mu2>0.8</mu2>
+    <kp>1e8</kp>
+    <kd>100</kd>
+  </gazebo>
+
+  <!-- ============================================================ -->
+  <!-- CASTER WHEEL FRICTION (low friction for free rolling)        -->
+  <!-- ============================================================ -->
+  <gazebo reference="rear_caster_wheel_left_link">
+    <material>Gazebo/Grey</material>
+    <mu1>0.3</mu1>
+    <mu2>0.3</mu2>
+    <kp>1e6</kp>
+    <kd>10</kd>
+  </gazebo>
+
+  <gazebo reference="rear_caster_wheel_right_link">
+    <material>Gazebo/Grey</material>
+    <mu1>0.3</mu1>
+    <mu2>0.3</mu2>
+    <kp>1e6</kp>
+    <kd>10</kd>
   </gazebo>
 
   <!-- ============================================================ -->
@@ -37,7 +60,7 @@
   <gazebo reference="lidar_link">
     <sensor type="ray" name="lidar_sensor">
       <pose>0 0 0 0 0 0</pose>
-      <visualize>true</visualize>
+      <visualize>false</visualize>
       <update_rate>10</update_rate>
       <ray>
         <scan>
