@@ -1,0 +1,161 @@
+<?xml version="1.0"?>
+<!--
+  AMR Gazebo Configuration
+  Sensors: Sllidar A1M8, Astra RGB Camera
+-->
+<robot name="amr" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ============================================================ -->
+  <!-- INCLUDE BASE URDF (from SolidWorks export)                   -->
+  <!-- ============================================================ -->
+  <xacro:include filename="completed_amr.urdf"/>
+
+  <!-- ============================================================ -->
+  <!-- PHYSICAL PROPERTIES                                         -->
+  <!-- ============================================================ -->
+  <gazebo reference="base_link">
+    <material>Gazebo/Grey</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+  </gazebo>
+
+  <gazebo reference="front_encoder_wheel_left_link">
+    <material>Gazebo/Black</material>
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+
+  <gazebo reference="front_encoder_wheel_right_link">
+    <material>Gazebo/Black</material>
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+
+  <!-- ============================================================ -->
+  <!-- LIDAR SENSOR (Sllidar A1M8 simulation)                       -->
+  <!-- ============================================================ -->
+  <gazebo reference="lidar_link">
+    <sensor type="ray" name="lidar_sensor">
+      <pose>0 0 0 0 0 0</pose>
+      <visualize>true</visualize>
+      <update_rate>10</update_rate>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>720</samples>
+            <resolution>1</resolution>
+            <min_angle>-3.14159265</min_angle>
+            <max_angle>3.14159265</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.12</min>
+          <max>12.0</max>
+          <resolution>0.01</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </ray>
+      <plugin filename="libgazebo_ros_ray_sensor.so" name="gazebo_ros_lidar">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>~/out:=scan</remapping>
+        </ros>
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>lidar_link</frame_name>
+        <updateRate>10</updateRate>
+        <min_range>0.12</min_range>
+        <max_range>12.0</max_range>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- ============================================================ -->
+  <!-- ASTRA RGB CAMERA (visualize + image for RViz)               -->
+  <!-- ============================================================ -->
+  <gazebo reference="camera_link">
+    <sensor type="camera" name="rgb_camera">
+      <always_on>true</always_on>
+      <visualize>true</visualize>
+      <update_rate>30</update_rate>
+      <camera name="rgb">
+        <horizontal_fov>1.22</horizontal_fov>
+        <image>
+          <width>640</width>
+          <height>480</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.1</near>
+          <far>10.0</far>
+        </clip>
+      </camera>
+      <plugin filename="libgazebo_ros_camera.so" name="gazebo_ros_rgb_camera">
+        <ros>
+          <namespace>/camera</namespace>
+          <remapping>image_raw:=color/image_raw</remapping>
+          <remapping>camera_info:=color/camera_info</remapping>
+        </ros>
+        <camera_name>color</camera_name>
+        <frame_name>camera_link</frame_name>
+        <hack_baseline>0.07</hack_baseline>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- ============================================================ -->
+  <!-- ASTRA DEPTH CAMERA (for RViz only, no Gazebo visualization) -->
+  <!-- ============================================================ -->
+  <gazebo reference="camera_link">
+    <sensor type="depth" name="depth_camera">
+      <always_on>true</always_on>
+      <visualize>false</visualize>
+      <update_rate>30</update_rate>
+      <camera name="depth">
+        <horizontal_fov>1.22</horizontal_fov>
+        <clip>
+          <near>0.1</near>
+          <far>10.0</far>
+        </clip>
+      </camera>
+    </sensor>
+  </gazebo>
+
+  <!-- ============================================================ -->
+  <!-- JOINT STATE PUBLISHER (publishes all joints including lift) -->
+  <!-- ============================================================ -->
+  <gazebo>
+    <plugin name="gazebo_ros_joint_state_publisher" filename="libgazebo_ros_joint_state_publisher.so">
+      <ros>
+        <namespace>/</namespace>
+        <remapping>~/out:=joint_states</remapping>
+      </ros>
+      <update_rate>50</update_rate>
+      <joint_name>encoder_lift_joint</joint_name>
+      <joint_name>base_lift_joint</joint_name>
+      <joint_name>front_encoder_wheel_left_joint</joint_name>
+      <joint_name>front_encoder_wheel_right_joint</joint_name>
+      <joint_name>rear_caster_stear_left_joint</joint_name>
+      <joint_name>rear_caster_stear_right_joint</joint_name>
+      <joint_name>rear_caster_wheel_left_joint</joint_name>
+      <joint_name>rear_caster_wheel_right_joint</joint_name>
+    </plugin>
+  </gazebo>
+
+  <!-- ============================================================ -->
+  <!-- LIFT JOINT CONTROL (position control for encoder_lift_joint) -->
+  <!-- ============================================================ -->
+  <gazebo>
+    <plugin name="gazebo_ros_joint_pose_trajectory" filename="libgazebo_ros_joint_pose_trajectory.so">
+      <ros>
+        <namespace>/sim</namespace>
+        <remapping>set_joint_trajectory:=lift_trajectory</remapping>
+      </ros>
+      <update_rate>50</update_rate>
+    </plugin>
+  </gazebo>
+
+</robot>
