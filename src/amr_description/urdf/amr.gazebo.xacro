@@ -1,34 +1,95 @@
 <?xml version="1.0"?>
 <!--
-  AMR Gazebo Configuration
-  Sensors: Sllidar A1M8, Astra RGB Camera
+  AMR Gazebo Classic Configuration
+  Sensors Sllidar A1M8, Astra RGB Camera
 -->
 <robot name="amr" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
   <!-- ============================================================ -->
   <!-- INCLUDE BASE URDF (from SolidWorks export)                   -->
   <!-- ============================================================ -->
-  <xacro:include filename="completed_amr.urdf"/>
+  <xacro:include filename="$(find amr_description)/urdf/amr_description.urdf"/>
 
-  <!-- ============================================================ -->
-  <!-- PHYSICAL PROPERTIES                                         -->
-  <!-- ============================================================ -->
+  <!-- PHYSICAL PROPERTIES -->
   <gazebo reference="base_link">
     <material>Gazebo/Grey</material>
     <mu1>0.2</mu1>
     <mu2>0.2</mu2>
   </gazebo>
 
+  <!-- DRIVE WHEELS high friction -->
   <gazebo reference="front_encoder_wheel_left_link">
     <material>Gazebo/Black</material>
     <mu1>1.0</mu1>
     <mu2>1.0</mu2>
+    <kp>1e8</kp>
+    <kd>100</kd>
+    <fdir1>1 0 0</fdir1>
   </gazebo>
 
   <gazebo reference="front_encoder_wheel_right_link">
     <material>Gazebo/Black</material>
     <mu1>1.0</mu1>
     <mu2>1.0</mu2>
+    <kp>1e8</kp>
+    <kd>100</kd>
+    <fdir1>1 0 0</fdir1>
+  </gazebo>
+
+  <!-- CASTER JOINTS passive free rotation -->
+  <gazebo reference="rear_caster_stear_left_link">
+    <material>Gazebo/Grey</material>
+    <mu1>0.2</mu1>      <!-- PVC cứng, dễ xoay -->
+    <mu2>0.2</mu2>
+  </gazebo>
+
+  <gazebo reference="rear_caster_stear_right_link">
+    <material>Gazebo/Grey</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+  </gazebo>
+
+  <gazebo reference="rear_caster_wheel_left_link">
+    <material>Gazebo/Black</material>
+    <mu1>0.5</mu1>
+    <mu2>0.5</mu2>
+  </gazebo>
+
+  <gazebo reference="rear_caster_wheel_right_link">
+    <material>Gazebo/Black</material>
+    <mu1>0.5</mu1>
+    <mu2>0.5</mu2>
+  </gazebo>
+
+  <!-- LIFT LINKS -->
+  <gazebo reference="base_lift_link">
+    <material>Gazebo/Grey</material>
+  </gazebo>
+
+  <gazebo reference="encoder_lift_link">
+    <material>Gazebo/White</material>
+  </gazebo>
+
+  <gazebo reference="left_fork_link">
+    <material>Gazebo/Grey</material>
+  </gazebo>
+
+  <gazebo reference="right_fork_link">
+    <material>Gazebo/Grey</material>
+  </gazebo>
+
+  <!-- LIDAR black -->
+  <gazebo reference="lidar_link">
+    <material>Gazebo/Black</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
+  </gazebo>
+
+  <!-- CAMERA black -->
+  <gazebo reference="camera_link">
+    <material>Gazebo/Black</material>
+    <mu1>0.2</mu1>
+    <mu2>0.2</mu2>
   </gazebo>
 
   <!-- ============================================================ -->
@@ -37,7 +98,7 @@
   <gazebo reference="lidar_link">
     <sensor type="ray" name="lidar_sensor">
       <pose>0 0 0 0 0 0</pose>
-      <visualize>true</visualize>
+      <visualize>false</visualize>
       <update_rate>10</update_rate>
       <ray>
         <scan>
@@ -74,7 +135,7 @@
   </gazebo>
 
   <!-- ============================================================ -->
-  <!-- ASTRA RGB CAMERA (visualize + image for RViz)               -->
+  <!-- ASTRA RGB CAMERA (visualize + image for RViz)                -->
   <!-- ============================================================ -->
   <gazebo reference="camera_link">
     <sensor type="camera" name="rgb_camera">
@@ -125,6 +186,39 @@
   </gazebo>
 
   <!-- ============================================================ -->
+  <!-- DIFFERENTIAL DRIVE PLUGIN (for teleop_twist_keyboard)        -->
+  <!-- ============================================================ -->
+  <gazebo>
+    <plugin name="gazebo_ros_diff_drive" filename="libgazebo_ros_diff_drive.so">
+      <ros>
+        <namespace>/</namespace>
+        <remapping>cmd_vel:=/diff_drive/cmd_vel</remapping>
+        <remapping>odom:=odom</remapping>
+      </ros>
+
+      <!-- Drive wheels (front encoder wheels) -->
+      <left_joint>front_encoder_wheel_left_joint</left_joint>
+      <right_joint>front_encoder_wheel_right_joint</right_joint>
+
+      <!-- Kinematics (from URDF separation = 0.24142 + 0.23078 = 0.4722m) -->
+      <wheel_separation>0.472</wheel_separation>
+      <wheel_diameter>0.076</wheel_diameter>
+
+      <!-- Limits -->
+      <max_wheel_torque>20</max_wheel_torque>
+      <max_wheel_acceleration>1.0</max_wheel_acceleration>
+
+      <!-- Output -->
+      <publish_odom>true</publish_odom>
+      <publish_odom_tf>true</publish_odom_tf>
+      <publish_wheel_tf>true</publish_wheel_tf>
+
+      <odometry_frame>odom</odometry_frame>
+      <robot_base_frame>base_link</robot_base_frame>
+    </plugin>
+  </gazebo>
+
+  <!-- ============================================================ -->
   <!-- JOINT STATE PUBLISHER (publishes all joints including lift) -->
   <!-- ============================================================ -->
   <gazebo>
@@ -135,7 +229,6 @@
       </ros>
       <update_rate>50</update_rate>
       <joint_name>encoder_lift_joint</joint_name>
-      <joint_name>base_lift_joint</joint_name>
       <joint_name>front_encoder_wheel_left_joint</joint_name>
       <joint_name>front_encoder_wheel_right_joint</joint_name>
       <joint_name>rear_caster_stear_left_joint</joint_name>
@@ -146,15 +239,27 @@
   </gazebo>
 
   <!-- ============================================================ -->
-  <!-- LIFT JOINT CONTROL (position control for encoder_lift_joint) -->
+  <!-- ROS2 CONTROL (Fix đúng chuẩn cho Gazebo Classic)             -->
   <!-- ============================================================ -->
+  <ros2_control name="amr_system" type="system">
+    <hardware>
+      <plugin>gazebo_ros2_control/GazeboSystem</plugin>
+    </hardware>
+
+    <!-- Lift Joint -->
+    <joint name="encoder_lift_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+  </ros2_control>
+
+  <!-- Gazebo Classic ROS2 Control Plugin -->
   <gazebo>
-    <plugin name="gazebo_ros_joint_pose_trajectory" filename="libgazebo_ros_joint_pose_trajectory.so">
-      <ros>
-        <namespace>/sim</namespace>
-        <remapping>set_joint_trajectory:=lift_trajectory</remapping>
-      </ros>
-      <update_rate>50</update_rate>
+    <plugin filename="libgazebo_ros2_control.so" name="gazebo_ros2_control">
+      <parameters>$(find amr_description)/config/lift_controller.yaml</parameters>
+      <robot_param>robot_description</robot_param>
+      <robot_param_node>robot_state_publisher</robot_param_node>
     </plugin>
   </gazebo>
 
