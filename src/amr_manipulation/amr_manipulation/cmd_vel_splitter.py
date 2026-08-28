@@ -22,7 +22,7 @@ class CmdVelSplitter(Node):
         # Parameters
         self.declare_parameter('lift_min', 0.0)
         self.declare_parameter('lift_max', 0.87)
-        self.declare_parameter('lift_speed', 0.05)  # m/step
+        self.declare_parameter('lift_speed', 0.04)  # m/step
 
         self.lift_min = self.get_parameter('lift_min').value
         self.lift_max = self.get_parameter('lift_max').value
