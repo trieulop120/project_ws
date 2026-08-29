@@ -37,13 +37,13 @@
   </gazebo>
 
   <!-- CASTER JOINTS passive free rotation -->
-  <gazebo reference="rear_caster_stear_left_link">
+  <gazebo reference="rear_caster_steer_left_link">
     <material>Gazebo/Grey</material>
     <mu1>0.2</mu1>      <!-- PVC cứng, dễ xoay -->
     <mu2>0.2</mu2>
   </gazebo>
 
-  <gazebo reference="rear_caster_stear_right_link">
+  <gazebo reference="rear_caster_steer_right_link">
     <material>Gazebo/Grey</material>
     <mu1>0.2</mu1>
     <mu2>0.2</mu2>
@@ -53,12 +53,18 @@
     <material>Gazebo/Black</material>
     <mu1>0.5</mu1>
     <mu2>0.5</mu2>
+    <kp>1e8</kp>
+    <kd>100</kd>
+    <fdir1>1 0 0</fdir1>
   </gazebo>
 
   <gazebo reference="rear_caster_wheel_right_link">
     <material>Gazebo/Black</material>
     <mu1>0.5</mu1>
     <mu2>0.5</mu2>
+    <kp>1e8</kp>
+    <kd>100</kd>
+    <fdir1>1 0 0</fdir1>
   </gazebo>
 
   <!-- LIFT LINKS -->
@@ -202,10 +208,10 @@
 
       <!-- Kinematics (from URDF separation = 0.24142 + 0.23078 = 0.4722m) -->
       <wheel_separation>0.472</wheel_separation>
-      <wheel_diameter>0.076</wheel_diameter>
+      <wheel_diameter>0.068</wheel_diameter>
 
       <!-- Limits -->
-      <max_wheel_torque>20</max_wheel_torque>
+      <max_wheel_torque>0.863</max_wheel_torque>
       <max_wheel_acceleration>1.0</max_wheel_acceleration>
 
       <!-- Output -->
@@ -231,8 +237,8 @@
       <joint_name>encoder_lift_joint</joint_name>
       <joint_name>front_encoder_wheel_left_joint</joint_name>
       <joint_name>front_encoder_wheel_right_joint</joint_name>
-      <joint_name>rear_caster_stear_left_joint</joint_name>
-      <joint_name>rear_caster_stear_right_joint</joint_name>
+      <joint_name>rear_caster_steer_left_joint</joint_name>
+      <joint_name>rear_caster_steer_right_joint</joint_name>
       <joint_name>rear_caster_wheel_left_joint</joint_name>
       <joint_name>rear_caster_wheel_right_joint</joint_name>
     </plugin>
