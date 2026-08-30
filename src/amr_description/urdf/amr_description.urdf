@@ -8,17 +8,17 @@
     name="base_link">
     <inertial>
       <origin
-        xyz="-0.0493668305933598 0.00544542255161407 0.219815048140839"
+        xyz="0.019114 0.00012696 0.22282"
         rpy="0 0 0" />
       <mass
-        value="4.30533644141521" />
+        value="4.3053" />
       <inertia
-        ixx="0.0579387059929739"
-        ixy="-1.64805304215128E-05"
-        ixz="-7.02612791029598E-07"
-        iyy="0.0392493362755053"
-        iyz="-4.47012107475682E-09"
-        izz="0.0613122679080867" />
+        ixx="0.057939"
+        ixy="-1.6481E-05"
+        ixz="-7.0261E-07"
+        iyy="0.039249"
+        iyz="-4.4701E-09"
+        izz="0.061312" />
     </inertial>
     <visual>
       <origin
@@ -31,7 +31,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -48,17 +48,17 @@
     name="front_encoder_wheel_right_link">
     <inertial>
       <origin
-        xyz="-1.5143569811471E-06 0.000291802762061089 3.65184543704711E-06"
+        xyz="-1.5144E-06 0.0002918 3.6518E-06"
         rpy="0 0 0" />
       <mass
-        value="0.0241340978121404" />
+        value="0.024134" />
       <inertia
-        ixx="7.26641531195306E-06"
-        ixy="3.41275586124443E-10"
-        ixz="-1.51211062924361E-10"
-        iyy="1.40693972871797E-05"
-        iyz="-8.22977526213836E-10"
-        izz="7.26671725550849E-06" />
+        ixx="7.2664E-06"
+        ixy="3.4128E-10"
+        ixz="-1.5121E-10"
+        iyy="1.4069E-05"
+        iyz="-8.2298E-10"
+        izz="7.2667E-06" />
     </inertial>
     <visual>
       <origin
@@ -71,7 +71,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -88,7 +88,7 @@
     name="front_encoder_wheel_right_joint"
     type="continuous">
     <origin
-      xyz="0.074022 -0.23078 -0.063003"
+      xyz="0.1425 -0.2361 -0.060003"
       rpy="0 0 0" />
     <parent
       link="base_link" />
@@ -96,28 +96,28 @@
       link="front_encoder_wheel_right_link" />
     <axis
       xyz="0 1 0" />
-     <limit
-        effort="0.863"
-        velocity="11.52"/>
+    <limit
+      effort="0.863"
+      velocity="11.52" />
     <dynamics
-        damping="0.05"
-        friction="0.01"/>
+      damping="0.05"
+      friction="0.01" />
   </joint>
   <link
     name="front_encoder_wheel_left_link">
     <inertial>
       <origin
-        xyz="1.52189831637006E-06 -0.000291802762072635 3.95338492353847E-06"
+        xyz="1.5219E-06 -0.0002918 3.9534E-06"
         rpy="0 0 0" />
       <mass
-        value="0.0241340978121404" />
+        value="0.024134" />
       <inertia
-        ixx="7.26635260812801E-06"
-        ixy="5.09680228316527E-15"
-        ixz="8.50587600740086E-17"
-        iyy="1.40693972871796E-05"
-        iyz="8.90932676736045E-10"
-        izz="7.26677995933354E-06" />
+        ixx="7.2664E-06"
+        ixy="5.0968E-15"
+        ixz="8.5059E-17"
+        iyy="1.4069E-05"
+        iyz="8.9093E-10"
+        izz="7.2668E-06" />
     </inertial>
     <visual>
       <origin
@@ -130,7 +130,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -147,7 +147,7 @@
     name="front_encoder_wheel_left_joint"
     type="continuous">
     <origin
-      xyz="0.074022 0.24142 -0.063003"
+      xyz="0.1425 0.2361 -0.060003"
       rpy="0 0 0" />
     <parent
       link="base_link" />
@@ -155,28 +155,28 @@
       link="front_encoder_wheel_left_link" />
     <axis
       xyz="0 1 0" />
-     <limit
-        effort="0.863"
-        velocity="11.52"/>
+    <limit
+      effort="0.863"
+      velocity="11.52" />
     <dynamics
-        damping="0.05"
-        friction="0.01"/>
+      damping="0.05"
+      friction="0.01" />
   </joint>
   <link
     name="rear_caster_steer_right_link">
     <inertial>
       <origin
-        xyz="0.00382120079766524 0.00010358863860227 -0.00603582950339376"
+        xyz="0.0038212 0.00010359 -0.0060358"
         rpy="0 0 0" />
       <mass
-        value="0.0179822997869202" />
+        value="0.017982" />
       <inertia
-        ixx="4.18749926705572E-06"
-        ixy="-3.02767091684347E-10"
-        ixz="4.84287605171218E-07"
-        iyy="4.68482447814291E-06"
-        iyz="1.99656560760833E-09"
-        izz="6.79107503547105E-06" />
+        ixx="4.1875E-06"
+        ixy="-3.0277E-10"
+        ixz="4.8429E-07"
+        iyy="4.6848E-06"
+        iyz="1.9966E-09"
+        izz="6.7911E-06" />
     </inertial>
     <visual>
       <origin
@@ -189,7 +189,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -206,7 +206,7 @@
     name="rear_caster_steer_right_joint"
     type="continuous">
     <origin
-      xyz="-0.20168 -0.18778 -0.030503"
+      xyz="-0.1332 -0.1931 -0.027503"
       rpy="0 0 0" />
     <parent
       link="base_link" />
@@ -214,25 +214,25 @@
       link="rear_caster_steer_right_link" />
     <axis
       xyz="0 0 1" />
-     <dynamics
-        damping="0.1"
-        friction="0.02"/>
+    <dynamics
+      damping="0.1"
+      friction="0.02" />
   </joint>
   <link
     name="rear_caster_wheel_right_link">
     <inertial>
       <origin
-        xyz="0 -1.99840144432528E-15 1.64313007644523E-14"
+        xyz="0 -1.7764E-15 1.6431E-14"
         rpy="0 0 0" />
       <mass
-        value="0.0294337031863833" />
+        value="0.029434" />
       <inertia
-        ixx="6.27589286634442E-06"
-        ixy="-2.10026327406002E-23"
-        ixz="-1.12916732115284E-21"
-        iyy="1.05574890455602E-05"
-        iyz="1.48392532350894E-20"
-        izz="6.27589286634442E-06" />
+        ixx="6.2759E-06"
+        ixy="-1.454E-23"
+        ixz="-1.1292E-21"
+        iyy="1.0557E-05"
+        iyz="1.4839E-20"
+        izz="6.2759E-06" />
     </inertial>
     <visual>
       <origin
@@ -245,7 +245,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -270,25 +270,25 @@
       link="rear_caster_wheel_right_link" />
     <axis
       xyz="0 1 0" />
-     <dynamics
-        damping="0.02"
-        friction="0.01"/>
+    <dynamics
+      damping="0.02"
+      friction="0.01" />
   </joint>
   <link
     name="rear_caster_steer_left_link">
     <inertial>
       <origin
-        xyz="0.00255890188730934 2.44356758560826E-06 -0.0026361162225399"
+        xyz="0.0025589 2.4436E-06 -0.0026361"
         rpy="0 0 0" />
       <mass
-        value="0.0164104146999673" />
+        value="0.01641" />
       <inertia
-        ixx="3.93853927568399E-06"
-        ixy="-2.97813533044572E-10"
-        ixz="4.84284589300158E-07"
-        iyy="4.67113100673414E-06"
-        iyz="1.98182917096098E-09"
-        izz="6.54211428670474E-06" />
+        ixx="3.9385E-06"
+        ixy="-2.9781E-10"
+        ixz="4.8428E-07"
+        iyy="4.6711E-06"
+        iyz="1.9818E-09"
+        izz="6.5421E-06" />
     </inertial>
     <visual>
       <origin
@@ -301,7 +301,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -318,7 +318,7 @@
     name="rear_caster_steer_left_joint"
     type="continuous">
     <origin
-      xyz="-0.20168 0.19842 -0.030503"
+      xyz="-0.1332 0.1931 -0.027503"
       rpy="0 0 0" />
     <parent
       link="base_link" />
@@ -326,25 +326,25 @@
       link="rear_caster_steer_left_link" />
     <axis
       xyz="0 0 1" />
-     <dynamics
-        damping="0.1"
-        friction="0.02"/>
+    <dynamics
+      damping="0.1"
+      friction="0.02" />
   </joint>
   <link
     name="rear_caster_wheel_left_link">
     <inertial>
       <origin
-        xyz="-1.11022302462516E-16 -2.22044604925031E-16 9.84780718638056E-05"
+        xyz="-2.2204E-16 0 9.8478E-05"
         rpy="0 0 0" />
       <mass
-        value="0.0294337031863833" />
+        value="0.029434" />
       <inertia
-        ixx="6.27589286634442E-06"
-        ixy="-1.29246970711371E-23"
-        ixz="-1.12916732115284E-21"
-        iyy="1.05574890455602E-05"
-        iyz="1.48101726666793E-20"
-        izz="6.27589286634442E-06" />
+        ixx="6.2759E-06"
+        ixy="-2.1003E-23"
+        ixz="-1.1292E-21"
+        iyy="1.0557E-05"
+        iyz="1.482E-20"
+        izz="6.2759E-06" />
     </inertial>
     <visual>
       <origin
@@ -357,7 +357,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -382,25 +382,25 @@
       link="rear_caster_wheel_left_link" />
     <axis
       xyz="0 1 0" />
-     <dynamics
-        damping="0.02"
-        friction="0.01"/>
+    <dynamics
+      damping="0.02"
+      friction="0.01" />
   </joint>
   <link
     name="imu_link">
     <inertial>
       <origin
-        xyz="-0.0686496424832543 0.00526593693599753 -0.00149999999999972"
+        xyz="-0.06865 0.0052659 -0.0015"
         rpy="0 0 0" />
       <mass
-        value="0.433591677658542" />
+        value="0.43359" />
       <inertia
-        ixx="0.00663395475276422"
-        ixy="-3.21713416352371E-07"
-        ixz="4.43764634417186E-21"
-        iyy="0.00397002543889303"
-        iyz="-4.12153982807415E-17"
-        izz="0.0106033298041408" />
+        ixx="0.006634"
+        ixy="-3.2171E-07"
+        ixz="4.5571E-21"
+        iyy="0.00397"
+        iyz="-4.1215E-17"
+        izz="0.010603" />
     </inertial>
     <visual>
       <origin
@@ -413,7 +413,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -430,7 +430,7 @@
     name="imu_joint"
     type="fixed">
     <origin
-      xyz="0 0 0"
+      xyz="0.068481 -0.0053185 0.003"
       rpy="0 0 0" />
     <parent
       link="base_link" />
@@ -443,17 +443,17 @@
     name="camera_link">
     <inertial>
       <origin
-        xyz="-0.0192480956479566 -9.81672015742951E-06 -6.24371804174295E-05"
+        xyz="-0.019248 -9.8167E-06 -6.2437E-05"
         rpy="0 0 0" />
       <mass
-        value="0.183480710290439" />
+        value="0.18348" />
       <inertia
-        ixx="0.000397638008280792"
-        ixy="3.36943171969184E-08"
-        ixz="2.72026743740447E-07"
-        iyy="3.70982336711151E-05"
-        iyz="1.12651705942679E-10"
-        izz="0.000407441878851077" />
+        ixx="0.00039764"
+        ixy="3.3694E-08"
+        ixz="2.7203E-07"
+        iyy="3.7098E-05"
+        iyz="1.1265E-10"
+        izz="0.00040744" />
     </inertial>
     <visual>
       <origin
@@ -466,7 +466,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -483,7 +483,7 @@
     name="camera_joint"
     type="fixed">
     <origin
-      xyz="0.10152 0.014743 0.59519"
+      xyz="0.17 0.0094248 0.59819"
       rpy="0 0 0" />
     <parent
       link="base_link" />
@@ -496,17 +496,17 @@
     name="lidar_link">
     <inertial>
       <origin
-        xyz="0.0052982992774806 0.00901279560442636 -0.00730078478703267"
+        xyz="0.0052983 0.0090128 -0.0073008"
         rpy="0 0 0" />
       <mass
-        value="0.141654473640087" />
+        value="0.14165" />
       <inertia
-        ixx="5.69097097753613E-05"
-        ixy="-2.87900344418162E-07"
-        ixz="1.24753616532653E-05"
-        iyy="8.93215448552515E-05"
-        iyz="-7.21857208026184E-07"
-        izz="0.000108702097721124" />
+        ixx="5.691E-05"
+        ixy="-2.879E-07"
+        ixz="1.2475E-05"
+        iyy="8.9322E-05"
+        iyz="-7.2186E-07"
+        izz="0.0001087" />
     </inertial>
     <visual>
       <origin
@@ -519,7 +519,7 @@
       <material
         name="">
         <color
-          rgba="0.211764705882353 0.211764705882353 0.203921568627451 1" />
+          rgba="0.21176 0.21176 0.20392 1" />
       </material>
     </visual>
     <collision>
@@ -536,7 +536,7 @@
     name="lidar_joint"
     type="fixed">
     <origin
-      xyz="-0.024802 -0.0038905 0.12806"
+      xyz="0.043679 -0.0092089 0.13106"
       rpy="0 0 0" />
     <parent
       link="base_link" />
@@ -549,17 +549,17 @@
     name="base_lift_link">
     <inertial>
       <origin
-        xyz="-0.00315733666983653 -0.000196848231616364 0.525699968711969"
+        xyz="-0.0031573 -0.00019685 0.5257"
         rpy="0 0 0" />
       <mass
-        value="0.326486799501112" />
+        value="0.32649" />
       <inertia
-        ixx="0.0178628092131955"
-        ixy="-1.39160213516857E-10"
-        ixz="1.73335666896295E-07"
-        iyy="0.0178571462647245"
-        iyz="1.3046672640489E-08"
-        izz="3.20902618179627E-05" />
+        ixx="0.017863"
+        ixy="-1.3916E-10"
+        ixz="1.7334E-07"
+        iyy="0.017857"
+        iyz="1.3047E-08"
+        izz="3.209E-05" />
     </inertial>
     <visual>
       <origin
@@ -572,7 +572,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -589,7 +589,7 @@
     name="base_lift_joint"
     type="fixed">
     <origin
-      xyz="0.12352 0.0055154 0.017997"
+      xyz="0.192 0.00019696 0.020997"
       rpy="0 0 0" />
     <parent
       link="base_link" />
@@ -602,17 +602,17 @@
     name="encoder_lift_link">
     <inertial>
       <origin
-        xyz="0.00336424687340886 -0.000198748258684933 0.123622115296924"
+        xyz="0.0033642 -0.00019875 0.12362"
         rpy="0 0 0" />
       <mass
-        value="0.357360840342875" />
+        value="0.35736" />
       <inertia
-        ixx="0.000279600646971789"
-        ixy="-7.63669360244903E-08"
-        ixz="7.79788582324602E-09"
-        iyy="4.96986291894178E-05"
-        iyz="-3.24165845306426E-10"
-        izz="0.00026477119016549" />
+        ixx="0.0002796"
+        ixy="-7.6367E-08"
+        ixz="7.7979E-09"
+        iyy="4.9699E-05"
+        iyz="-3.2417E-10"
+        izz="0.00026477" />
     </inertial>
     <visual>
       <origin
@@ -625,7 +625,7 @@
       <material
         name="">
         <color
-          rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+          rgba="0.89804 0.91765 0.92941 1" />
       </material>
     </visual>
     <collision>
@@ -652,7 +652,7 @@
       xyz="0 0 1" />
     <limit
       lower="-0.04"
-      upper="0.85"
+      upper="0.8"
       effort="50"
       velocity="0.1" />
   </joint>
@@ -660,17 +660,17 @@
     name="left_fork_link">
     <inertial>
       <origin
-        xyz="-0.0398443853546764 -0.00131744864111871 0.0592702583716915"
+        xyz="-0.039844 -0.0013174 0.05927"
         rpy="0 0 0" />
       <mass
-        value="0.0680578875808647" />
+        value="0.068058" />
       <inertia
-        ixx="0.000408993938679969"
-        ixy="-3.29322597361116E-08"
-        ixz="0.00022638974153021"
-        iyy="0.000774049928629425"
-        iyz="-2.93209835930285E-08"
-        izz="0.000374935431901761" />
+        ixx="0.00040899"
+        ixy="-3.2932E-08"
+        ixz="0.00022639"
+        iyy="0.00077405"
+        iyz="-2.9321E-08"
+        izz="0.00037494" />
     </inertial>
     <visual>
       <origin
@@ -683,7 +683,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -713,17 +713,17 @@
     name="right_fork_link">
     <inertial>
       <origin
-        xyz="-0.039844385354656 0.000133846295693463 0.0592702583716592"
+        xyz="-0.039844 0.00013385 0.05927"
         rpy="0 0 0" />
       <mass
-        value="0.0680578875808845" />
+        value="0.068058" />
       <inertia
-        ixx="0.000408993938679999"
-        ixy="-3.29322597245401E-08"
-        ixz="0.000226389741530237"
-        iyy="0.000774049928629537"
-        iyz="-2.93209836027394E-08"
-        izz="0.000374935431901846" />
+        ixx="0.00040899"
+        ixy="-3.2932E-08"
+        ixz="0.00022639"
+        iyy="0.00077405"
+        iyz="-2.9321E-08"
+        izz="0.00037494" />
     </inertial>
     <visual>
       <origin
@@ -736,7 +736,7 @@
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
