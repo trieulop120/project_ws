@@ -1,0 +1,5 @@
+#!/bin/bash
+# Wrapper script to run scan_fusion_node.py
+# This script ensures the Python node runs correctly
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec /usr/bin/python3 "${SCRIPT_DIR}/scan_fusion_node.py" "$@"
