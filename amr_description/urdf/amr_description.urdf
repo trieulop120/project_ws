@@ -598,12 +598,12 @@
         rpy="0 0 0" />
       <mass value="0.8" />
       <inertia
-        ixx="0.002"
+        ixx="0.005"
         ixy="0.0"
         ixz="0.0"
-        iyy="0.002"
+        iyy="0.005"
         iyz="0.0"
-        izz="0.002" />
+        izz="0.005" />
     </inertial>
     <visual>
       <origin
@@ -642,11 +642,11 @@
     <axis
       xyz="0 0 1" />
     <limit
-      lower="0.01"
+      lower="0.001"
       upper="0.8"
-      effort="50"
-      velocity="0.1" />
-    <dynamics damping="10.0" friction="1.0" />
+      effort="100"
+      velocity="0.2" />
+    <dynamics damping="20.0" friction="2.0"/>
   </joint>
   <link
     name="left_fork_link">

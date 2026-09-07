@@ -19,7 +19,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     pkg_mapping = get_package_share_directory('amr_mapping')
-    config_file = os.path.join(pkg_mapping, 'config', 'slam.yaml')
+    config_file = os.path.join(pkg_mapping, 'config', 'mapper_params_online_async.yaml')
 
     slam_node = Node(
         package='slam_toolbox',

@@ -16,3 +16,8 @@ lift_controller:
   ros__parameters:
     joints:
       - encoder_lift_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity

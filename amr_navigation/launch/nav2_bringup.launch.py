@@ -159,7 +159,7 @@ def generate_launch_description():
             ekf_config
         ],
         remappings=[
-            ('/odom', '/odom'),
+            ('/odometry/filtered', '/odometry/filtered'),
         ],
     )
 

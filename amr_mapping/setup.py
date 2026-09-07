@@ -11,7 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/config', [
-            'config/slam.yaml',
+            'config/mapper_params_online_async.yaml',
         ]),
         ('share/' + package_name + '/maps', [
             'maps/amr_map.yaml',

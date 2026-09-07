@@ -1,7 +1,7 @@
 """Launch EKF odometry for AMR localization.
 
 Fuses wheel odometry (/odom) with IMU gyro_z (/imu/data).
-Outputs fused odometry to /localization/odom and TF odom -> base_link.
+Outputs fused odometry to /odometry/filtered and TF odom -> base_link.
 """
 
 import os
@@ -21,7 +21,7 @@ def generate_launch_description():
         output='screen',
         parameters=[config_file],
         remappings=[
-            ('/odom', '/odom'),          # From differential drive plugin
+            ('/odometry/filtered', '/odometry/filtered'), # Đẩy output ra /odometry/filtered
             #('/imu/data', '/imu/data'),  # From IMU sensor plugin
         ]
     )

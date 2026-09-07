@@ -47,7 +47,7 @@ def generate_launch_description():
     world_file = os.path.join(pkg_amr_gazebo, 'worlds', 'warehouse.world')
     xacro_file = os.path.join(pkg_amr_desc, 'urdf', 'amr.gazebo.xacro')
     ekf_config = os.path.join(pkg_amr_local, 'config', 'ekf.yaml')
-    slam_config = os.path.join(pkg_amr_mapping, 'config', 'slam.yaml')
+    slam_config = os.path.join(pkg_amr_mapping, 'config', 'mapper_params_online_async.yaml')
     rviz_config = os.path.join(pkg_amr_mapping, 'rviz', 'slam.rviz')
     controller_config = os.path.join(pkg_amr_desc, 'config', 'lift_controller.yaml')
 
