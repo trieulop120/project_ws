@@ -47,8 +47,8 @@ amcl:
     sigma_hit: 0.2
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_d: 0.05     # Giảm xuống 10 cm để cập nhật mịn hơn
-    update_min_a: 0.02    # Giảm góc xoay xuống ~2.8 deg
+    update_min_d: 0.05     
+    update_min_a: 0.02    
     z_hit: 0.5
     z_max: 0.05
     z_rand: 0.5
@@ -68,7 +68,7 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_footprint
     odom_topic: /odometry/filtered
-    bt_loop_duration: 100
+    bt_loop_duration: 50
     default_server_timeout: 20
     wait_for_service_timeout: 1000
     plugin_lib_names:
@@ -131,9 +131,9 @@ bt_navigator_navigate_to_pose_rclcpp_node:
 controller_server:
   ros__parameters:
     use_sim_time: True
-    controller_frequency: 20.0
+    controller_frequency: 10.0
     min_x_velocity_threshold: 0.001
-    min_y_velocity_threshold: 0.5
+    min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugin: "progress_checker"
@@ -142,105 +142,118 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.15
-      movement_time_allowance: 15.0
+      required_movement_radius: 0.15  # TĂNG: 0.10 → 0.15 (ít false stuck)
+      movement_time_allowance: 45.0    # TĂNG: 30 → 45 (thêm thời gian)
 
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.05
-      yaw_goal_tolerance: 0.05
+      xy_goal_tolerance: 0.15     #dont change
+      yaw_goal_tolerance: 0.15    #dont change
 
     FollowPath:
       plugin: nav2_mppi_controller::MPPIController
-      time_steps: 35             # 35 * 0.05s = 1.75s dự báo tầm xa
-      model_dt: 0.05
-      batch_size: 2000
+      time_steps: 40          # PRECISION: shorter lookahead
+      model_dt: 0.1
+      batch_size: 3000       # PRECISION: more samples
 
-      # Mở rộng dải lấy mẫu góc xoay
-      vx_std: 0.2
-      vy_std: 0.0
-      wz_std: 0.5                # Tăng mẫu xoay để MPPI dễ chọn quỹ đạo Pure Spin
+      vx_std: 0.08          # PRECISION: less noise
+      vy_std: 0.15
+      wz_std: 0.25          # PRECISION: less angular noise
 
-      vx_max: 0.4
-      vx_min: -0.1               # Khóa lùi sâu (chỉ cho phép lùi tối đa 10cm/s)
+      vx_max: 0.15          # PRECISION: SLOWER = more accurate
+      vx_min: -0.15
+
       vy_max: 0.0
       vy_min: 0.0
-      wz_max: 1.2                # Tốc độ xoay tối đa ~68 deg/s
+
+      wz_max: 1.0           # PRECISION: slower turning
+      wz_min: -1.0
 
       iteration_count: 1
-      prune_distance: 1.7
-      transform_tolerance: 0.1
-      temperature: 0.3
+      prune_distance: 1.0
+      transform_tolerance: 0.2
+      temperature: 0.2        # PRECISION: less exploration
       gamma: 0.015
       motion_model: "DiffDrive"
-      visualize_trajectory: False
+      checkpoint_trails: 10
+      visualize_trajectory: true
 
       critics: ["ConstraintCritic", "CostCritic", "ObstaclesCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic", "PathAngleCritic", "PreferForwardCritic", "TwirlingCritic"]
-
-      # 1. ÉP BÁM SÁT ĐƯỜNG PATH (Tăng từ 6.0/14.0 lên 20.0)
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0           # TĂNG: 2.5 → 5.0 (more costmap aware)
+        critical_cost: 300.0
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 0.4
+  
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 20.0         # TRỌNG SỐ CAO NHẤT: Bắt buộc robot bám chặt vạch vàng
+        cost_weight: 10.0         # TĂNG: 8.0 → 10.0 (mạnh hơn - xoay theo path)
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 3
         threshold_to_consider: 0.5
-        offset_from_furthest: 20
-        use_path_orientations: true # BẮT BUỘC TRUE: Ép góc quay đầu xe phải xoay theo hướng của Path!
+        offset_from_furthest: 15
+        use_path_orientations: true
 
-      # 2. BÁM TIẾN THEO QUỸ ĐẠO PATH
       PathFollowCritic:
         enabled: true
         cost_power: 1
         cost_weight: 8.0
-        offset_from_furthest: 5
-        threshold_to_consider: 1.4
+        offset_from_furthest: 2
+        threshold_to_consider: 0.6
 
-      # 3. GÓC CUA CỦA PATH
       PathAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0          # Tăng trọng số chỉnh góc cua
+        cost_weight: 2.0
+        max_path_occupancy_ratio: 0.03
+        trajectory_point_step: 4
         offset_from_furthest: 4
         threshold_to_consider: 0.5
-        max_angle_to_furthest: 1.0
-        forward_preference: false # Tắt ưu tiên tiến khi đường path đổi góc vuông
+        max_angle_to_furthest: 1.57
+        forward_preference: false
 
-      # 4. TRIỆT TIÊU PHẠT TIẾN (Cho phép đứng yên xoay tại chỗ)
       PreferForwardCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 0.5          # Giảm xuống 0.5 (triệt tiêu phạt khi vx = 0)
+        cost_weight: 10.0       # TĂNG MẠNH: 3.0 → 10.0 (CHỈ ĐI FORWARD)
         threshold_to_consider: 0.5
 
-      # 5. CHỐNG LẮC VẮN / ÉP XOAY MƯỢT
       TwirlingCritic:
         enabled: true
         twirling_cost_power: 1
-        twirling_cost_weight: 5.0 # Khóa các dao động xoay nhích tiến lùi
+        twirling_cost_weight: 3.0  # GIẢM: 5.0 → 3.0 (cho phép spin để align)
 
       GoalCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
-        threshold_to_consider: 1.4
+        cost_weight: 8.0        # PRECISION: prioritize reaching goal
+        threshold_to_consider: 0.6
+        near_goal_distance: 0.3  # PRECISION: goal behavior earlier
 
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.0
-        threshold_to_consider: 0.15
+        cost_weight: 2.0        # GIẢM: 5.0 → 2.0 (cho phép move trong khi xoay)
+        threshold_to_consider: 0.8  # GIẢM: 1.5 → 0.8 (chỉ effect gần goal)
 
       ObstaclesCritic:
         enabled: true
         cost_power: 1
-        repulsion_weight: 1.2
-        critical_weight: 20.0
-        consider_footprint: true  # Dùng footprint [[0.48, 0.24], ...] chuẩn
-        collision_cost: 10000.0
-        collision_margin_distance: 0.04
-        near_goal_distance: 0.3
+        repulsion_weight: 3.0       # TĂNG: 1.5 → 3.0 (stronger avoidance)
+        critical_weight: 30.0        # TĂNG: 20 → 30 (penalize collision harder)
+        consider_footprint: true
+        collision_cost: 100000.0     # TĂNG: 10000 → 100000 (very expensive collision)
+        collision_margin_distance: 0.15  # TĂNG: 0.1 → 0.15 (bigger safe zone)
+        near_goal_distance: 0.5
 
 local_costmap:
   local_costmap:
@@ -292,8 +305,8 @@ local_costmap:
           #obstacle_min_range: 0.4
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 5.0
-        inflation_radius: 0.45
+        cost_scaling_factor: 6.0    # TĂNG: 5.0 → 6.0
+        inflation_radius: 1.0       # TĂNG: 0.7 → 1.0
 
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
@@ -352,19 +365,33 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.5 
+        cost_scaling_factor: 6.0    # TĂNG: 3.0 → 6.0
+        inflation_radius: 1.0       # TĂNG: 0.8 → 1.0 (vùng cấm rộng hơn)
 
 planner_server:
   ros__parameters:
+    use_sim_time: true
     expected_planner_frequency: 2.0
-    use_sim_time: True
-    planner_plugins: ["GridBased"]
+    planner_plugins: [GridBased]
     GridBased:
-      plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.5
-      use_astar: true
-      allow_unknown: true
+      # Cost-aware grid A* matches the holonomic mecanum base. Hybrid-A* and
+      # state-lattice planners add non-holonomic turning constraints that this
+      # robot does not have.
+      plugin: nav2_smac_planner/SmacPlanner2D
+      tolerance: 0.15
+      downsample_costmap: false
+      downsampling_factor: 1
+      allow_unknown: false
+      max_iterations: 100000
+      max_on_approach_iterations: 1000
+      max_planning_time: 0.5
+      cost_travel_multiplier: 2.0
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+        do_refinement: true
 
 smoother_server:
   ros__parameters:
@@ -381,28 +408,19 @@ smoother_server:
 
 behavior_server:
   ros__parameters:
-    costmap_topic: local_costmap/costmap_raw
-    footprint_topic: local_costmap/published_footprint
-    cycle_frequency: 10.0
-    behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
-    spin:
-      plugin: "nav2_behaviors/Spin"
-    backup:
-      plugin: "nav2_behaviors/BackUp"
-    drive_on_heading:
-      plugin: "nav2_behaviors/DriveOnHeading"
-    wait:
-      plugin: "nav2_behaviors/Wait"
-    assisted_teleop:
-      plugin: "nav2_behaviors/AssistedTeleop"
+    use_sim_time: true
     global_frame: odom
     robot_base_frame: base_footprint
-    transform_tolerance: 0.1
-    use_sim_time: true
-    simulate_ahead_time: 1.0
-    max_rotational_vel: 0.2
-    min_rotational_vel: 0.1
-    rotational_acc_lim: 1.0
+    transform_tolerance: 0.2
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    behavior_plugins: [spin, backup, wait]
+    spin:
+      plugin: nav2_behaviors/Spin
+    backup:
+      plugin: nav2_behaviors/BackUp
+    wait:
+      plugin: nav2_behaviors/Wait
 
 robot_state_publisher:
   ros__parameters:
@@ -424,12 +442,12 @@ velocity_smoother:
     use_sim_time: true
     smoothing_frequency: 20.0
     scale_velocities: false
-    feedback: "OPEN_LOOP"
-    # TUNED: Increased velocity for faster navigation
-    max_velocity: [0.4, 0.0, 1.2]      # Nâng lên khớp với MPPI
-    min_velocity: [-0.2, 0.0, -1.2]   # Vận tốc lùi max: -0.25 m/s, xoay ngược max: -0.5 rad/s
-    max_accel: [3.0, 0.0, 3.2]        # Gia tốc tiến/xoay
-    max_decel: [-3.0, 0.0, -3.2]      # Gia tốc giảm tốc tiến/xoay
-    odom_topic: "/odometry/filtered"
+    feedback: "CLOSED_LOOP"
+    max_velocity: [0.15, 0.0, 1.0]    # PRECISION: match controller limits
+    min_velocity: [-0.15, -0.0, -1.0]
+    max_accel: [0.3, 0.0, 1.5]          # PRECISION: slower acceleration
+    max_decel: [-0.3, -0.0, -1.5]
+    odom_topic: /odometry/filtered
     odom_duration: 0.1
-    velocity_timeout: 1.0
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 0.35

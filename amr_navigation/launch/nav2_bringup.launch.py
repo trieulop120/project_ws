@@ -130,7 +130,7 @@ def generate_launch_description():
     # Controllers (delayed start - wait for ros2_control)
     # ============================================
     controller_spawner = TimerAction(
-        period=10.0,
+        period=5.0,
         actions=[
             Node(
                 package='controller_manager',

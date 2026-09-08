@@ -213,7 +213,7 @@
       <!-- Output -->
       <publish_odom>true</publish_odom>
       <publish_odom_tf>false</publish_odom_tf>
-      <publish_wheel_tf>true</publish_wheel_tf>
+      <publish_wheel_tf>false</publish_wheel_tf>
 
       <odometry_frame>odom</odometry_frame>
       <robot_base_frame>base_footprint</robot_base_frame>
@@ -231,10 +231,10 @@
         <namespace>/</namespace>
         <remapping>~/out:=joint_states</remapping>
       </ros>
-      <update_rate>30</update_rate>  <!-- Reduced from 50 to match sim time --> 
+      <update_rate>50</update_rate>  <!-- Reduced from 50 to match sim time --> 
       <!-- Drive wheels -->
-      <!--<joint_name>front_encoder_wheel_left_joint</joint_name>
-      <joint_name>front_encoder_wheel_right_joint</joint_name>-->
+      <joint_name>front_encoder_wheel_left_joint</joint_name>
+      <joint_name>front_encoder_wheel_right_joint</joint_name>
       <!-- Caster joints -->
       <joint_name>rear_caster_steer_left_joint</joint_name>
       <joint_name>rear_caster_steer_right_joint</joint_name>
