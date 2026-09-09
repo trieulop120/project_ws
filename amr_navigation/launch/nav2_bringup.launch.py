@@ -5,7 +5,7 @@ Includes:
   - EKF odometry (wheel odometry + IMU)
   - Controller manager (joint_state_broadcaster, lift_controller)
   - Nav2 with AMCL localization + MPPI controller
-  - LiDAR only (no camera fusion)
+  - PointCloud obstacle detection from depth camera
 
 Usage:
   ros2 launch amr_navigation nav2_bringup.launch.py           # Headless
@@ -183,7 +183,9 @@ def generate_launch_description():
         'launch', 'bringup_launch.py'
     )
 
-    # Delay Nav2 launch to ensure map_server is ready
+    # Delay Nav2 launch to ensure:
+    # 1. Gazebo simulation is stable
+    # 2. map_server is ready
     nav2_bringup_delayed = TimerAction(
         period=8.0,
         actions=[
@@ -246,7 +248,6 @@ def generate_launch_description():
         ekf_node,
 
         # Nav2 (includes map_server, amcl, controller, planner, etc.)
-        # Delayed 8s to ensure map_server is ready
         nav2_bringup_delayed,
 
         # cmd_vel_splitter

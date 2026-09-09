@@ -43,8 +43,8 @@ slam_toolbox:
     update_rate: 10.0               # Tần số cập nhật SLAM 10Hz  
 
     # Tinh chỉnh độ nhạy di chuyển
-    minimum_travel_distance: 0.1
-    minimum_travel_heading: 0.1
+    minimum_travel_distance: 0.15
+    minimum_travel_heading: 0.15
     scan_buffer_size: 10
     scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine: 0.10
@@ -53,7 +53,7 @@ slam_toolbox:
     # Scan Matching
     use_scan_matching: true
     use_scan_barycenter: true
-    minimumScore: 30.0              # Ngưỡng điểm số so khớp ảnh 
+    minimumScore: 50.0              # Ngưỡng điểm số so khớp ảnh 
 
     # --- Tinh chỉnh mô hình nhiễu Odom (Xử lý trượt khi xoay/tăng tốc) ---
     sigma_noise_xy: 0.1             # Nhiễu tịnh tiến XY 
@@ -61,8 +61,8 @@ slam_toolbox:
 
     # Loop Closure (Khép vòng bản đồ)
     do_loop_closing: true
-    loop_search_maximum_distance: 3.0
-    loop_match_minimum_chain_size: 10
+    loop_search_maximum_distance: 4.0
+    loop_match_minimum_chain_size: 8
     loop_match_maximum_variance_coarse: 3.0
     loop_match_minimum_response_coarse: 0.35
     loop_match_minimum_response_fine: 0.45

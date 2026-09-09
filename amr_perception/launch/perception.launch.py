@@ -9,7 +9,7 @@ Usage:
   ros2 launch amr_perception perception.launch.py lidar_only:=true  # LiDAR only
 
 Remapping:
-  Input: /camera/astra_pro/depth/image_raw (from Gazebo simulation)
+  Input: /camera/depth/image_raw (from Gazebo simulation)
   Output: /scan_depth (depth camera scan)
          /scan_fused (fused with LiDAR)
 """
@@ -67,8 +67,8 @@ def generate_launch_description():
         }],
         remappings=[
             # Input from Gazebo Astra Pro simulation
-            ('depth', '/camera/astra_pro/depth/image_raw'),
-            ('depth_camera_info', '/camera/astra_pro/depth/camera_info'),
+            ('depth', '/camera/depth/image_raw'),
+            ('depth_camera_info', '/camera/depth/camera_info'),
             # Output scan topic
             ('scan', '/scan_depth'),
         ],

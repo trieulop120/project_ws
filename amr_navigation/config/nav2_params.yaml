@@ -153,16 +153,17 @@ controller_server:
 
     FollowPath:
       plugin: nav2_mppi_controller::MPPIController
-      time_steps: 40          # PRECISION: shorter lookahead
+      time_steps: 56         # TĂNG: 40 → 56 (tầm nhìn xa hơn)
       model_dt: 0.1
       batch_size: 3000       # PRECISION: more samples
+      max_angel_to_allow_movement: 0.3  # MỚI: rad ~17° - khi Δθ > 17° thì ép v_x=0
 
       vx_std: 0.08          # PRECISION: less noise
       vy_std: 0.15
       wz_std: 0.25          # PRECISION: less angular noise
 
       vx_max: 0.15          # PRECISION: SLOWER = more accurate
-      vx_min: -0.15
+      vx_min: 0.0           # TẮT BACKWARD: -0.15 → 0.0 (không đi lùi)
 
       vy_max: 0.0
       vy_min: 0.0
@@ -213,18 +214,18 @@ controller_server:
       PathAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 2.0
+        cost_weight: 8.0         # TĂNG: 2.0 → 8.0 (phạt nặng đi chéo)
         max_path_occupancy_ratio: 0.03
-        trajectory_point_step: 4
-        offset_from_furthest: 4
-        threshold_to_consider: 0.5
+        trajectory_point_step: 2  # GIẢM: 4 → 2 (xem xét nhiều điểm hơn)
+        offset_from_furthest: 2  # GIẢM: 4 → 2 (xem xét gần hơn)
+        threshold_to_consider: 0.4  # GIẢM: 0.5 → 0.4 (effect sớm hơn)
         max_angle_to_furthest: 1.57
-        forward_preference: false
+        forward_preference: true  # ĐỔI: false → true (chỉ đi forward)
 
       PreferForwardCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 10.0       # TĂNG MẠNH: 3.0 → 10.0 (CHỈ ĐI FORWARD)
+        cost_weight: 7.0        # GIẢM: 10.0 → 7.0 (cho phép backward ngắn, tránh paralysis)
         threshold_to_consider: 0.5
 
       TwirlingCritic:
@@ -242,8 +243,8 @@ controller_server:
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 2.0        # GIẢM: 5.0 → 2.0 (cho phép move trong khi xoay)
-        threshold_to_consider: 0.8  # GIẢM: 1.5 → 0.8 (chỉ effect gần goal)
+        cost_weight: 1.5        # GIẢM: 4.0 → 1.5 (giảm phạt khi xoay, tránh đi chéo)
+        threshold_to_consider: 0.5  # GIẢM: 1.2 → 0.5 (chỉ effect khi rất gần goal)
 
       ObstaclesCritic:
         enabled: true
@@ -284,25 +285,25 @@ local_costmap:
         observation_sources: scan pointcloud
         scan:
           topic: /scan
-          max_obstacle_height: 1.0 
+          max_obstacle_height: 1.0
           clearing: True
           marking: True
           data_type: "LaserScan"
           raytrace_max_range: 11.5
           raytrace_min_range: 0.0
           obstacle_max_range: 10.0
-          obstacle_min_range: 0.0
-        #pointcloud:
-          #topic: /camera/points
-          #max_obstacle_height: 2.0
-          #min_obstacle_height: 0.1
-          #clearing: True
-          #marking: True
-          #data_type: "PointCloud2"
-          #raytrace_max_range: 4.0
-          #raytrace_min_range: 0.4
-          #obstacle_max_range: 3.5
-          #obstacle_min_range: 0.4
+          obstacle_min_range: 0.15
+        pointcloud:
+          topic: /points
+          max_obstacle_height: 1.2
+          min_obstacle_height: 0.1
+          clearing: True
+          marking: True
+          data_type: "PointCloud2"
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.4
+          obstacle_max_range: 4.5
+          obstacle_min_range: 0.4
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 6.0    # TĂNG: 5.0 → 6.0
@@ -311,7 +312,6 @@ local_costmap:
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
-
       always_send_full_costmap: True
 
 global_costmap:
@@ -350,23 +350,23 @@ global_costmap:
           raytrace_max_range: 11.5
           raytrace_min_range: 0.0
           obstacle_max_range: 10.0
-          obstacle_min_range: 0.0
-        #pointcloud:
-          #topic: /camera/points
-          #max_obstacle_height: 2.0
-          #min_obstacle_height: 0.1
-          #clearing: True
-          #marking: True
-          #data_type: "PointCloud2"
-          #raytrace_max_range: 4.0
-          #raytrace_min_range: 0.4
-          #obstacle_max_range: 3.5
-          #obstacle_min_range: 0.4
+          obstacle_min_range: 0.15
+        pointcloud:
+          topic: /points
+          max_obstacle_height: 1.2
+          min_obstacle_height: 0.1
+          clearing: True
+          marking: True
+          data_type: "PointCloud2"
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.4
+          obstacle_max_range: 4.5
+          obstacle_min_range: 0.4
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 6.0    # TĂNG: 3.0 → 6.0
-        inflation_radius: 1.0       # TĂNG: 0.8 → 1.0 (vùng cấm rộng hơn)
+        cost_scaling_factor: 6.0
+        inflation_radius: 1.0
 
 planner_server:
   ros__parameters:
@@ -444,7 +444,7 @@ velocity_smoother:
     scale_velocities: false
     feedback: "CLOSED_LOOP"
     max_velocity: [0.15, 0.0, 1.0]    # PRECISION: match controller limits
-    min_velocity: [-0.15, -0.0, -1.0]
+    min_velocity: [0.0, -0.0, -1.0]   # KHÔNG BACKWARD: match vx_min: 0.0
     max_accel: [0.3, 0.0, 1.5]          # PRECISION: slower acceleration
     max_decel: [-0.3, -0.0, -1.5]
     odom_topic: /odometry/filtered
