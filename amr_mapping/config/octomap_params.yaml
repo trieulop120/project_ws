@@ -1,0 +1,35 @@
+# OctoMap Server - Navigation (Binary)
+# Receives /points_filtered from pcl_ros VoxelGrid (~15Hz)
+# Outputs: /octomap_point_cloud_centers (2Hz) for global 3D map & RViz2
+
+octomap_server:
+  ros__parameters:
+    # === Frame Configuration ===
+    frame_id: "map"
+    base_frame_id: "base_footprint"
+
+    # === Resolution ===
+    resolution: 0.05
+
+    # === Sensor Model ===
+    sensor_model/max_range: 3.5
+    sensor_model/min_range: 0.6
+    sensor_model/hit: 0.7
+    sensor_model/miss: 0.4
+    sensor_model/min: 0.12
+    sensor_model/max: 0.97
+
+    # === Z-Filtering (already filtered by VoxelGrid, but double-check) ===
+    pointcloud_max_z: 1.20
+    pointcloud_min_z: 0.15
+
+    # === Publish Topics ===
+    topic: "/octomap_binary"
+
+    # === Update Rate === (Lightweight - only for visualization)
+    publish_rate: 2.0
+
+    # === Binary (no color) ===
+    color: false
+    compress_map: true
+    latch: true

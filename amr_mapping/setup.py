@@ -12,6 +12,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/config', [
             'config/mapper_params_online_async.yaml',
+            'config/octomap_params.yaml',
         ]),
         ('share/' + package_name + '/maps', [
             'maps/amr_map.yaml',

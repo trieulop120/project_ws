@@ -21,8 +21,6 @@ setup(
     entry_points={
         'console_scripts': [
             'cmd_vel_splitter = amr_manipulation.cmd_vel_splitter:main',
-            'teleop_keyboard = amr_manipulation.teleop_keyboard:main',
-            'scan_to_depth = amr_manipulation.scan_to_depth:main',
         ],
     },
 )

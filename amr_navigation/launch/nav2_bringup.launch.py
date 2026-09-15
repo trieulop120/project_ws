@@ -5,7 +5,7 @@ Includes:
   - EKF odometry (wheel odometry + IMU)
   - Controller manager (joint_state_broadcaster, lift_controller)
   - Nav2 with AMCL localization + MPPI controller
-  - PointCloud obstacle detection from depth camera
+ 
 
 Usage:
   ros2 launch amr_navigation nav2_bringup.launch.py           # Headless
@@ -61,10 +61,11 @@ def generate_launch_description():
     map_file = os.path.join(pkg_amr_mapping, 'maps', 'amr_map.yaml')
     rviz_config = os.path.join(pkg_amr_nav, 'rviz', 'navigation.rviz')
     controller_config = os.path.join(pkg_amr_desc, 'config', 'lift_controller.yaml')
+    #octomap_params = os.path.join(pkg_amr_mapping, 'config', 'octomap_params.yaml')
 
     # Xacro processing
     doc = xacro.parse(open(xacro_file))
-    xacro.process_doc(doc)
+    xacro.process_doc(doc, mappings={'use_sim_time': 'true'})
     robot_description_config = doc.toxml()
 
     # ============================================
@@ -127,6 +128,37 @@ def generate_launch_description():
     )
 
     # ============================================
+    # Camera Optical Frame TFs (REP 105 standard)
+    # Transform camera_link -> camera_*_optical_frame
+    # Optical frame convention: X=right, Y=down, Z=forward
+    # ============================================
+    camera_depth_tf_publisher = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_depth_tf_publisher',
+        arguments=[
+            '--x', '0', '--y', '0', '--z', '0',
+            '--qx', '-0.5', '--qy', '0.5', '--qz', '-0.5', '--qw', '0.5',
+            '--frame-id', 'camera_link',
+            '--child-frame-id', 'camera_depth_optical_frame'
+        ],
+        parameters=[{'use_sim_time': True}]
+    )
+
+    camera_color_tf_publisher = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_color_tf_publisher',
+        arguments=[
+            '--x', '0', '--y', '0', '--z', '0',
+            '--qx', '-0.5', '--qy', '0.5', '--qz', '-0.5', '--qw', '0.5',
+            '--frame-id', 'camera_link',
+            '--child-frame-id', 'camera_color_optical_frame'
+        ],
+        parameters=[{'use_sim_time': True}]
+    )
+
+    # ============================================
     # Controllers (delayed start - wait for ros2_control)
     # ============================================
     controller_spawner = TimerAction(
@@ -173,6 +205,41 @@ def generate_launch_description():
         output='screen',
         parameters=[{'use_sim_time': True}],
     )
+
+    # ============================================
+    # PointCloud Downsampler (C++ with PCL VoxelGrid)
+    # Input: /points (raw from Gazebo camera, ~57,000 pts)
+    # Output: /points_filtered (~2,000-3,000 pts @ 10-15Hz)
+    # Filters: Z-range 0.15-1.20m (remove floor/ceiling)
+    # ============================================
+    voxel_grid_node = Node(
+        package='amr_perception',
+        executable='pointcloud_downsampler',
+        name='pointcloud_downsampler',
+        output='screen',
+        parameters=[{
+            'leaf_size': 0.05,
+            'z_min': 0.15,
+            'z_max': 1.20,
+        }],
+    )
+
+    # ============================================
+    # OctoMap Server (for 3D perception and voxel layer)
+    # Converts PointCloud2 -> Octree -> OccupancyGrid
+    # Uses /points_filtered from VoxelGrid (~2-3Hz after octree processing)
+    # ============================================
+    #octomap_server = Node(
+    #    package='octomap_server',
+    #    executable='octomap_server_node',
+    #    name='octomap_server',
+    #    output='screen',
+    #    parameters=[octomap_params],
+    #    remappings=[
+    #        ('cloud_in', '/points_filtered'),  # Nhận từ VoxelGrid
+    #        ('octomap_point_cloud_centers', '/octomap_point_cloud_centers'),
+    #    ],
+    #)
 
     # ============================================
     # Nav2 Bringup (official)
@@ -241,6 +308,10 @@ def generate_launch_description():
         # Spawn entity
         spawn_entity,
 
+        # Camera optical frame TFs
+        camera_depth_tf_publisher,
+        camera_color_tf_publisher,
+
         # Delayed: Controllers
         controller_spawner,
 
@@ -252,6 +323,12 @@ def generate_launch_description():
 
         # cmd_vel_splitter
         cmd_vel_splitter,
+
+        # OctoMap Server (uses /points_filtered from VoxelGrid)
+        #octomap_server,
+
+        # PCL VoxelGrid (downsamples /points -> /points_filtered @ 15Hz)
+        voxel_grid_node,
 
         # RViz
         rviz,

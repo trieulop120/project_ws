@@ -5,7 +5,6 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /RobotModel1/Description Topic1
-        - /LaserScan1/Status1
         - /RGB-D camera1/Depth image1/Topic1
         - /RGB-D camera1/Depth point cloud1
       Splitter Ratio: 0.5
@@ -90,10 +89,6 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
-        camera_depth_optical_frame:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
         camera_link:
           Alpha: 1
           Show Axes: false
@@ -281,8 +276,37 @@ Visualization Manager:
           Use Fixed Frame: true
           Use rainbow: true
           Value: true
-      Enabled: true
+      Enabled: false
       Name: RGB-D camera
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: MarkerArray
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /occupied_cells_vis_array
+      Value: false
+    - Class: octomap_rviz_plugins/OccupancyGrid
+      Enabled: false
+      Max. Height Display: inf
+      Max. Octree Depth: 16
+      Min. Height Display: -inf
+      Name: OccupancyGrid
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /octomap_binary
+      Value: false
+      Voxel Alpha: 1
+      Voxel Coloring: Z-Axis
+      Voxel Rendering: Occupied Voxels
   Enabled: true
   Global Options:
     Background Color: 117; 135; 133
@@ -329,25 +353,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 23.253759384155273
+      Distance: 14.826703071594238
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -2.7233598232269287
-        Y: -2.7785885334014893
-        Z: 0.7566900849342346
+        X: 0.17267075181007385
+        Y: 0.4465046226978302
+        Z: -0.3423202633857727
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.939796507358551
+      Pitch: 1.081872820854187
       Target Frame: base_footprint
       Value: Orbit (rviz_default_plugins)
-      Yaw: 2.1773881912231445
+      Yaw: 3.0151140689849854
     Saved: ~
 Window Geometry:
   Depth image:

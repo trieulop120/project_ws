@@ -3,18 +3,18 @@
 <package format="3">
   <name>amr_perception</name>
   <version>1.0.0</version>
-  <description>AMR Perception - Depth camera to LaserScan conversion and sensor fusion</description>
+  <description>AMR Perception - PointCloud processing with PCL VoxelGrid downsampling</description>
   <maintainer email="trieu@example.com">Trieu</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <buildtool_depend>ament_cmake_python</buildtool_depend>
 
-  <depend>rclpy</depend>
-  <depend>std_msgs</depend>
+  <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
-  <depend>image_transport</depend>
-  <depend>depthimage_to_laserscan</depend>
+  <depend>std_msgs</depend>
+  <depend>pcl_conversions</depend>
+  <depend>pcl_ros</depend>
+  <depend>tf2</depend>
   <depend>tf2_ros</depend>
 
   <export>

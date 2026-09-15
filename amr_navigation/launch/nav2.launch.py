@@ -9,6 +9,7 @@ Requires (đã chạy ở chỗ khác):
   - /scan (LiDAR)
   - /odom (wheel odometry)
   - /imu/data (IMU)
+  - /points (Camera PointCloud)
   - TF: odom -> base_footprint (từ EKF)
 
 Outputs:
@@ -16,6 +17,8 @@ Outputs:
   - /amcl_pose (vị trí robot trên map)
   - TF: map -> odom (từ AMCL)
   - cmd_vel_nav -> cmd_vel (velocity commands đến robot)
+  - /points_filtered (từ VoxelGrid, ~15Hz)
+  - /octomap_point_cloud_centers (từ octomap_server, ~2Hz)
 """
 
 import os
@@ -40,6 +43,7 @@ def generate_launch_description():
     # Paths
     params_file = os.path.join(pkg_nav, 'config', 'nav2_params.yaml')
     map_file = os.path.join(pkg_mapping, 'maps', 'amr_map.yaml')
+    octomap_params = os.path.join(pkg_mapping, 'config', 'octomap_params.yaml')
 
     # Nav2 bringup launch from nav2_bringup package
     # Bao gồm: map_server, amcl, controller, planner, bt_navigator, etc.
@@ -185,6 +189,40 @@ def generate_launch_description():
         }]
     )
 
+    # ============================================
+    # PointCloud Downsampler (C++ with PCL VoxelGrid)
+    # Input: /points (raw from camera, ~57,000 pts)
+    # Output: /points_filtered (~2,000-3,000 pts @ 10-15Hz)
+    # Filters: Z-range 0.15-1.20m (remove floor/ceiling)
+    # ============================================
+    voxel_grid_node = Node(
+        package='amr_perception',
+        executable='pointcloud_downsampler',
+        name='pointcloud_downsampler',
+        output='screen',
+        parameters=[{
+            'leaf_size': 0.05,
+            'z_min': 0.15,
+            'z_max': 1.20,
+        }],
+    )
+
+    # ============================================
+    # OctoMap Server (for 3D visualization & global map)
+    # Converts PointCloud2 -> Octree -> /octomap_point_cloud_centers
+    # ============================================
+    octomap_server = Node(
+        package='octomap_server',
+        executable='octomap_server_node',
+        name='octomap_server',
+        output='screen',
+        parameters=[octomap_params],
+        remappings=[
+            ('cloud_in', '/points_filtered'),
+            ('octomap_point_cloud_centers', '/octomap_point_cloud_centers'),
+        ],
+    )
+
     return LaunchDescription([
         use_sim_time,
 
@@ -201,4 +239,8 @@ def generate_launch_description():
         waypoint_follower,
         velocity_smoother,
         navigation_mgr,
+
+        # 3D Perception
+        voxel_grid_node,
+        octomap_server,
     ])

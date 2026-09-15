@@ -18,7 +18,7 @@
   <joint name="base_footprint_joint" type="fixed">
     <parent link="base_footprint"/>
     <child link="base_link"/>
-    <origin xyz="0 0 0.068" rpy="0 0 0"/>
+    <origin xyz="0 0 0.0925" rpy="0 0 0"/>
   </joint>
 
   <!-- PHYSICAL PROPERTIES -->
@@ -144,16 +144,9 @@
   </gazebo>
 
   <!-- ============================================================ -->
-  <!-- ASTRA PRO DEPTH CAMERA (RGB + Depth + PointCloud)           -->                       -->
+  <!-- ASTRA PRO DEPTH CAMERA (RGB + Depth + PointCloud)           -->
+  <!-- Optical frame TFs được publish trong launch files (không phải xacro) -->
   <!-- ============================================================ -->
-
-  <!-- Optical Frame (REP 103 standard) -->
-  <link name="camera_depth_optical_frame"/>
-  <joint name="camera_depth_optical_joint" type="fixed">
-    <parent link="camera_link"/>
-    <child link="camera_depth_optical_frame"/>
-    <origin xyz="0 0 0" rpy="-1.5708 0 -1.5708"/>
-  </joint>
 
   <gazebo reference="camera_link">
     <sensor type="depth" name="astra_pro">

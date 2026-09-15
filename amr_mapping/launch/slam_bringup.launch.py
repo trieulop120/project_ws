@@ -48,6 +48,7 @@ def generate_launch_description():
     xacro_file = os.path.join(pkg_amr_desc, 'urdf', 'amr.gazebo.xacro')
     ekf_config = os.path.join(pkg_amr_local, 'config', 'ekf.yaml')
     slam_config = os.path.join(pkg_amr_mapping, 'config', 'mapper_params_online_async.yaml')
+    octomap_params = os.path.join(pkg_amr_mapping, 'config', 'octomap_params.yaml')
     rviz_config = os.path.join(pkg_amr_mapping, 'rviz', 'slam.rviz')
     controller_config = os.path.join(pkg_amr_desc, 'config', 'lift_controller.yaml')
 
@@ -114,6 +115,37 @@ def generate_launch_description():
     )
 
     # ============================================
+    # Camera Optical Frame TFs (REP 105 standard)
+    # Transform camera_link -> camera_*_optical_frame
+    # Optical frame convention: X=right, Y=down, Z=forward
+    # ============================================
+    camera_depth_tf_publisher = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_depth_tf_publisher',
+        arguments=[
+            '--x', '0', '--y', '0', '--z', '0',
+            '--qx', '-0.5', '--qy', '0.5', '--qz', '-0.5', '--qw', '0.5',
+            '--frame-id', 'camera_link',
+            '--child-frame-id', 'camera_depth_optical_frame'
+        ],
+        parameters=[{'use_sim_time': True}]
+    )
+
+    camera_color_tf_publisher = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_color_tf_publisher',
+        arguments=[
+            '--x', '0', '--y', '0', '--z', '0',
+            '--qx', '-0.5', '--qy', '0.5', '--qz', '-0.5', '--qw', '0.5',
+            '--frame-id', 'camera_link',
+            '--child-frame-id', 'camera_color_optical_frame'
+        ],
+        parameters=[{'use_sim_time': True}]
+    )
+
+    # ============================================
     # Controllers (delayed start - wait longer for ros2_control to load)
     # ============================================
     controller_spawner = TimerAction(
@@ -146,7 +178,7 @@ def generate_launch_description():
             ekf_config
         ],
         remappings=[
-            ('/odom', '/odom'),
+            ('/odometry/filtered', '/odometry/filtered'),
             #('/imu/data', '/imu/data'),
         ],
     )
@@ -176,6 +208,22 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': True,
         }],
+    )
+
+    # ============================================
+    # OctoMap Server - Navigation (Binary)
+    # Lightweight binary octree for Nav2 costmap
+    # Input: /points (PointCloud2)
+    # ============================================
+    octomap_server = Node(
+        package='octomap_server',
+        executable='octomap_server_node',
+        name='octomap_server',
+        output='screen',
+        parameters=[octomap_params],
+        remappings=[
+            ('cloud_in', '/points'),
+        ],
     )
 
     # ============================================
@@ -213,6 +261,10 @@ def generate_launch_description():
         # Spawn entity (always)
         spawn_entity,
 
+        # Camera optical frame TFs
+        camera_depth_tf_publisher,
+        camera_color_tf_publisher,
+
         # Delayed: Controllers
         controller_spawner,
 
@@ -221,6 +273,9 @@ def generate_launch_description():
 
         # SLAM
         slam_node,
+
+        # OctoMap Server - Navigation (binary, for Nav2)
+        octomap_server,
 
         # cmd_vel_splitter
         cmd_vel_splitter,
