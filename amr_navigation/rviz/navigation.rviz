@@ -64,8 +64,8 @@ Visualization Manager:
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
-        Max Value: 3.592158317565918
-        Min Value: -3.4773547649383545
+        Max Value: 3.5896899700164795
+        Min Value: -3.4766383171081543
         Value: true
       Axis: X
       Channel Name: intensity
@@ -431,8 +431,8 @@ Visualization Manager:
       Enabled: true
       Name: D-RGB Camera
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: MarkerArray
+      Enabled: false
+      Name: Route Graph
       Namespaces:
         {}
       Topic:
@@ -440,8 +440,8 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /waypoints
-      Value: true
+        Value: /route_graph/markers
+      Value: false
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: false
@@ -474,10 +474,6 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
-        camera_depth_optical_frame:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
         camera_link:
           Alpha: 1
           Show Axes: false

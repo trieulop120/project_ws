@@ -14,7 +14,7 @@ Usage:
 
 import os
 import xacro
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_share_directory, get_package_prefix
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
@@ -272,6 +272,18 @@ def generate_launch_description():
     )
 
     # ============================================
+    # Route Graph Publisher (hiển thị nodes/edges trên RViz)
+    # ============================================
+    route_graph_publisher_bin = os.path.join(
+        get_package_prefix('amr_navigation'), 'bin', 'route_graph_publisher'
+    )
+    route_graph_publisher = Node(
+        executable=route_graph_publisher_bin,
+        name='route_graph_publisher',
+        output='screen',
+    )
+
+    # ============================================
     # RViz with Nav2 panel
     # ============================================
     rviz = Node(
@@ -329,6 +341,9 @@ def generate_launch_description():
 
         # PCL VoxelGrid (downsamples /points -> /points_filtered @ 15Hz)
         voxel_grid_node,
+
+        # Route Graph Publisher (hiển thị route trên RViz)
+        route_graph_publisher,
 
         # RViz
         rviz,

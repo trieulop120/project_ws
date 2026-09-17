@@ -1,9 +1,13 @@
 # Simplified Nav2 params for AMR simulation
 # Uses AMCL with EKF odometry
+#
+# NOTE: yaml_filename is overridden by launch file at runtime.
+# Launch files use get_package_share_directory('amr_mapping')
+# to resolve the actual map path.
 
 map_server:
   ros__parameters:
-    yaml_filename: "/home/trieu/project_ws/src/amr_mapping/maps/amr_map.yaml"
+    yaml_filename: ""  # Overridden by launch file
 
 map_saver:
   ros__parameters:
