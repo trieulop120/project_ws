@@ -1,0 +1,13 @@
+package.xml
+setup.cfg
+setup.py
+amr_mission_manager/__init__.py
+amr_mission_manager/mission_manager_node.py
+amr_mission_manager.egg-info/PKG-INFO
+amr_mission_manager.egg-info/SOURCES.txt
+amr_mission_manager.egg-info/dependency_links.txt
+amr_mission_manager.egg-info/entry_points.txt
+amr_mission_manager.egg-info/requires.txt
+amr_mission_manager.egg-info/top_level.txt
+amr_mission_manager.egg-info/zip-safe
+resource/amr_mission_manager

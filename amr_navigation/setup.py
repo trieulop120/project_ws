@@ -15,6 +15,9 @@ launch_files = glob(os.path.join('launch', '*.launch.py'))
 # Find rviz files
 rviz_files = glob(os.path.join('rviz', '*.rviz'))
 
+# Find behavior tree XML files
+bt_files = glob(os.path.join('behavior_trees', '*.xml'))
+
 setup(
     name=package_name,
     version='0.1.0',
@@ -23,6 +26,7 @@ setup(
         'amr_navigation.interactive_node_creator',
         'amr_navigation.yaml_to_geojson',
         'amr_navigation.route_graph_publisher',
+        'amr_navigation.test_navigate_to_pose',
     ],
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -34,6 +38,7 @@ setup(
         ('share/' + package_name + '/config/graphs', config_files),
         ('share/' + package_name + '/launch', launch_files),
         ('share/' + package_name + '/rviz', rviz_files),
+        ('share/' + package_name + '/behavior_trees', bt_files),
     ],
     install_requires=['setuptools', 'pyyaml'],
     zip_safe=True,
@@ -47,6 +52,7 @@ setup(
             'yaml_to_geojson = amr_navigation.yaml_to_geojson:main',
             'interactive_node_creator = amr_navigation.interactive_node_creator:main',
             'route_graph_publisher = amr_navigation.route_graph_publisher:main',
+            'test_navigate_to_pose = amr_navigation.test_navigate_to_pose:main',
         ],
     },
 )

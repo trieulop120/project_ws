@@ -14,7 +14,11 @@ setup(
     zip_safe=True,
     maintainer='Trieu',
     maintainer_email='trieu@example.com',
-    description='AMR Mission Manager - Reserved for future mission/task management',
+    description='AMR Mission Manager - Mission execution and route planning',
     license='MIT',
-    entry_points={},
+    entry_points={
+        'console_scripts': [
+            'mission_manager = amr_mission_manager.mission_manager_node:main',
+        ],
+    },
 )

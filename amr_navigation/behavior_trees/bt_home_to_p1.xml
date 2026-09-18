@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!--
+  Custom Behavior Tree for HOME → P1 navigation using Route Graph
+
+  This BT:
+  1. Calls ComputeRoute with start_id=0 (HOME), goal_id=1 (P_1)
+  2. Passes the resulting path to FollowPath
+
+  Route Server must be running with route_graph.geojson loaded.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="HomeToP1">
+      <!-- ComputeRoute: Get path from Route Graph -->
+      <ComputeRoute
+        start_id="0"
+        goal_id="1"
+        use_start="false"
+        use_poses="false"
+        server_name="/compute_route"
+        route="{route}"
+        planning_time="{planning_time}"
+        path="{path}"/>
+
+      <!-- FollowPath: Execute navigation -->
+      <FollowPath
+        controller_id="FollowPath"
+        path="{path}"
+        goal_checker_id="general_goal_checker"
+        server_name="/follow_path"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

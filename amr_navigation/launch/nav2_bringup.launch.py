@@ -1,11 +1,11 @@
-"""Nav2 Bringup - Launch Gazebo + Nav2 + EKF + Controllers + RViz
+"""Nav2 Bringup - Launch Gazebo + Nav2 + EKF + Controllers + RViz + Route Server
 
 Includes:
   - Gazebo simulation with robot
   - EKF odometry (wheel odometry + IMU)
   - Controller manager (joint_state_broadcaster, lift_controller)
   - Nav2 with AMCL localization + MPPI controller
- 
+  - Route Server (nav2_route) for route-based navigation
 
 Usage:
   ros2 launch amr_navigation nav2_bringup.launch.py           # Headless
@@ -61,7 +61,9 @@ def generate_launch_description():
     map_file = os.path.join(pkg_amr_mapping, 'maps', 'amr_map.yaml')
     rviz_config = os.path.join(pkg_amr_nav, 'rviz', 'navigation.rviz')
     controller_config = os.path.join(pkg_amr_desc, 'config', 'lift_controller.yaml')
-    #octomap_params = os.path.join(pkg_amr_mapping, 'config', 'octomap_params.yaml')
+
+    # Path to route graph GeoJSON
+    graph_geojson = os.path.join(pkg_amr_nav, 'config', 'graphs', 'route_graph.geojson')
 
     # Xacro processing
     doc = xacro.parse(open(xacro_file))
@@ -129,8 +131,6 @@ def generate_launch_description():
 
     # ============================================
     # Camera Optical Frame TFs (REP 105 standard)
-    # Transform camera_link -> camera_*_optical_frame
-    # Optical frame convention: X=right, Y=down, Z=forward
     # ============================================
     camera_depth_tf_publisher = Node(
         package='tf2_ros',
@@ -207,10 +207,7 @@ def generate_launch_description():
     )
 
     # ============================================
-    # PointCloud Downsampler (C++ with PCL VoxelGrid)
-    # Input: /points (raw from Gazebo camera, ~57,000 pts)
-    # Output: /points_filtered (~2,000-3,000 pts @ 10-15Hz)
-    # Filters: Z-range 0.15-1.20m (remove floor/ceiling)
+    # PointCloud Downsampler
     # ============================================
     voxel_grid_node = Node(
         package='amr_perception',
@@ -225,34 +222,13 @@ def generate_launch_description():
     )
 
     # ============================================
-    # OctoMap Server (for 3D perception and voxel layer)
-    # Converts PointCloud2 -> Octree -> OccupancyGrid
-    # Uses /points_filtered from VoxelGrid (~2-3Hz after octree processing)
-    # ============================================
-    #octomap_server = Node(
-    #    package='octomap_server',
-    #    executable='octomap_server_node',
-    #    name='octomap_server',
-    #    output='screen',
-    #    parameters=[octomap_params],
-    #    remappings=[
-    #        ('cloud_in', '/points_filtered'),  # Nhận từ VoxelGrid
-    #        ('octomap_point_cloud_centers', '/octomap_point_cloud_centers'),
-    #    ],
-    #)
-
-    # ============================================
     # Nav2 Bringup (official)
-    # Uses map for localization
     # ============================================
     nav2_bringup_path = os.path.join(
         get_package_share_directory('nav2_bringup'),
         'launch', 'bringup_launch.py'
     )
 
-    # Delay Nav2 launch to ensure:
-    # 1. Gazebo simulation is stable
-    # 2. map_server is ready
     nav2_bringup_delayed = TimerAction(
         period=8.0,
         actions=[
@@ -272,7 +248,61 @@ def generate_launch_description():
     )
 
     # ============================================
-    # Route Graph Publisher (hiển thị nodes/edges trên RViz)
+    # Route Server (nav2_route)
+    # Starts after Nav2 to ensure all dependencies are ready
+    # ============================================
+    route_server = Node(
+        package='nav2_route',
+        executable='route_server',
+        name='route_server',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'graph_filepath': graph_geojson,
+            'graph_file_loader': {
+                'plugin': 'nav2_route::GeoJsonGraphFileLoader',
+            },
+            'cost_plugins': ['distance_cost'],
+            'distance_cost': {
+                'plugin': 'nav2_route::DistanceScorer',
+            },
+            'costmap_cost_plugin': {
+                'plugin': 'nav2_route::CostmapScorer',
+            },
+            'tracker_frequency': 20.0,
+        }],
+    )
+
+    # ============================================
+    # Route Server Lifecycle - Auto Configure + Activate
+    # Uses separate TimerActions to avoid race conditions
+    # Lifecycle: unconfigured[1] -> configure -> inactive[2] -> activate -> active[3]
+    # ============================================
+    
+    # Delay 3s: Give route_server time to start and enter inactive state
+    route_server_configure = TimerAction(
+        period=3.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'lifecycle', 'set', '/route_server', 'configure'],
+                output='screen',
+            ),
+        ],
+    )
+    
+    # Delay 5s: Wait for configure to complete, then activate
+    route_server_activate = TimerAction(
+        period=5.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'lifecycle', 'set', '/route_server', 'activate'],
+                output='screen',
+            ),
+        ],
+    )
+
+    # ============================================
+    # Route Graph Publisher
     # ============================================
     route_graph_publisher_bin = os.path.join(
         get_package_prefix('amr_navigation'), 'bin', 'route_graph_publisher'
@@ -284,7 +314,7 @@ def generate_launch_description():
     )
 
     # ============================================
-    # RViz with Nav2 panel
+    # RViz
     # ============================================
     rviz = Node(
         package='rviz2',
@@ -333,16 +363,20 @@ def generate_launch_description():
         # Nav2 (includes map_server, amcl, controller, planner, etc.)
         nav2_bringup_delayed,
 
+        # Route Server - starts immediately after Nav2 delay (8s total)
+        route_server,
+
+        # Route Server lifecycle - configure then activate with proper delays
+        route_server_configure,
+        route_server_activate,
+
         # cmd_vel_splitter
         cmd_vel_splitter,
 
-        # OctoMap Server (uses /points_filtered from VoxelGrid)
-        #octomap_server,
-
-        # PCL VoxelGrid (downsamples /points -> /points_filtered @ 15Hz)
+        # PCL VoxelGrid
         voxel_grid_node,
 
-        # Route Graph Publisher (hiển thị route trên RViz)
+        # Route Graph Publisher
         route_graph_publisher,
 
         # RViz

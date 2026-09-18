@@ -1,0 +1,3 @@
+[console_scripts]
+mission_manager = amr_mission_manager.mission_manager_node:main
+
