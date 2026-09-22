@@ -17,38 +17,48 @@ nodes:
       is_parking: true
   P_1:
     position:
-      x: 1.047
-      y: 1.56
+      x: 0.978
+      y: 1.533
       z: 0.0
     orientation:
       yaw: 0.0
     type: pickup_approach
     floor: 1
     description: Node P_1
-  J1:
-    position:
-      x: 0.325
-      y: 0.477
-      z: 0.002
-    orientation:
-      yaw: 0.0
-    type: transit
-    floor: 1
-    description: Node J1
   D_1:
     position:
-      x: -2.13
-      y: 0.534
+      x: -1.969
+      y: 0.955
       z: 0.0
     orientation:
       yaw: 3.1416
     type: dropoff_approach
     floor: 1
     description: Node D_1
+  J1:
+    position:
+      x: 0.583
+      y: -0.009
+      z: -0.001
+    orientation:
+      yaw: 0.0
+    type: transit
+    floor: 1
+    description: Node J1
+  J2:
+    position:
+      x: 0.988
+      y: 0.395
+      z: -0.001
+    orientation:
+      yaw: 0.0
+    type: transit
+    floor: 1
+    description: Node J2
   J3:
     position:
-      x: -1.149
-      y: 1.992
+      x: 0.93
+      y: 2.139
       z: 0.002
     orientation:
       yaw: 0.0
@@ -57,72 +67,122 @@ nodes:
     description: Node J3
   J4:
     position:
-      x: -1.382
-      y: 0.869
+      x: 0.398
+      y: 2.51
       z: -0.001
     orientation:
       yaw: 0.0
     type: transit
     floor: 1
     description: Node J4
-  J2:
+  J5:
     position:
-      x: 0.058
-      y: 2.575
+      x: -1.646
+      y: 2.553
       z: -0.001
     orientation:
       yaw: 0.0
     type: transit
     floor: 1
-    description: Node J2
-  SAFE_1:
+    description: Node J5
+  J6:
     position:
-      x: 2.619
-      y: 0.042
-      z: 0.0
+      x: -2.034
+      y: 2.189
+      z: -0.001
     orientation:
-      yaw: -3.0713
-    type: safe_zone
+      yaw: 0.0
+    type: transit
     floor: 1
-    description: Node SAFE_1
+    description: Node J6
+  J7:
+    position:
+      x: -2.017
+      y: 0.576
+      z: -0.001
+    orientation:
+      yaw: 0.0
+    type: transit
+    floor: 1
+    description: Node J7
+  J8:
+    position:
+      x: -1.527
+      y: 0.297
+      z: -0.001
+    orientation:
+      yaw: 0.0
+    type: transit
+    floor: 1
+    description: Node J8
+  J9:
+    position:
+      x: -0.683
+      y: 0.162
+      z: -0.001
+    orientation:
+      yaw: 0.0
+    type: transit
+    floor: 1
+    description: Node J9
 edges:
 - from: NODE_HOME
   to: J1
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 0.58
 - from: J1
-  to: P_1
-  bidirectional: false
+  to: J2
+  bidirectional: true
   weight: 1.0
-  distance: 1.3
+  distance: 0.57
 - from: J2
+  to: P_1
+  bidirectional: true
+  weight: 1.0
+  distance: 1.14
+- from: P_1
   to: J3
   bidirectional: false
   weight: 1.0
-  distance: 1.34
-- from: P_1
-  to: J2
-  bidirectional: false
-  weight: 1.0
-  distance: 1.42
+  distance: 0.61
 - from: J3
   to: J4
   bidirectional: false
   weight: 1.0
-  distance: 1.15
+  distance: 0.65
 - from: J4
+  to: J5
+  bidirectional: false
+  weight: 1.0
+  distance: 2.04
+- from: J5
+  to: J6
+  bidirectional: false
+  weight: 1.0
+  distance: 0.53
+- from: J6
   to: D_1
   bidirectional: false
   weight: 1.0
-  distance: 0.82
+  distance: 1.24
 - from: D_1
-  to: J1
+  to: J7
   bidirectional: false
   weight: 1.0
-  distance: 2.46
-- from: J1
-  to: SAFE_1
-  bidirectional: true
+  distance: 0.38
+- from: J7
+  to: J8
+  bidirectional: false
   weight: 1.0
-  distance: 2.33
+  distance: 0.56
+- from: J8
+  to: J9
+  bidirectional: false
+  weight: 1.0
+  distance: 0.85
+- from: J9
+  to: NODE_HOME
+  bidirectional: false
+  weight: 1.0
+  distance: 0.7

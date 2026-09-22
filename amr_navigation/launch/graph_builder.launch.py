@@ -25,7 +25,9 @@ def generate_launch_description():
     map_yaml = os.path.join(pkg_mapping, 'maps', 'amr_map.yaml')
 
     # Đường dẫn route graph - save vào src/config/graphs/ (nhờ symlink-install)
-    graph_yaml = os.path.join(pkg_nav, 'config', 'graphs', 'route_graph.yaml')
+    graph_yaml = os.path.expanduser(
+    '~/project_ws/src/amr_navigation/config/graphs/route_graph.yaml'
+    )
 
     # Executable nằm trong bin/ không phải lib/
     pkg_prefix = get_package_prefix('amr_navigation')

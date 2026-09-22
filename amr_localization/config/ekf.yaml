@@ -9,7 +9,7 @@
     two_d_mode: true # we operate a ground robot so 2D
     publish_tf: true
     print_diagnostics: true
-    debug: true
+    debug: false
 
     # Frame IDs
     map_frame: map

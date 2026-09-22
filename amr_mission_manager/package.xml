@@ -3,13 +3,16 @@
 <package format="3">
   <name>amr_mission_manager</name>
   <version>1.0.0</version>
-  <description>AMR Mission Manager - Reserved for future mission/task management</description>
+  <description>AMR Mission Manager - Route navigation mission management</description>
   <maintainer email="trieu@example.com">Trieu</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 
   <depend>rclpy</depend>
+  <depend>std_srvs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>geometry_msgs</depend>
 
   <export>
     <build_type>ament_python</build_type>

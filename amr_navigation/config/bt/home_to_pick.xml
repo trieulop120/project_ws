@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!--
+  Mission: HOME → PICK
+  goal_id  = 1 (PICK)
+  start_id = Dynamic (robot's current node)
+  Route: 0→3→4→1 (from HOME to PICK)
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="home_to_pick">
+
+      <!-- Set goal node ID -->
+      <SetBlackboard value="0" output_key="my_start_id"/>
+      <SetBlackboard value="1" output_key="my_goal_id"/>
+
+      <!-- Compute route: auto-detect start from robot's position -->
+      <ComputeRoute
+        goal_id="{my_goal_id}"
+        use_start="false"
+        use_poses="false"
+        path="{path}"
+        route="{route}"/>
+
+      <!-- Phase 2: Follow route to endpoint -->
+      <FollowPath
+        path="{path}"/>
+
+      <!-- Phase 3: Compute path to exact PoseStamped goal -->
+      <ComputePathToPose
+        goal="{goal}"
+        path="{path}"/>
+
+      <!-- Phase 4: Follow last-mile path -->
+      <FollowPath
+        path="{path}"/>
+
+    </Sequence>
+  </BehaviorTree>
+</root>

@@ -2,7 +2,8 @@
 """
 yaml_to_geojson.py
 ==================
-Chuyen doi route_graph.yaml sang dinh dang GeoJSON cho nav2_route.
+Chuyen doi route_graph.yaml sang dinh dang GeoJSON cho nav2_route
+va tao du lieu PoseStamped cho cac node.
 
 Format chuan cua nav2_route:
 - Nodes: id (so), frame, geometry: Point
@@ -14,12 +15,14 @@ Su dung:
 
 Dau ra:
     config/graphs/route_graph.geojson
+    config/graphs/route_poses.yaml
 
 Author: AMR System
 """
 
 import os
 import json
+import math
 import yaml
 from ament_index_python.packages import get_package_share_directory
 
@@ -40,6 +43,11 @@ def get_yaml_path():
 def get_geojson_path():
     # Luu truc tiep vao src/ de khong bi mat sau build
     return '/home/trieu/project_ws/src/amr_navigation/config/graphs/route_graph.geojson'
+
+
+def get_pose_path():
+    # Luu truc tiep vao src/ de khong bi mat sau build
+    return '/home/trieu/project_ws/src/amr_navigation/config/graphs/route_poses.yaml'
 
 
 def load_yaml():
@@ -144,10 +152,62 @@ def convert_to_nav2_route_geojson(data: dict) -> dict:
     return output, node_id_map
 
 
+def yaw_to_quaternion(yaw):
+    """Chuyen yaw sang quaternion."""
+
+    return {
+        'x': 0.0,
+        'y': 0.0,
+        'z': math.sin(yaw / 2.0),
+        'w': math.cos(yaw / 2.0)
+    }
+
+
+def convert_to_pose_stamped(data: dict, node_id_map: dict) -> dict:
+    """Tao du lieu PoseStamped cho cac node."""
+
+    nodes = data.get('nodes', {})
+    poses = {}
+
+    for name in nodes.keys():
+        node_data = nodes[name]
+
+        pos = node_data.get('position', {})
+        orientation = node_data.get('orientation', {})
+
+        x = pos.get('x', 0.0)
+        y = pos.get('y', 0.0)
+        z = pos.get('z', 0.0)
+
+        yaw = orientation.get('yaw', 0.0)
+
+        quaternion = yaw_to_quaternion(yaw)
+
+        poses[name] = {
+            'id': node_id_map[name],
+            'pose_stamped': {
+                'header': {
+                    'frame_id': 'map'
+                },
+                'pose': {
+                    'position': {
+                        'x': x,
+                        'y': y,
+                        'z': z
+                    },
+                    'orientation': quaternion
+                }
+            }
+        }
+
+    return poses
+
+
 def main():
     print('[INFO] Converting route_graph.yaml to GeoJSON...')
     print(f'[INFO] Input:  {get_yaml_path()}')
     print(f'[INFO] Output: {get_geojson_path()}')
+    print(f'[INFO] Pose:   {get_pose_path()}')
 
     # Load YAML
     data = load_yaml()
@@ -157,12 +217,31 @@ def main():
     # Convert
     geojson_data, node_id_map = convert_to_nav2_route_geojson(data)
 
-    # Save
+    # Save GeoJSON
     os.makedirs(get_config_dir(), exist_ok=True)
     with open(get_geojson_path(), 'w', encoding='utf-8') as f:
         json.dump(geojson_data, f, indent=2)
 
     print(f'[OK] Saved: {get_geojson_path()}')
+
+    # Convert PoseStamped
+    pose_data = convert_to_pose_stamped(data, node_id_map)
+
+    pose_output = {
+        'frame_id': 'map',
+        'poses': pose_data
+    }
+
+    # Save PoseStamped
+    with open(get_pose_path(), 'w', encoding='utf-8') as f:
+        yaml.safe_dump(
+            pose_output,
+            f,
+            sort_keys=False,
+            allow_unicode=True
+        )
+
+    print(f'[OK] Saved: {get_pose_path()}')
 
     # Summary
     print('\n' + '='*50)
@@ -177,8 +256,16 @@ def main():
     for name, nid in sorted(node_id_map.items(), key=lambda x: x[1]):
         print(f'    {nid}: {name}')
 
+    print('\n  PoseStamped:')
+    for name, pose in pose_data.items():
+        yaw = data['nodes'][name].get('orientation', {}).get('yaw', 0.0)
+        print(f'    {name}: x={pose["pose_stamped"]["pose"]["position"]["x"]}, '
+              f'y={pose["pose_stamped"]["pose"]["position"]["y"]}, '
+              f'yaw={yaw}')
+
     print('\n[INFO] Done!')
     print(f'[INFO] GeoJSON ready for nav2_route: {get_geojson_path()}')
+    print(f'[INFO] PoseStamped data: {get_pose_path()}')
 
 
 if __name__ == '__main__':

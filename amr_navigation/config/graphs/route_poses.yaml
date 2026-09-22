@@ -1,0 +1,182 @@
+frame_id: map
+poses:
+  NODE_HOME:
+    id: 0
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  P_1:
+    id: 1
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 0.978
+          y: 1.533
+          z: 0.0
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  D_1:
+    id: 2
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: -1.969
+          y: 0.955
+          z: 0.0
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.9999999999932537
+          w: -3.673205103346574e-06
+  J1:
+    id: 3
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 0.583
+          y: -0.009
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J2:
+    id: 4
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 0.988
+          y: 0.395
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J3:
+    id: 5
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 0.93
+          y: 2.139
+          z: 0.002
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J4:
+    id: 6
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 0.398
+          y: 2.51
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J5:
+    id: 7
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: -1.646
+          y: 2.553
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J6:
+    id: 8
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: -2.034
+          y: 2.189
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J7:
+    id: 9
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: -2.017
+          y: 0.576
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J8:
+    id: 10
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: -1.527
+          y: 0.297
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J9:
+    id: 11
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: -0.683
+          y: 0.162
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0

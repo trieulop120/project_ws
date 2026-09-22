@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 import os
 from glob import glob
 
@@ -8,6 +8,10 @@ package_name = 'amr_navigation'
 config_files = glob(os.path.join('config', '**', '*.yaml'), recursive=True)
 config_files += glob(os.path.join('config', '**', '*.geojson'), recursive=True)
 config_files = [f for f in config_files if os.path.isfile(f)]
+
+# Find BT XML files
+bt_files = glob(os.path.join('config', 'bt', '*.xml'))
+bt_files = [f for f in bt_files if os.path.isfile(f)]
 
 # Find launch files
 launch_files = glob(os.path.join('launch', '*.launch.py'))
@@ -23,6 +27,7 @@ setup(
         'amr_navigation.interactive_node_creator',
         'amr_navigation.yaml_to_geojson',
         'amr_navigation.route_graph_publisher',
+        'amr_navigation.route_graph_loader',
     ],
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -32,6 +37,7 @@ setup(
             'config/nav2_params.yaml',
         ]),
         ('share/' + package_name + '/config/graphs', config_files),
+        ('share/' + package_name + '/config/bt', bt_files),
         ('share/' + package_name + '/launch', launch_files),
         ('share/' + package_name + '/rviz', rviz_files),
     ],

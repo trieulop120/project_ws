@@ -284,6 +284,68 @@ def generate_launch_description():
     )
 
     # ============================================
+    # Route Server (nav2_route)
+    # ============================================
+
+    graph_geojson = os.path.join(
+        get_package_share_directory('amr_navigation'),
+        'config',
+        'graphs',
+        'route_graph.geojson'
+    )
+
+    route_server = Node(
+        package='nav2_route',
+        executable='route_server',
+        name='route_server',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'graph_filepath': graph_geojson,
+            'route_frame': 'map',
+            'global_frame': 'map',
+            'base_frame': 'base_link',
+        }],
+    )
+
+    # ============================================
+    # Route Server Lifecycle - Auto Configure + Activate
+    # Uses separate TimerActions to avoid race conditions
+    # Lifecycle: unconfigured[1] -> configure -> inactive[2] -> activate -> active[3]
+    # ============================================
+    
+    # Delay 3s: Give route_server time to start and enter inactive state
+    route_server_configure = TimerAction(
+        period=3.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'lifecycle', 'set', '/route_server', 'configure'],
+                output='screen',
+            ),
+        ],
+    )
+    
+    # Delay 5s: Wait for configure to complete, then activate
+    route_server_activate = TimerAction(
+        period=5.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'lifecycle', 'set', '/route_server', 'activate'],
+                output='screen',
+            ),
+        ],
+    )
+
+    # ============================================
+    # Route Graph Publisher
+    # ============================================
+    route_graph_publisher = Node(
+        executable=route_graph_publisher_bin,
+        name='route_graph_publisher',
+        output='screen',
+    )
+
+    # ============================================
     # RViz with Nav2 panel
     # ============================================
     rviz = Node(
@@ -332,6 +394,13 @@ def generate_launch_description():
 
         # Nav2 (includes map_server, amcl, controller, planner, etc.)
         nav2_bringup_delayed,
+
+        # Route Server - starts immediately after Nav2 delay (8s total)
+        route_server,
+
+        # Route Server lifecycle - configure then activate with proper delays
+        route_server_configure,
+        route_server_activate,
 
         # cmd_vel_splitter
         cmd_vel_splitter,
