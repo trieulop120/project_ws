@@ -452,6 +452,75 @@
           ]
         ]
       }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 24,
+        "startid": 1,
+        "endid": 4
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              0.978,
+              1.533
+            ],
+            [
+              0.988,
+              0.395
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 25,
+        "startid": 4,
+        "endid": 3
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              0.988,
+              0.395
+            ],
+            [
+              0.583,
+              -0.009
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 26,
+        "startid": 3,
+        "endid": 0
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              0.583,
+              -0.009
+            ],
+            [
+              0.0,
+              0.0
+            ]
+          ]
+        ]
+      }
     }
   ]
 }

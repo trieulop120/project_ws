@@ -143,46 +143,61 @@ edges:
   distance: 1.14
 - from: P_1
   to: J3
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 0.61
 - from: J3
   to: J4
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 0.65
 - from: J4
   to: J5
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 2.04
 - from: J5
   to: J6
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 0.53
 - from: J6
   to: D_1
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 1.24
 - from: D_1
   to: J7
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 0.38
 - from: J7
   to: J8
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 0.56
 - from: J8
   to: J9
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 0.85
 - from: J9
   to: NODE_HOME
-  bidirectional: false
+  bidirectional: true
   weight: 1.0
   distance: 0.7
+- from: P_1
+  to: J2
+  bidirectional: true
+  weight: 1.0
+  distance: 1.14
+- from: J2
+  to: J1
+  bidirectional: true
+  weight: 1.0
+  distance: 0.57
+- from: J1
+  to: NODE_HOME
+  bidirectional: true
+  weight: 1.0
+  distance: 0.58

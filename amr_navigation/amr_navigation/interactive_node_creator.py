@@ -47,13 +47,13 @@ HOME_NODE = {
 
 # CAU HINH MARKER
 Z_OFFSET = 0.5          # Z cao 0.5m
-NODE_SCALE = 0.2         # Sphere 0.2m
-HOME_SCALE = 0.25        # HOME 0.25m
-EDGE_SCALE = 0.08        # Line 0.08m
+NODE_SCALE = 0.15         # Sphere 0.2m
+HOME_SCALE = 0.22        # HOME 0.25m
+EDGE_SCALE = 0.06        # Line 0.08m
 
 # MAU SAC theo class
 COLOR_HOME = (1.0, 0.5, 0.0)     # Cam - HOME, CHARGE
-COLOR_PICKUP = (0.0, 1.0, 0.0)    # Xanh la - PICKUP_*, P_*
+COLOR_PICKUP = (1.0, 1.0, 0.0)    # Vang - PICKUP_*, P_*
 COLOR_DROPOFF = (1.0, 0.0, 0.0)  # Do - DROP_*, D_*
 COLOR_TRANSIT = (0.0, 0.4, 1.0)   # Xanh duong - J*, WAYPOINT*, transit
 COLOR_SAFE_ZONE = (0.5, 0.5, 0.5) # Xam - SAFE_*
@@ -125,7 +125,7 @@ def get_node_color(ntype: str):
     if ntype in ('home', 'charging'):
         return COLOR_HOME        # Cam (1.0, 0.5, 0.0)
     elif ntype in ('pickup_approach', 'pickup'):
-        return COLOR_PICKUP      # Xanh la (0.0, 1.0, 0.0)
+        return COLOR_PICKUP      # Xanh la (1.0, 1.0, 0.0)
     elif ntype in ('dropoff_approach', 'dropoff'):
         return COLOR_DROPOFF     # Do (1.0, 0.0, 0.0)
     elif ntype == 'safe_zone':

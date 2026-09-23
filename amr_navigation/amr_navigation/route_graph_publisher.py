@@ -30,13 +30,13 @@ HOME_NODE_NAME = 'NODE_HOME'
 
 # Cấu hình marker
 Z_OFFSET = 0.5
-NODE_SCALE = 0.1
-HOME_SCALE = 0.125
-EDGE_SCALE = 0.04
+NODE_SCALE = 0.15
+HOME_SCALE = 0.2
+EDGE_SCALE = 0.06
 
 # Màu sắc
 COLOR_HOME = (1.0, 0.5, 0.0)
-COLOR_PICKUP = (0.0, 1.0, 0.0)
+COLOR_PICKUP = (0.7, 0.2, 1.0)    # Tím - PICKUP_*, P_*
 COLOR_DROPOFF = (1.0, 0.0, 0.0)
 COLOR_TRANSIT = (0.0, 0.4, 1.0)
 COLOR_SAFE_ZONE = (0.5, 0.5, 0.5)
@@ -188,22 +188,24 @@ class RouteGraphPublisher(Node):
             markers.markers.append(m)
 
             # DIRECTION ARROW
-            m = Marker()
-            m.header.frame_id = 'map'
-            m.header.stamp = self.get_clock().now().to_msg()
-            m.ns = 'arrows'
-            m.id = i
-            m.type = Marker.ARROW
-            m.action = Marker.ADD
-            m.pose.position.x = x
-            m.pose.position.y = y
-            m.pose.position.z = z
-            m.pose.orientation = yaw_to_quaternion(yaw)
-            m.scale.x = 0.4 if is_home else 0.3
-            m.scale.y = 0.08 if is_home else 0.05
-            m.scale.z = 0.05
-            m.color = make_color(*color)
-            markers.markers.append(m)
+            is_key_node = name in ('NODE_HOME', 'P_1', 'D_1')
+            if is_key_node:
+             m = Marker()
+             m.header.frame_id = 'map'
+             m.header.stamp = self.get_clock().now().to_msg()
+             m.ns = 'arrows'
+             m.id = i
+             m.type = Marker.ARROW
+             m.action = Marker.ADD
+             m.pose.position.x = x
+             m.pose.position.y = y
+             m.pose.position.z = z
+             m.pose.orientation = yaw_to_quaternion(yaw)
+             m.scale.x = 0.2 
+             m.scale.y = 0.08 
+             m.scale.z = 0.03
+             m.color = make_color(*color)
+             markers.markers.append(m)
 
         # Edges
         for e_idx, e in enumerate(self.edges):
