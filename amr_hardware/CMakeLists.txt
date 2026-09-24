@@ -22,18 +22,11 @@ install(FILES
   DESTINATION share/${PROJECT_NAME}/config
 )
 
-# Install standalone scripts (no entry_points needed)
+# Install console_scripts
 install(PROGRAMS
-  ${CMAKE_CURRENT_SOURCE_DIR}/scripts/auto_detect_usb.py
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/static_transforms.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME auto_detect_usb
-)
-
-# Install console_scripts (entry_points from old setup.py)
-install(PROGRAMS
-  ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/static_tf_broadcaster.py
-  DESTINATION lib/${PROJECT_NAME}
-  RENAME static_tf_broadcaster
+  RENAME static_transforms
 )
 install(PROGRAMS
   ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/esp32_bridge.py
@@ -44,11 +37,6 @@ install(PROGRAMS
   ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/teleop_amr.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME teleop_amr
-)
-install(PROGRAMS
-  ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/cli_control.py
-  DESTINATION lib/${PROJECT_NAME}
-  RENAME cli_control
 )
 install(PROGRAMS
   ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/cmd_vel_splitter.py

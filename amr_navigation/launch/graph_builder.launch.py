@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Graph Builder Launch File
+Graph Builder Launch File (Simulation)
+
+Tạo/sửa route graph trên simulation với map Gazebo.
 
 Usage:
-    ros2 launch amr_navigation graph_builder.launch.py           # Clean slate
-    ros2 launch amr_navigation graph_builder.launch.py load_existing:=true  # Load existing
+    ros2 launch amr_navigation graph_builder.launch.py
+    ros2 launch amr_navigation graph_builder.launch.py load_existing:=true
 """
 
 import os
@@ -17,21 +19,21 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # Dùng package share (với symlink-install sẽ trỏ vào src/)
     pkg_nav = get_package_share_directory('amr_navigation')
     pkg_mapping = get_package_share_directory('amr_mapping')
 
-    rviz_config = os.path.join(pkg_nav, 'rviz', 'route_builder.rviz')
+    # ============================================
+    # PATHS - Chỉnh sửa ở đây
+    # ============================================
+    input_yaml = os.path.join(pkg_nav, 'config', 'graphs', 'route_graph.yaml')
+    output_geojson = os.path.join(pkg_nav, 'config', 'graphs', 'route_graph.geojson')
+    output_poses = os.path.join(pkg_nav, 'config', 'graphs', 'route_poses.yaml')
     map_yaml = os.path.join(pkg_mapping, 'maps', 'amr_map.yaml')
+    rviz_config = os.path.join(pkg_nav, 'rviz', 'route_builder.rviz')
 
-    # Đường dẫn route graph - save vào src/config/graphs/ (nhờ symlink-install)
-    graph_yaml = os.path.expanduser(
-    '~/project_ws/src/amr_navigation/config/graphs/route_graph.yaml'
-    )
-
-    # Executable nằm trong lib/ nhờ colcon build --symlink-install
-    # Node() khai bao package + executable chuan
-
+    # ============================================
+    # Launch Arguments
+    # ============================================
     load_existing_arg = DeclareLaunchArgument(
         'load_existing',
         default_value='false',
@@ -39,14 +41,18 @@ def generate_launch_description():
     )
     load_existing = LaunchConfiguration('load_existing')
 
+    # ============================================
+    # Return LaunchDescription
+    # ============================================
     return LaunchDescription([
         SetEnvironmentVariable(name='MESA_GL_VERSION_OVERRIDE', value='3.3'),
 
         load_existing_arg,
 
-        LogInfo(msg='[GRAPH_BUILDER] Khoi tao he thong...'),
+        LogInfo(msg='[GRAPH_BUILDER] Khởi tạo simulation...'),
+        LogInfo(msg=f'  Input YAML: {input_yaml}'),
+        LogInfo(msg=f'  Output GeoJSON: {output_geojson}'),
         LogInfo(msg=f'  Map: {map_yaml}'),
-        LogInfo(msg=f'  Graph: {graph_yaml}'),
         LogInfo(condition=IfCondition(load_existing), msg='  Mode: LOAD EXISTING'),
         LogInfo(condition=UnlessCondition(load_existing), msg='  Mode: CLEAN SLATE'),
 
@@ -76,7 +82,7 @@ def generate_launch_description():
             parameters=[{'autostart': True, 'node_names': ['map_server'], 'use_sim_time': False}],
         ),
 
-        # Interactive Node Creator - mở terminal riêng để nhập lệnh
+        # Interactive Node Creator
         Node(
             package='amr_navigation',
             executable='interactive_node_creator',
@@ -84,9 +90,23 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'load_existing': load_existing,
-                'graph_filepath': graph_yaml,
+                'graph_filepath': input_yaml,
             }],
             prefix=['gnome-terminal --title="Node Creator CLI" --'],
+        ),
+
+        # YAML to GeoJSON Converter
+        Node(
+            package='amr_navigation',
+            executable='yaml_to_geojson',
+            name='yaml_to_geojson',
+            output='screen',
+            parameters=[{
+                'input_yaml': input_yaml,
+                'output_geojson': output_geojson,
+                'output_poses': output_poses,
+                'auto_run': False,
+            }],
         ),
 
         # RViz2

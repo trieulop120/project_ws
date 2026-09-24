@@ -19,7 +19,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point, PointStamped, PoseStamped, Quaternion
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Empty
 import yaml
 import os
 import math
@@ -53,7 +53,7 @@ EDGE_SCALE = 0.06        # Line 0.08m
 
 # MAU SAC theo class
 COLOR_HOME = (1.0, 0.5, 0.0)     # Cam - HOME, CHARGE
-COLOR_PICKUP = (1.0, 1.0, 0.0)    # Vang - PICKUP_*, P_*
+COLOR_PICKUP = (0.7, 0.2, 1.0)    # Tím - PICKUP_*, P_*
 COLOR_DROPOFF = (1.0, 0.0, 0.0)  # Do - DROP_*, D_*
 COLOR_TRANSIT = (0.0, 0.4, 1.0)   # Xanh duong - J*, WAYPOINT*, transit
 COLOR_SAFE_ZONE = (0.5, 0.5, 0.5) # Xam - SAFE_*
@@ -196,6 +196,9 @@ class InteractiveNodeCreator(Node):
             MarkerArray, '/route_graph/markers', qos_profile=qos_profile
         )
 
+        # Publisher: thông báo khi graph được save
+        self.save_pub = self.create_publisher(Empty, '/graph_saved', 10)
+
         # === SUBSCRIBERS ===
         # /clicked_point: Publish Point (🔵) tren RViz2
         # geometry_msgs/PointStamped - chi lay x, y, yaw=0
@@ -285,6 +288,10 @@ class InteractiveNodeCreator(Node):
 
         print(f'[SAVE] {self.yaml_file}')
         print(f'       Nodes: {len(self.nodes)} | Edges: {len(self.edges)}')
+
+        # Publish để yaml_to_geojson tự động convert
+        self.save_pub.publish(Empty())
+        print('       [AUTO-CONVERT] Đang chuyển đổi GeoJSON...')
 
     # =========================================================================
     # CALLBACKS - Chi dat pending, KHONG block

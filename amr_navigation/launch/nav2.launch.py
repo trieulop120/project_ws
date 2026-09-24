@@ -1,31 +1,26 @@
-"""Launch Nav2 stack for AMR navigation (localization + navigation).
-
-Standalone launch - chạy khi đã có Gazebo + EKF + sensor chạy ở chỗ khác.
+"""Nav2 Launch for Real Hardware.
 
 Usage:
   ros2 launch amr_navigation nav2.launch.py
 
-Requires (đã chạy ở chỗ khác):
-  - /scan (LiDAR)
-  - /odom (wheel odometry)
-  - /imu/data (IMU)
+Requires (đã chạy từ real_bringup.launch.py):
+  - /scan_filtered (LiDAR đã lọc)
+  - /odometry/filtered (EKF odometry)
+  - /imu/data_raw (IMU)
   - /points (Camera PointCloud)
-  - TF: odom -> base_footprint (từ EKF)
+  - /points_filtered (downsampled PointCloud)
+  - /map (từ SLAM)
 
 Outputs:
-  - /map (từ map_server)
   - /amcl_pose (vị trí robot trên map)
   - TF: map -> odom (từ AMCL)
-  - cmd_vel_nav -> cmd_vel (velocity commands đến robot)
-  - /points_filtered (từ VoxelGrid, ~15Hz)
-  - /octomap_point_cloud_centers (từ octomap_server, ~2Hz)
+  - /cmd_vel_nav -> /cmd_vel_smoothed -> /cmd_vel (robot)
 """
 
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
 from launch_ros.actions import Node
 
 
@@ -33,27 +28,17 @@ def generate_launch_description():
     pkg_nav = get_package_share_directory('amr_navigation')
     pkg_mapping = get_package_share_directory('amr_mapping')
 
-    # Arguments
-    use_sim_time = DeclareLaunchArgument(
-        'use_sim_time',
-        default_value='true',
-        description='Use simulation clock'
-    )
+    # ============================================
+    # PATHS - Chỉnh sửa ở đây
+    # ============================================
+    params_file = os.path.join(pkg_nav, 'config', 'nav2_params_real.yaml')
+    map_file = os.path.join(pkg_mapping, 'maps', 'real_map.yaml')
+    graph_file = os.path.join(pkg_nav, 'config', 'graphs', 'route_graph.geojson')
+    rviz_config = os.path.join(pkg_nav, 'rviz', 'navigation.rviz')
 
-    # Paths
-    params_file = os.path.join(pkg_nav, 'config', 'nav2_params.yaml')
-    map_file = os.path.join(pkg_mapping, 'maps', 'amr_map.yaml')
-    octomap_params = os.path.join(pkg_mapping, 'config', 'octomap_params.yaml')
-
-    # Nav2 bringup launch from nav2_bringup package
-    # Bao gồm: map_server, amcl, controller, planner, bt_navigator, etc.
-    bringup_dir = get_package_share_directory('nav2_bringup')
-
-    # Import nav2 bringup launch
-    from launch.launch_description_sources import PythonLaunchDescriptionSource
-    from launch.actions import IncludeLaunchDescription
-
-    # map_server node
+    # ============================================
+    # Map Server
+    # ============================================
     map_server_node = Node(
         package='nav2_map_server',
         executable='map_server',
@@ -61,14 +46,13 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'yaml_filename': map_file,
-            'use_sim_time': LaunchConfiguration('use_sim_time'),
+            'use_sim_time': False,
         }],
-        remappings=[
-            ('/map', '/map'),
-        ]
     )
 
-    # AMCL node
+    # ============================================
+    # AMCL Localization
+    # ============================================
     amcl_node = Node(
         package='nav2_amcl',
         executable='amcl',
@@ -76,25 +60,29 @@ def generate_launch_description():
         output='screen',
         parameters=[params_file],
         remappings=[
-            ('/scan', '/scan'),
+            ('/scan', '/scan_filtered'),
             ('/initialpose', '/initialpose'),
         ]
     )
 
-    # Lifecycle manager for localization
+    # ============================================
+    # Lifecycle Manager — Localization
+    # ============================================
     localization_mgr = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
         name='lifecycle_manager_localization',
         output='screen',
         parameters=[{
-            'use_sim_time': LaunchConfiguration('use_sim_time'),
+            'use_sim_time': False,
             'autostart': True,
             'node_names': ['map_server', 'amcl'],
         }]
     )
 
-    # Controller server
+    # ============================================
+    # Controller Server (MPPI)
+    # ============================================
     controller_node = Node(
         package='nav2_controller',
         executable='controller_server',
@@ -103,51 +91,45 @@ def generate_launch_description():
         parameters=[params_file],
         remappings=[
             ('/cmd_vel', '/cmd_vel_nav'),
-            ('/tf', '/tf'),
-            ('/tf_static', '/tf_static'),
         ]
     )
 
-    # Planner server
+    # ============================================
+    # Planner Server (A* SmacPlanner2D)
+    # ============================================
     planner_node = Node(
         package='nav2_planner',
         executable='planner_server',
         name='planner_server',
         output='screen',
         parameters=[params_file],
-        remappings=[
-            ('/tf', '/tf'),
-            ('/tf_static', '/tf_static'),
-        ]
     )
 
-    # Behavior server (spin, backup, wait, etc.)
+    # ============================================
+    # Behavior Server (spin, backup, wait)
+    # ============================================
     behavior_node = Node(
         package='nav2_behaviors',
         executable='behavior_server',
         name='behavior_server',
         output='screen',
         parameters=[params_file],
-        remappings=[
-            ('/tf', '/tf'),
-            ('/tf_static', '/tf_static'),
-        ]
     )
 
+    # ============================================
     # BT Navigator
+    # ============================================
     bt_navigator = Node(
         package='nav2_bt_navigator',
         executable='bt_navigator',
         name='bt_navigator',
         output='screen',
         parameters=[params_file],
-        remappings=[
-            ('/tf', '/tf'),
-            ('/tf_static', '/tf_static'),
-        ]
     )
 
-    # Waypoint follower
+    # ============================================
+    # Waypoint Follower
+    # ============================================
     waypoint_follower = Node(
         package='nav2_waypoint_follower',
         executable='waypoint_follower',
@@ -156,7 +138,9 @@ def generate_launch_description():
         parameters=[params_file],
     )
 
-    # Velocity smoother
+    # ============================================
+    # Velocity Smoother
+    # ============================================
     velocity_smoother = Node(
         package='nav2_velocity_smoother',
         executable='velocity_smoother',
@@ -169,14 +153,16 @@ def generate_launch_description():
         ]
     )
 
-    # Lifecycle manager for navigation
+    # ============================================
+    # Lifecycle Manager — Navigation
+    # ============================================
     navigation_mgr = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
         name='lifecycle_manager_navigation',
         output='screen',
         parameters=[{
-            'use_sim_time': LaunchConfiguration('use_sim_time'),
+            'use_sim_time': False,
             'autostart': True,
             'node_names': [
                 'controller_server',
@@ -190,48 +176,81 @@ def generate_launch_description():
     )
 
     # ============================================
-    # PointCloud Downsampler (C++ with PCL VoxelGrid)
-    # Input: /points (raw from camera, ~57,000 pts)
-    # Output: /points_filtered (~2,000-3,000 pts @ 10-15Hz)
-    # Filters: Z-range 0.15-1.20m (remove floor/ceiling)
+    # Route Server (nav2_route)
     # ============================================
-    voxel_grid_node = Node(
-        package='amr_perception',
-        executable='pointcloud_downsampler',
-        name='pointcloud_downsampler',
+    route_server = Node(
+        package='nav2_route',
+        executable='route_server',
+        name='route_server',
         output='screen',
         parameters=[{
-            'leaf_size': 0.05,
-            'z_min': 0.15,
-            'z_max': 1.20,
+            'use_sim_time': False,
+            'graph_filepath': graph_file,
+            'route_frame': 'map',
+            'global_frame': 'map',
+            'base_frame': 'base_link',
         }],
     )
 
     # ============================================
-    # OctoMap Server (for 3D visualization & global map)
-    # Converts PointCloud2 -> Octree -> /octomap_point_cloud_centers
+    # Route Server Lifecycle - Auto Configure + Activate
+    # Lifecycle: unconfigured[1] -> configure -> inactive[2] -> activate -> active[3]
     # ============================================
-    octomap_server = Node(
-        package='octomap_server',
-        executable='octomap_server_node',
-        name='octomap_server',
-        output='screen',
-        parameters=[octomap_params],
-        remappings=[
-            ('cloud_in', '/points_filtered'),
-            ('octomap_point_cloud_centers', '/octomap_point_cloud_centers'),
+    route_server_configure = TimerAction(
+        period=3.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'lifecycle', 'set', '/route_server', 'configure'],
+                output='screen',
+            ),
         ],
     )
 
-    return LaunchDescription([
-        use_sim_time,
+    route_server_activate = TimerAction(
+        period=5.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'lifecycle', 'set', '/route_server', 'activate'],
+                output='screen',
+            ),
+        ],
+    )
 
-        # Localization stack
+    # ============================================
+    # Route Graph Publisher
+    # ============================================
+    route_graph_publisher = Node(
+        package='amr_navigation',
+        executable='route_graph_publisher',
+        name='route_graph_publisher',
+        output='screen',
+        parameters=[{
+            'graph_yaml_path': graph_file.replace('.geojson', '.yaml'),
+        }],
+    )
+
+    # ============================================
+    # RViz (Navigation)
+    # ============================================
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config],
+        parameters=[{'use_sim_time': False}],
+        output='screen',
+    )
+
+    # ============================================
+    # Return LaunchDescription
+    # ============================================
+    return LaunchDescription([
+        # Localization
         map_server_node,
         amcl_node,
         localization_mgr,
 
-        # Navigation stack
+        # Navigation
         controller_node,
         planner_node,
         behavior_node,
@@ -240,7 +259,16 @@ def generate_launch_description():
         velocity_smoother,
         navigation_mgr,
 
-        # 3D Perception
-        voxel_grid_node,
-        octomap_server,
+        # Route Server
+        route_server,
+
+        # Route Server Lifecycle
+        route_server_configure,
+        route_server_activate,
+
+        # Route Graph Publisher
+        route_graph_publisher,
+
+        # Visualization
+        rviz_node,
     ])

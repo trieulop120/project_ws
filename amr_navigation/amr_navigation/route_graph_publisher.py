@@ -29,10 +29,10 @@ from ament_index_python.packages import get_package_share_directory
 HOME_NODE_NAME = 'NODE_HOME'
 
 # Cấu hình marker
-Z_OFFSET = 0.5
-NODE_SCALE = 0.15
-HOME_SCALE = 0.2
-EDGE_SCALE = 0.06
+Z_OFFSET = 0.5          
+NODE_SCALE = 0.15         
+HOME_SCALE = 0.22        
+EDGE_SCALE = 0.06 
 
 # Màu sắc
 COLOR_HOME = (1.0, 0.5, 0.0)
@@ -87,10 +87,8 @@ def get_route_graph_path():
     return os.path.join(pkg_share, 'config', 'graphs', 'route_graph.yaml')
 
 
-def load_route_graph():
+def load_route_graph(yaml_path: str) -> tuple:
     """Load route graph từ YAML"""
-    yaml_path = get_route_graph_path()
-
     if not os.path.exists(yaml_path):
         return None, None
 
@@ -112,15 +110,22 @@ class RouteGraphPublisher(Node):
     def __init__(self):
         super().__init__('route_graph_publisher')
 
+        # Declare parameter cho graph path
+        default_path = get_route_graph_path()
+        self.declare_parameter('graph_yaml_path', default_path)
+        self.graph_yaml_path = self.get_parameter('graph_yaml_path').value
+
+        self.get_logger().info(f'Graph YAML: {self.graph_yaml_path}')
+
         self.marker_pub = self.create_publisher(
             MarkerArray, '/route_graph/markers', 10
         )
 
         # Load graph
-        self.nodes, self.edges = load_route_graph()
+        self.nodes, self.edges = load_route_graph(self.graph_yaml_path)
 
         if self.nodes is None:
-            self.get_logger().warn(f'Route graph not found, skipping')
+            self.get_logger().warn(f'Route graph not found: {self.graph_yaml_path}')
             return
 
         self.get_logger().info(f'Loaded {len(self.nodes)} nodes, {len(self.edges)} edges')
@@ -188,7 +193,7 @@ class RouteGraphPublisher(Node):
             markers.markers.append(m)
 
             # DIRECTION ARROW
-            is_key_node = name in ('NODE_HOME', 'P_1', 'D_1')
+            is_key_node = name in ('NODE_HOME', 'P_1', 'P_2', 'D_1')
             if is_key_node:
              m = Marker()
              m.header.frame_id = 'map'

@@ -14,7 +14,7 @@ public:
         // Khai báo các tham số kích thước khung xe (Đơn vị: Mét)
         // Lidar đặt tại mốc gốc (0,0)
         this->declare_parameter<double>("front_limit", 0.45); // Phía trước  (+X): 45 cm
-        this->declare_parameter<double>("rear_limit", 0.20);  // Phía sau    (-X): 20 cm
+        this->declare_parameter<double>("rear_limit", 0.25);  // Phía sau    (-X): 25 cm
         this->declare_parameter<double>("left_limit", 0.25);  // Bên trái    (+Y): 25 cm
         this->declare_parameter<double>("right_limit", 0.25); // Bên phải   (-Y): 25 cm
 

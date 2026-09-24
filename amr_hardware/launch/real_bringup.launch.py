@@ -90,77 +90,13 @@ def generate_launch_description():
     )
 
     # ============================================
-    # Rear Caster Static TFs
+    # Static Transform Publisher
     # ============================================
-    caster_steer_left_tf = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='caster_steer_left_tf_publisher',
-        arguments=[
-            '--x', '-0.1332',
-            '--y', '0.1931',
-            '--z', '-0.027503',
-            '--qx', '0',
-            '--qy', '0',
-            '--qz', '0',
-            '--qw', '1',
-            '--frame-id', 'base_link',
-            '--child-frame-id', 'rear_caster_steer_left_link'
-        ],
-        parameters=[{'use_sim_time': False}],
-    )
-
-    caster_wheel_left_tf = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='caster_wheel_left_tf_publisher',
-        arguments=[
-            '--x', '0.017',
-            '--y', '0',
-            '--z', '-0.0400',
-            '--qx', '0',
-            '--qy', '0',
-            '--qz', '0',
-            '--qw', '1',
-            '--frame-id', 'rear_caster_steer_left_link',
-            '--child-frame-id', 'rear_caster_wheel_left_link'
-        ],
-        parameters=[{'use_sim_time': False}],
-    )
-
-    caster_steer_right_tf = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='caster_steer_right_tf_publisher',
-        arguments=[
-            '--x', '-0.1332',
-            '--y', '-0.1931',
-            '--z', '-0.027503',
-            '--qx', '0',
-            '--qy', '0',
-            '--qz', '0',
-            '--qw', '1',
-            '--frame-id', 'base_link',
-            '--child-frame-id', 'rear_caster_steer_right_link'
-        ],
-        parameters=[{'use_sim_time': False}],
-    )
-
-    caster_wheel_right_tf = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='caster_wheel_right_tf_publisher',
-        arguments=[
-            '--x', '0.017',
-            '--y', '0',
-            '--z', '-0.0400',
-            '--qx', '0',
-            '--qy', '0',
-            '--qz', '0',
-            '--qw', '1',
-            '--frame-id', 'rear_caster_steer_right_link',
-            '--child-frame-id', 'rear_caster_wheel_right_link'
-        ],
+    static_transforms = Node(
+        package='amr_hardware',
+        executable='static_transforms',
+        name='amr_static_transforms',
+        output='screen',
         parameters=[{'use_sim_time': False}],
     )
 
@@ -229,22 +165,8 @@ def generate_launch_description():
     )
 
     # ============================================
-    # Camera Static TFs & Driver
+    # Camera Driver
     # ============================================
-    camera_depth_tf = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='camera_depth_tf_publisher',
-        arguments=[
-            '--x', '0', '--y', '0', '--z', '0',
-            '--qx', '-0.5', '--qy', '0.5', '--qz', '-0.5', '--qw', '0.5',
-            '--frame-id', 'camera_link',
-            '--child-frame-id', 'camera_depth_optical_frame'
-        ],
-        parameters=[{'use_sim_time': False}],
-        condition=IfCondition(camera_enable)
-    )
-
     camera_driver = Node(
         package='astra_camera',
         executable='astra_camera_node',
@@ -278,13 +200,9 @@ def generate_launch_description():
         name='pointcloud_filter',
         output='screen',
         parameters=[{
-            'use_sim_time': False,
-            'min_distance': 0.6,
-            'max_distance': 3.5,
+            'leaf_size': 0.05,
             'min_height': 0.15,
             'max_height': 1.20,
-            'input_topic': '/points',
-            'output_topic': '/points_filtered',
         }],
         condition=IfCondition(camera_enable)
     )
@@ -318,19 +236,15 @@ def generate_launch_description():
 
         bringup_info,
         lidar_info,
-        scan_filter_node,
         ekf_info,
 
         rsp,
-        caster_steer_left_tf,
-        caster_wheel_left_tf,
-        caster_steer_right_tf,
-        caster_wheel_right_tf,
+        static_transforms,
 
         esp32_bridge,
         cmd_vel_splitter,
         lidar_node,
-        camera_depth_tf,
+        scan_filter_node,
         camera_driver,
         pointcloud_filter_node,
         ekf_node,

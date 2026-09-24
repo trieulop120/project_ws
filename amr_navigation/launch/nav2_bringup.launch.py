@@ -61,6 +61,7 @@ def generate_launch_description():
     map_file = os.path.join(pkg_amr_mapping, 'maps', 'amr_map.yaml')
     rviz_config = os.path.join(pkg_amr_nav, 'rviz', 'navigation.rviz')
     controller_config = os.path.join(pkg_amr_desc, 'config', 'lift_controller.yaml')
+    graph_file = os.path.join(pkg_amr_nav, 'config', 'graphs', 'route_graph.geojson')
 
     # Xacro processing
     doc = xacro.parse(open(xacro_file))
@@ -214,7 +215,7 @@ def generate_launch_description():
     voxel_grid_node = Node(
         package='amr_perception',
         executable='pointcloud_downsampler',
-        name='pointcloud_downsampler',
+        name='pointcloud_filter',
         output='screen',
         parameters=[{
             'leaf_size': 0.05,
@@ -254,13 +255,16 @@ def generate_launch_description():
     )
 
     # ============================================
-    # Route Graph Publisher (hiển thị nodes/edges trên RViz)
+    # Route Graph Publisher
     # ============================================
     route_graph_publisher = Node(
         package='amr_navigation',
         executable='route_graph_publisher',
         name='route_graph_publisher',
         output='screen',
+        parameters=[{
+            'graph_yaml_path': graph_file.replace('.geojson', '.yaml'),
+        }],
     )
 
     # ============================================
