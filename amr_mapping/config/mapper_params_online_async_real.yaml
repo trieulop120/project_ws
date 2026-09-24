@@ -1,0 +1,84 @@
+slam_toolbox:
+  ros__parameters:
+    # Thời gian phần cứng thực tế
+    use_sim_time: false # MODIFIED: Đổi từ true thành false cho phần cứng thực tế
+
+    # Plugin tối ưu hóa Graph SLAM
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # Khai báo các khung tọa độ chuẩn
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_footprint
+    scan_topic: /scan_filtered
+    odom_topic: /odometry/filtered
+    mode: mapping
+
+    # Cấu hình QoS cho LiDAR thực tế
+    qos_overrides:
+      /scan_filtered: # MODIFIED: Đổi tên topic QoS khớp với /scan_filtered
+        subscription:
+          reliability: best_effort
+          durability: volatile
+
+    # Quản lý bộ đệm & tần số xử lý
+    message_queue_size: 50
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.05
+    map_update_interval: 1.0
+    resolution: 0.05
+    min_laser_range: 0.35 # MODIFIED: Đổi từ 0.25m lên 0.35m khớp với scan_filter_node để triệt tiêu nhiễu khung xe
+    max_laser_range: 12.0
+    minimum_time_interval: 0.1 # MODIFIED: Giảm từ 0.5s xuống 0.1s để xử lý scan kịp thời khi xe thực di chuyển
+    transform_timeout: 0.5 # MODIFIED: Tăng từ 0.2s lên 0.5s tránh mất TF do độ trễ xử lý của máy tính nhúng
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    enable_interactive_mode: true
+    update_rate: 10.0
+
+    # Tinh chỉnh độ nhạy di chuyển trên phần cứng thực
+    minimum_travel_distance: 0.10 # MODIFIED: Giảm từ 0.15m xuống 0.10m để cập nhật map mịn hơn ở tốc độ thấp
+    minimum_travel_heading: 0.10 # MODIFIED: Giảm từ 0.15 rad xuống 0.10 rad giúp xoay tại chỗ quét góc chính xác hơn
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.10
+    link_scan_maximum_distance: 1.5
+
+    # Scan Matching
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimumScore: 50.0
+
+    # Tinh chỉnh mô hình nhiễu Odom thực tế
+    sigma_noise_xy: 0.05 # MODIFIED: Giảm nhiễu XY giả định vì đã có EKF hỗ trợ
+    sigma_noise_theta: 0.10 # MODIFIED: Giảm nhiễu Theta để SLAM tin tưởng Scan Matching hơn khi góc xoay bị trượt
+
+    # Loop Closure (Khép vòng bản đồ)
+    do_loop_closing: true
+    loop_search_maximum_distance: 4.0
+    loop_match_minimum_chain_size: 8
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # Không gian tìm kiếm & Phạt sai số
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true

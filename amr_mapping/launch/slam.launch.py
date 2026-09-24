@@ -1,14 +1,7 @@
-"""Launch SLAM toolbox for 2D mapping.
-
-Subscribes to:
-  - /scan (LiDAR scan from Sllidar A1M8)
-  - /tf (odom -> base_footprint from EKF)
-
-Publishes:
-  - /map (occupancy grid)
-  - /map_metadata
-  - /slam_toolbox/scan_visualization
-  - TF: map -> odom
+#!/usr/bin/env python3
+"""
+SLAM Bringup Real Hardware - Launch EKF + SLAM + OctoMap + Controllers + RViz (No Gazebo)
+File location: amr_mapping/launch/slam.launch.py
 """
 
 import os
@@ -18,23 +11,70 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    pkg_mapping = get_package_share_directory('amr_mapping')
-    config_file = os.path.join(pkg_mapping, 'config', 'mapper_params_online_async.yaml')
+    # ============================================
+    # Package paths
+    # ============================================
+    pkg_amr_mapping = get_package_share_directory('amr_mapping')
 
+    # Config Paths
+    slam_config = os.path.join(pkg_amr_mapping, 'config', 'mapper_params_online_async_real.yaml')
+    octomap_params = os.path.join(pkg_amr_mapping, 'config', 'octomap_params.yaml')
+    rviz_config = os.path.join(pkg_amr_mapping, 'rviz', 'slam.rviz')
+
+    # ============================================
+    # SLAM Toolbox
+    # ============================================
     slam_node = Node(
         package='slam_toolbox',
         executable='async_slam_toolbox_node',
         name='slam_toolbox',
         output='screen',
-        parameters=[{
-            'use_sim_time': True,
-            config_file: config_file,
-        }],
-        remappings=[
-            ('/scan', '/scan'),
-        ]
+        parameters=[
+            {'use_sim_time': False},
+            slam_config
+        ],
     )
 
+    # ============================================
+    # OctoMap Server
+    # ============================================
+    octomap_server = Node(
+        package='octomap_server',
+        executable='octomap_server_node',
+        name='octomap_server',
+        output='screen',
+        parameters=[
+            {'use_sim_time': False},
+            octomap_params
+        ],
+        remappings=[
+            ('cloud_in', '/points'),
+        ],
+    )
+
+    # ============================================
+    # RViz2
+    # ============================================
+    rviz = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config],
+        parameters=[{'use_sim_time': False}],
+        output='screen',
+    )
+
+    # ============================================
+    # Return LaunchDescription
+    # ============================================
     return LaunchDescription([
-        slam_node,
+
+        # SLAM
+        slam_node,         # <-- Nhận /scan_filtered để dựng bản đồ
+
+        # OctoMap Server
+        octomap_server,
+
+        # Visualization
+        rviz,
     ])

@@ -1,0 +1,22 @@
+# =============================================================================
+# AMR USB Device Rules - ESP32 & RPLiDAR (CP2102)
+# =============================================================================
+# [AUDIT_FIX]: Fixed udev rule logic - IMPORT must come before ENV check,
+# and added ATTRS for more specific device matching
+
+# 1. ESP32: Match by vendor/product ID (Silicon Labs CP2102)
+KERNEL=="ttyUSB*", SUBSYSTEM=="tty", \
+    ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+    ATTRS{serial}=="0001", \
+    IMPORT{builtin}="usb_id", \
+    SYMLINK+="esp32", MODE="0666", GROUP="dialout", TAG+="systemd", \
+    GOTO="amr_usb_end"
+
+# 2. RPLiDAR: Other CP2102 devices with different serial
+KERNEL=="ttyUSB*", SUBSYSTEM=="tty", \
+    ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+    IMPORT{builtin}="usb_id", \
+    SYMLINK+="rplidar", MODE="0666", GROUP="dialout", TAG+="systemd", \
+    GOTO="amr_usb_end"
+
+LABEL="amr_usb_end"
