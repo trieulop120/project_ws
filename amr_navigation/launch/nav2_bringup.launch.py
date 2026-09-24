@@ -14,7 +14,7 @@ Usage:
 
 import os
 import xacro
-from ament_index_python.packages import get_package_share_directory, get_package_prefix
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
@@ -61,7 +61,6 @@ def generate_launch_description():
     map_file = os.path.join(pkg_amr_mapping, 'maps', 'amr_map.yaml')
     rviz_config = os.path.join(pkg_amr_nav, 'rviz', 'navigation.rviz')
     controller_config = os.path.join(pkg_amr_desc, 'config', 'lift_controller.yaml')
-    #octomap_params = os.path.join(pkg_amr_mapping, 'config', 'octomap_params.yaml')
 
     # Xacro processing
     doc = xacro.parse(open(xacro_file))
@@ -225,23 +224,6 @@ def generate_launch_description():
     )
 
     # ============================================
-    # OctoMap Server (for 3D perception and voxel layer)
-    # Converts PointCloud2 -> Octree -> OccupancyGrid
-    # Uses /points_filtered from VoxelGrid (~2-3Hz after octree processing)
-    # ============================================
-    #octomap_server = Node(
-    #    package='octomap_server',
-    #    executable='octomap_server_node',
-    #    name='octomap_server',
-    #    output='screen',
-    #    parameters=[octomap_params],
-    #    remappings=[
-    #        ('cloud_in', '/points_filtered'),  # Nhận từ VoxelGrid
-    #        ('octomap_point_cloud_centers', '/octomap_point_cloud_centers'),
-    #    ],
-    #)
-
-    # ============================================
     # Nav2 Bringup (official)
     # Uses map for localization
     # ============================================
@@ -274,11 +256,9 @@ def generate_launch_description():
     # ============================================
     # Route Graph Publisher (hiển thị nodes/edges trên RViz)
     # ============================================
-    route_graph_publisher_bin = os.path.join(
-        get_package_prefix('amr_navigation'), 'bin', 'route_graph_publisher'
-    )
     route_graph_publisher = Node(
-        executable=route_graph_publisher_bin,
+        package='amr_navigation',
+        executable='route_graph_publisher',
         name='route_graph_publisher',
         output='screen',
     )
@@ -339,11 +319,7 @@ def generate_launch_description():
     # ============================================
     # Route Graph Publisher
     # ============================================
-    route_graph_publisher = Node(
-        executable=route_graph_publisher_bin,
-        name='route_graph_publisher',
-        output='screen',
-    )
+    # (da khai bao o tren, giu nguyen chi thay doi executable)
 
     # ============================================
     # RViz with Nav2 panel
@@ -404,9 +380,6 @@ def generate_launch_description():
 
         # cmd_vel_splitter
         cmd_vel_splitter,
-
-        # OctoMap Server (uses /points_filtered from VoxelGrid)
-        #octomap_server,
 
         # PCL VoxelGrid (downsamples /points -> /points_filtered @ 15Hz)
         voxel_grid_node,

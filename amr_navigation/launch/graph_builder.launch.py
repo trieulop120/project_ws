@@ -8,7 +8,7 @@ Usage:
 """
 
 import os
-from ament_index_python.packages import get_package_share_directory, get_package_prefix
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
@@ -29,9 +29,8 @@ def generate_launch_description():
     '~/project_ws/src/amr_navigation/config/graphs/route_graph.yaml'
     )
 
-    # Executable nằm trong bin/ không phải lib/
-    pkg_prefix = get_package_prefix('amr_navigation')
-    node_creator_bin = os.path.join(pkg_prefix, 'bin', 'interactive_node_creator')
+    # Executable nằm trong lib/ nhờ colcon build --symlink-install
+    # Node() khai bao package + executable chuan
 
     load_existing_arg = DeclareLaunchArgument(
         'load_existing',
@@ -79,7 +78,8 @@ def generate_launch_description():
 
         # Interactive Node Creator - mở terminal riêng để nhập lệnh
         Node(
-            executable=node_creator_bin,
+            package='amr_navigation',
+            executable='interactive_node_creator',
             name='interactive_node_creator',
             output='screen',
             parameters=[{

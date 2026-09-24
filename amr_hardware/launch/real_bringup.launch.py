@@ -62,7 +62,6 @@ def generate_launch_description():
     xacro_file = os.path.join(pkg_amr_desc, 'urdf', 'amr.gazebo.xacro')
     ekf_config = os.path.join(pkg_amr_localization, 'config', 'ekf_real_robot.yaml')
 
-    # [AUDIT_FIX]: Fixed file handle leak - now uses context manager to ensure file is properly closed
     # Process xacro
     with open(xacro_file) as f:
         doc = xacro.parse(f)
@@ -92,10 +91,7 @@ def generate_launch_description():
 
     # ============================================
     # Rear Caster Static TFs
-    # Caster không có encoder nên không publish
-    # joint_states. Giữ caster ở góc 0 rad.
     # ============================================
-
     caster_steer_left_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
@@ -169,7 +165,7 @@ def generate_launch_description():
     )
 
     # ============================================
-    # ESP32 Hardware Bridge (Unified Node)
+    # ESP32 Hardware Bridge
     # ============================================
     esp32_bridge = Node(
         package='amr_hardware',
@@ -222,7 +218,7 @@ def generate_launch_description():
     )
 
     # ============================================
-    # LiDAR Scan Filter Node (/scan -> /scan_filtered) [MỚI THÊM]
+    # LiDAR Scan Filter Node
     # ============================================
     scan_filter_node = Node(
         package='amr_perception',
@@ -260,10 +256,18 @@ def generate_launch_description():
             'color_height': 480,
             'depth_width': 640,
             'depth_height': 480,
-            'depth_registration': True,
+            # [FIXED]: Explicitly enable depth & color streams
+            'enable_depth': True,
+            'enable_color': True,
+            # [FIXED]: Disable hardware registration to fix Device.setProperty(5) error
+            'enable_depth_to_color_registration': False,
+            'depth_registration': False,
         }],
         remappings=[
+            # Remap PointCloud2 output from Astra to /points
             ('/depth/points', '/points'),
+            ('/camera/depth/image_raw', '/depth/image_raw'),
+            ('/camera/color/image_raw', '/color/image_raw'),
         ],
         condition=IfCondition(camera_enable)
     )
@@ -279,7 +283,6 @@ def generate_launch_description():
             'max_distance': 3.5,
             'min_height': 0.15,
             'max_height': 1.20,
-            # [AUDIT_FIX]: Changed input_topic from '/points' to '/camera/points' to match camera driver remapping
             'input_topic': '/points',
             'output_topic': '/points_filtered',
         }],

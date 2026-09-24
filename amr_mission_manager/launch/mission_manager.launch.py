@@ -11,33 +11,23 @@ Usage:
 Author: AMR System
 """
 
-import os
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    pkg_name = 'amr_mission_manager'
-    pkg_share = get_package_share_directory(pkg_name)
-    pkg_prefix = os.path.dirname(os.path.dirname(pkg_share))
-
-    # Executable paths
-    mission_manager_exec = os.path.join(pkg_prefix, 'bin', 'mission_manager')
-    mission_gui_exec = os.path.join(pkg_prefix, 'bin', 'mission_gui')
-
-    # Mission Manager Node
-    mission_manager_node = ExecuteProcess(
-        cmd=[mission_manager_exec],
+    mission_manager_node = Node(
+        package='amr_mission_manager',
+        executable='mission_manager',
+        name='mission_manager',
         output='screen',
-        shell=False,
     )
 
-    # Mission GUI
-    mission_gui_node = ExecuteProcess(
-        cmd=[mission_gui_exec],
+    mission_gui_node = Node(
+        package='amr_mission_manager',
+        executable='mission_gui',
+        name='mission_gui',
         output='screen',
-        shell=False,
     )
 
     return LaunchDescription([

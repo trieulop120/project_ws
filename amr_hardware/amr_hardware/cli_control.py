@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # [AUDIT_FIX]: Added argparse to allow specifying serial port as command line argument
 import serial
 import time
