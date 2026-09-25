@@ -11,7 +11,7 @@ Responsibilities:
 - Send NavigateToPose with selected BT
 
 Flow:
-    GUI button
+    GUI button / Service call
         ↓
     Resolve destination from route_graph.yaml
         ↓
@@ -20,6 +20,7 @@ Flow:
     NavigateToPose(pose, BT=<mission>.xml)
         ↓
     BT: ComputeRoute → FollowPath → ComputePathToPose → FollowPath
+    (or NavigateToPose for return_home)
 
 Usage:
     ros2 run amr_mission_manager mission_manager
@@ -40,12 +41,15 @@ NODE_NAME = 'mission_manager'
 
 # Mission → (destination_type, BT_file)
 # destination_type = điểm đến để lấy PoseStamped
+# return_home dùng NavigateToPose trực tiếp, không cần route graph
 MISSION_BT_MAP = {
-    'home_to_pick': ('PICK', 'home_to_pick.xml'),      # HOME → PICK: goal pose = PICK
-    'pick_to_drop': ('DROP', 'pick_to_drop.xml'),      # PICK → DROP: goal pose = DROP
-    'drop_to_pick': ('PICK', 'drop_to_pick.xml'),      # DROP → PICK: goal pose = PICK
-    'pick_to_home': ('HOME', 'pick_to_home.xml'),      # PICK → HOME: goal pose = HOME
-    'drop_to_home': ('HOME', 'drop_to_home.xml'),      # DROP → HOME: goal pose = HOME
+    'home_to_p1': ('P_1', 'home_to_p1.xml'),      # HOME → P_1
+    'home_to_p2': ('P_2', 'home_to_p2.xml'),      # HOME → P_2
+    'p1_to_d1': ('D_1', 'p1_to_d1.xml'),         # P_1 → D_1
+    'p2_to_d1': ('D_1', 'p2_to_d1.xml'),         # P_2 → D_1
+    'd1_to_p1': ('P_1', 'd1_to_p1.xml'),         # D_1 → P_1
+    'd1_to_p2': ('P_2', 'd1_to_p2.xml'),         # D_1 → P_2
+    'return_home': ('HOME', 'return_home.xml'),     # Any → HOME (NavigateToPose only)
 }
 
 
@@ -55,12 +59,15 @@ class MissionManager(Node):
     def __init__(self):
         super().__init__(NODE_NAME)
 
+        # Declare parameters
+        self.declare_parameter('graph_package', 'amr_navigation')
+        self.declare_parameter('graph_yaml_filename', 'route_graph.yaml')
+
+        self._bt_package = self.get_parameter('graph_package').value
+
         # Initialize route graph loader
         self._loader = None
         self._init_loader()
-
-        # Get BT package path
-        self._bt_package = 'amr_navigation'
 
         # NavigateToPose action client
         self._nav_client = ActionClient(
@@ -81,7 +88,15 @@ class MissionManager(Node):
         """Initialize route graph loader."""
         try:
             from amr_navigation.route_graph_loader import RouteGraphLoader
-            self._loader = RouteGraphLoader()
+
+            graph_package = self.get_parameter('graph_package').value
+            yaml_filename = self.get_parameter('graph_yaml_filename').value
+
+            self._loader = RouteGraphLoader(
+                package_name=graph_package,
+                yaml_filename=yaml_filename
+            )
+            self.get_logger().info(f'Using graph: {graph_package}/config/graphs/{yaml_filename}')
             self.get_logger().info(self._loader.get_summary())
         except ImportError as e:
             self.get_logger().error(f'Failed to import RouteGraphLoader: {e}')
@@ -152,8 +167,11 @@ class MissionManager(Node):
 
             self.get_logger().info(f'  BT: {bt_file}')
 
-            # Send NavigateToPose with mission-specific BT
-            self._navigate_to_pose(pose, dst_node, bt_path)
+            # Special handling for return_home - use home_pose key
+            if mission_name == 'return_home':
+                self._navigate_to_pose(pose, dst_node, bt_path, use_home_pose=True)
+            else:
+                self._navigate_to_pose(pose, dst_node, bt_path, use_home_pose=False)
             return True
 
         except Exception as e:
@@ -162,13 +180,20 @@ class MissionManager(Node):
             traceback.print_exc()
             return False
 
-    def _navigate_to_pose(self, pose: PoseStamped, node_name: str, bt_path: str):
+    def _navigate_to_pose(self, pose: PoseStamped, node_name: str, bt_path: str, use_home_pose: bool = False):
         """Send NavigateToPose goal with custom BT."""
         pose.header.stamp = self.get_clock().now().to_msg()
 
         goal = NavigateToPose.Goal()
         goal.pose = pose
         goal.behavior_tree = bt_path
+
+        # For return_home, the BT expects {home_pose} instead of {goal}
+        # We pass pose as both to handle this
+        if use_home_pose:
+            self.get_logger().info('  Mode: NavigateToPose (direct to HOME)')
+        else:
+            self.get_logger().info('  Mode: ComputeRoute + FollowPath')
 
         self.get_logger().info(f'  Sending NavigateToPose...')
 

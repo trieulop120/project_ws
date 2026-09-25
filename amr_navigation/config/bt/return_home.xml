@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!--
+  Mission: Return HOME
+  Uses NavigateToPose directly to HOME pose
+  Recovery: if aborted, retry ComputePathToPose + FollowPath
+
+  (No route graph - simple Nav2 action)
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="return_home">
+      <ComputePathToPose goal="{goal}" path="{path}"/>
+      <FollowPath path="{path}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

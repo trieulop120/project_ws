@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<!--
+  Mission: HOME → P_2
+  start_id = 0 (HOME)
+  goal_id  = 2 (P_2)
+
+  Flow:
+    1. ComputeRoute + FollowPath (primary)
+    2. If aborted → ComputePathToPose + FollowPath (fallback)
+       Nav2 will replan around obstacles
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Fallback name="home_to_p2_fallback">
+      <!-- Primary: Route-based navigation -->
+      <Sequence name="route_nav">
+        <SetBlackboard value="0" output_key="my_start_id"/>
+        <SetBlackboard value="2" output_key="my_goal_id"/>
+
+        <ComputeRoute
+          start_id="{my_start_id}"
+          goal_id="{my_goal_id}"
+          use_start="false"
+          use_poses="false"
+          path="{path}"
+          route="{route}"/>
+
+        <FollowPath path="{path}"/>
+
+        <ComputePathToPose goal="{goal}" path="{path}"/>
+        <FollowPath path="{path}"/>
+      </Sequence>
+
+      <!-- Fallback: Direct Nav2 navigation (replan around obstacles) -->
+      <Sequence name="direct_nav">
+        <ComputePathToPose goal="{goal}" path="{fallback_path}"/>
+        <FollowPath path="{fallback_path}"/>
+      </Sequence>
+    </Fallback>
+  </BehaviorTree>
+</root>

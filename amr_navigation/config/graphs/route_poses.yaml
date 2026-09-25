@@ -22,83 +22,68 @@ poses:
         frame_id: map
       pose:
         position:
-          x: 0.978
-          y: 1.533
+          x: 1.029
+          y: 1.59
           z: 0.0
         orientation:
           x: 0.0
           y: 0.0
           z: 0.0
           w: 1.0
-  D_1:
+  P_2:
     id: 2
     pose_stamped:
       header:
         frame_id: map
       pose:
         position:
-          x: -1.969
-          y: 0.955
+          x: 1.881
+          y: -0.131
           z: 0.0
         orientation:
           x: 0.0
           y: 0.0
-          z: 0.9999999999932537
-          w: -3.673205103346574e-06
-  J1:
+          z: -0.7071080798594735
+          w: 0.7071054825112363
+  D_1:
     id: 3
     pose_stamped:
       header:
         frame_id: map
       pose:
         position:
-          x: 0.583
-          y: -0.009
-          z: -0.001
+          x: -1.758
+          y: 0.893
+          z: 0.0
         orientation:
           x: 0.0
           y: 0.0
-          z: 0.0
-          w: 1.0
-  J2:
+          z: 0.9999999999932537
+          w: -3.673205103346574e-06
+  J3:
     id: 4
     pose_stamped:
       header:
         frame_id: map
       pose:
         position:
-          x: 0.988
-          y: 0.395
+          x: 1.568
+          y: -0.006
           z: -0.001
         orientation:
           x: 0.0
           y: 0.0
           z: 0.0
           w: 1.0
-  J3:
+  J4:
     id: 5
     pose_stamped:
       header:
         frame_id: map
       pose:
         position:
-          x: 0.93
-          y: 2.139
-          z: 0.002
-        orientation:
-          x: 0.0
-          y: 0.0
-          z: 0.0
-          w: 1.0
-  J4:
-    id: 6
-    pose_stamped:
-      header:
-        frame_id: map
-      pose:
-        position:
-          x: 0.398
-          y: 2.51
+          x: 0.978
+          y: 2.159
           z: -0.001
         orientation:
           x: 0.0
@@ -106,29 +91,29 @@ poses:
           z: 0.0
           w: 1.0
   J5:
-    id: 7
+    id: 6
     pose_stamped:
       header:
         frame_id: map
       pose:
         position:
-          x: -1.646
-          y: 2.553
-          z: -0.001
+          x: 0.499
+          y: 2.463
+          z: 0.002
         orientation:
           x: 0.0
           y: 0.0
           z: 0.0
           w: 1.0
   J6:
-    id: 8
+    id: 7
     pose_stamped:
       header:
         frame_id: map
       pose:
         position:
-          x: -2.034
-          y: 2.189
+          x: -1.422
+          y: 2.428
           z: -0.001
         orientation:
           x: 0.0
@@ -136,44 +121,89 @@ poses:
           z: 0.0
           w: 1.0
   J7:
-    id: 9
+    id: 8
     pose_stamped:
       header:
         frame_id: map
       pose:
         position:
-          x: -2.017
-          y: 0.576
-          z: -0.001
+          x: -1.819
+          y: 2.159
+          z: 0.002
         orientation:
           x: 0.0
           y: 0.0
           z: 0.0
           w: 1.0
   J8:
-    id: 10
+    id: 9
     pose_stamped:
       header:
         frame_id: map
       pose:
         position:
-          x: -1.527
-          y: 0.297
-          z: -0.001
+          x: -1.764
+          y: 0.581
+          z: 0.543
         orientation:
           x: 0.0
           y: 0.0
           z: 0.0
           w: 1.0
   J9:
+    id: 10
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: -1.437
+          y: 0.406
+          z: -0.005
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J2:
     id: 11
     pose_stamped:
       header:
         frame_id: map
       pose:
         position:
-          x: -0.683
-          y: 0.162
+          x: 1.022
+          y: 0.484
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J1:
+    id: 12
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 0.705
+          y: -0.007
+          z: -0.001
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  J10:
+    id: 13
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: -0.684
+          y: 0.012
           z: -0.001
         orientation:
           x: 0.0

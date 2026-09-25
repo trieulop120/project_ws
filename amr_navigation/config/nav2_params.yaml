@@ -148,8 +148,8 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.15  # TĂNG: 0.10 → 0.15 (ít false stuck)
-      movement_time_allowance: 30.0    # TĂNG: 30 → 45 (thêm thời gian)
+      required_movement_radius: 0.05  # TĂNG: 0.10 → 0.15 (ít false stuck)
+      movement_time_allowance: 10.0    # TĂNG: 30 → 45 (thêm thời gian)
 
     general_goal_checker:
       stateful: True

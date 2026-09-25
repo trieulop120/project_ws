@@ -23,8 +23,16 @@ from ament_index_python.packages import get_package_share_directory
 class RouteGraphLoader:
     """Load route graph data tu route_graph.yaml."""
 
-    def __init__(self, package_name: str = 'amr_navigation'):
+    def __init__(self, package_name: str = 'amr_navigation', yaml_filename: str = 'route_graph.yaml'):
+        """
+        Initialize RouteGraphLoader.
+
+        Args:
+            package_name: ROS package name
+            yaml_filename: Tên file YAML trong <package>/config/graphs/
+        """
         self._package_name = package_name
+        self._yaml_filename = yaml_filename
         self._yaml_data: dict = {}
         self._node_order: List[str] = []  # Sequential IDs
         self._loaded = False
@@ -36,15 +44,19 @@ class RouteGraphLoader:
             home = os.path.expanduser("~/project_ws")
             return os.path.join(home, "src", self._package_name)
 
+    def _get_graph_path(self) -> str:
+        """Get graph YAML path."""
+        return os.path.join(
+            self._get_package_share_path(),
+            'config', 'graphs', self._yaml_filename
+        )
+
     def _load(self) -> None:
         """Load route_graph.yaml."""
         if self._loaded:
             return
 
-        yaml_path = os.path.join(
-            self._get_package_share_path(),
-            'config', 'graphs', 'route_graph.yaml'
-        )
+        yaml_path = self._get_graph_path()
 
         if os.path.exists(yaml_path):
             with open(yaml_path, 'r') as f:
@@ -53,6 +65,8 @@ class RouteGraphLoader:
             # Build sequential ID map theo thu tu nodes trong YAML
             nodes = self._yaml_data.get('nodes', {})
             self._node_order = list(nodes.keys())
+        else:
+            raise FileNotFoundError(f"Graph file not found: {yaml_path}")
 
         self._loaded = True
 
@@ -77,25 +91,40 @@ class RouteGraphLoader:
 
     def resolve(self, logical: str) -> Optional[str]:
         """
-        Resolve logical name (HOME/PICK/DROP) thanh actual node name.
+        Resolve logical name thanh actual node name.
 
         Args:
-            logical: HOME, PICK, hoac DROP
+            logical: HOME, P_1, P_2, D_1, PICK, DROP, hoac node name
 
         Returns:
             Node name tu route_graph.yaml, hoac None
         """
         self._load()
         upper = logical.upper()
+        lower = logical.lower()
 
+        # Direct node name match
+        if logical in self._node_order:
+            return logical
+
+        # Specific pickup nodes
+        if upper in ('P_1', 'PICK1'):
+            return 'P_1' if 'P_1' in self._node_order else None
+        if upper in ('P_2', 'PICK2'):
+            return 'P_2' if 'P_2' in self._node_order else None
+
+        # Specific dropoff node
+        if upper in ('D_1', 'DROP1'):
+            return 'D_1' if 'D_1' in self._node_order else None
+
+        # Generic type match
         if upper in ('HOME', 'NODE_HOME'):
             return self._find_by_type('home')
         elif upper in ('PICK', 'PICKUP'):
             return self._find_by_type('pickup_approach')
         elif upper in ('DROP', 'DROPOFF'):
             return self._find_by_type('dropoff_approach')
-        elif logical in self._node_order:
-            return logical
+
         return None
 
     def get_node_id(self, node_name: str) -> Optional[int]:

@@ -17,7 +17,7 @@ from launch.substitutions import LaunchConfiguration
 # PATHS - Chỉnh sửa ở đây
 # ============================================
 GRAPH_PACKAGE = 'amr_navigation'              # Package chứa graph
-GRAPH_YAML_FILENAME = 'route_graph.yaml'    # File YAML trong config/graphs/
+GRAPH_YAML_FILENAME = 'real_route_graph.yaml'    # File YAML trong config/graphs/
 
 
 def generate_launch_description():
