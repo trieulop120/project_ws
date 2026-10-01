@@ -19,7 +19,7 @@ def generate_launch_description():
     # Config Paths
     slam_config = os.path.join(pkg_amr_mapping, 'config', 'mapper_params_online_async_real.yaml')
     octomap_params = os.path.join(pkg_amr_mapping, 'config', 'octomap_params.yaml')
-    rviz_config = os.path.join(pkg_amr_mapping, 'rviz', 'slam.rviz')
+    rviz_config = os.path.join(pkg_amr_mapping, 'rviz', 'slam_real.rviz')
 
     # ============================================
     # SLAM Toolbox

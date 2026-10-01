@@ -28,19 +28,40 @@ from ament_index_python.packages import get_package_share_directory
 
 HOME_NODE_NAME = 'NODE_HOME'
 
-# Cấu hình marker
-Z_OFFSET = 0.5          
-NODE_SCALE = 0.15         
-HOME_SCALE = 0.22        
-EDGE_SCALE = 0.06 
+# Cau hinh marker
+Z_OFFSET = 0.5
 
-# Màu sắc
-COLOR_HOME = (1.0, 0.5, 0.0)
-COLOR_PICKUP = (0.7, 0.2, 1.0)    # Tím - PICKUP_*, P_*
-COLOR_DROPOFF = (1.0, 0.0, 0.0)
-COLOR_TRANSIT = (0.0, 0.4, 1.0)
-COLOR_SAFE_ZONE = (0.5, 0.5, 0.5)
-COLOR_DEFAULT = (0.5, 0.5, 0.5)
+NODE_SCALE = 0.15
+TRANSIT_SCALE = 0.11
+HOME_SCALE = 0.22
+
+EDGE_SCALE = 0.06
+
+# Kich thuoc mui ten huong node
+NODE_ARROW_LENGTH = 0.18
+HOME_ARROW_LENGTH = 0.24
+
+NODE_ARROW_WIDTH = 0.045
+HOME_ARROW_WIDTH = 0.055
+
+NODE_ARROW_HEIGHT = 0.04
+
+# Khoang cach va kich thuoc ten node
+LABEL_OFFSET_Y = 0.17
+LABEL_OFFSET_Z = 0.06
+
+LABEL_SCALE = 0.18
+HOME_LABEL_SCALE = 0.20
+TRANSIT_LABEL_SCALE = 0.16
+
+# Mau sac theo class
+# Giong interactive_node_creator.py
+COLOR_HOME = (1.0, 0.5, 0.0)       # Cam - HOME, CHARGE
+COLOR_PICKUP = (0.0, 0.45, 1.0)    # Xanh duong - PICKUP_*, P_*
+COLOR_DROPOFF = (1.0, 0.0, 0.0)    # Do - DROP_*, D_*
+COLOR_TRANSIT = (0.2, 0.8, 0.4)    # Xanh la - node trung gian
+COLOR_SAFE_ZONE = (0.5, 0.5, 0.5)  # Xam - SAFE_*
+COLOR_DEFAULT = (0.5, 0.5, 0.5)    # Xam mac dinh
 
 
 # ============================================================================
@@ -78,22 +99,27 @@ def get_node_color(ntype):
 def get_node_scale(ntype, is_home=False):
     if is_home:
         return HOME_SCALE
+    if ntype in ('transit', 'junction'):
+        return TRANSIT_SCALE
     return NODE_SCALE
 
 
 def get_route_graph_path():
-    """Lấy đường dẫn route_graph.yaml"""
+    """Lay duong dan route_graph.yaml"""
     pkg_share = get_package_share_directory('amr_navigation')
     return os.path.join(pkg_share, 'config', 'graphs', 'route_graph.yaml')
 
 
 def load_route_graph(yaml_path: str) -> tuple:
-    """Load route graph từ YAML"""
+    """Load route graph tu YAML"""
     if not os.path.exists(yaml_path):
         return None, None
 
     with open(yaml_path, 'r') as f:
         data = yaml.safe_load(f)
+
+    if not data:
+        return {}, []
 
     nodes = data.get('nodes', {})
     edges = data.get('edges', [])
@@ -125,19 +151,23 @@ class RouteGraphPublisher(Node):
         self.nodes, self.edges = load_route_graph(self.graph_yaml_path)
 
         if self.nodes is None:
-            self.get_logger().warn(f'Route graph not found: {self.graph_yaml_path}')
+            self.get_logger().warn(
+                f'Route graph not found: {self.graph_yaml_path}'
+            )
             return
 
-        self.get_logger().info(f'Loaded {len(self.nodes)} nodes, {len(self.edges)} edges')
+        self.get_logger().info(
+            f'Loaded {len(self.nodes)} nodes, {len(self.edges)} edges'
+        )
 
         # Publish markers
         self._publish_markers()
 
-        # Republish periodically để đảm bảo RViz nhận
+        # Republish periodically de dam bao RViz nhan
         self.timer = self.create_timer(1.0, self._publish_markers)
 
     def _publish_markers(self):
-        """Publish all markers"""
+        """Publish all route graph markers"""
         if self.nodes is None:
             return
 
@@ -152,6 +182,7 @@ class RouteGraphPublisher(Node):
             yaw = data.get('orientation', {}).get('yaw', 0)
             ntype = data.get('type', 'transit')
             is_home = (name == HOME_NODE_NAME)
+            is_transit = ntype in ('transit', 'junction')
 
             color = get_node_color(ntype)
             scale = get_node_scale(ntype, is_home)
@@ -184,38 +215,57 @@ class RouteGraphPublisher(Node):
             m.type = Marker.TEXT_VIEW_FACING
             m.action = Marker.ADD
             m.pose.position.x = x
-            m.pose.position.y = y + 0.35
-            m.pose.position.z = z + 0.05
+
+            # Giu khoang cach text = 0.17 m
+            m.pose.position.y = y + LABEL_OFFSET_Y
+
+            m.pose.position.z = z + LABEL_OFFSET_Z
             m.pose.orientation.w = 1.0
             m.text = 'HOME' if is_home else name
-            m.scale.z = 0.25
+
+            if is_home:
+                m.scale.z = HOME_LABEL_SCALE
+            elif is_transit:
+                m.scale.z = TRANSIT_LABEL_SCALE
+            else:
+                m.scale.z = LABEL_SCALE
+
             m.color = make_color(*color)
             markers.markers.append(m)
 
             # DIRECTION ARROW
-            is_key_node = name in ('NODE_HOME', 'P_1', 'P_2', 'D_1')
-            if is_key_node:
-             m = Marker()
-             m.header.frame_id = 'map'
-             m.header.stamp = self.get_clock().now().to_msg()
-             m.ns = 'arrows'
-             m.id = i
-             m.type = Marker.ARROW
-             m.action = Marker.ADD
-             m.pose.position.x = x
-             m.pose.position.y = y
-             m.pose.position.z = z
-             m.pose.orientation = yaw_to_quaternion(yaw)
-             m.scale.x = 0.2 
-             m.scale.y = 0.08 
-             m.scale.z = 0.03
-             m.color = make_color(*color)
-             markers.markers.append(m)
+            # Giong interactive_node_creator:
+            # - HOME / PICKUP / DROP / CHARGE: hien mui ten
+            # - TRANSIT / JUNCTION: khong hien mui ten
+            if not is_transit:
+                m = Marker()
+                m.header.frame_id = 'map'
+                m.header.stamp = self.get_clock().now().to_msg()
+                m.ns = 'arrows'
+                m.id = i
+                m.type = Marker.ARROW
+                m.action = Marker.ADD
+                m.pose.position.x = x
+                m.pose.position.y = y
+                m.pose.position.z = z
+                m.pose.orientation = yaw_to_quaternion(yaw)
+
+                if is_home:
+                    m.scale.x = HOME_ARROW_LENGTH
+                    m.scale.y = HOME_ARROW_WIDTH
+                else:
+                    m.scale.x = NODE_ARROW_LENGTH
+                    m.scale.y = NODE_ARROW_WIDTH
+
+                m.scale.z = NODE_ARROW_HEIGHT
+                m.color = make_color(*color)
+                markers.markers.append(m)
 
         # Edges
         for e_idx, e in enumerate(self.edges):
             from_node = self.nodes.get(e['from'])
             to_node = self.nodes.get(e['to'])
+
             if not from_node or not to_node:
                 continue
 
@@ -227,8 +277,16 @@ class RouteGraphPublisher(Node):
             m.type = Marker.LINE_STRIP
             m.action = Marker.ADD
             m.points = [
-                Point(x=from_node['position']['x'], y=from_node['position']['y'], z=Z_OFFSET),
-                Point(x=to_node['position']['x'], y=to_node['position']['y'], z=Z_OFFSET)
+                Point(
+                    x=from_node['position']['x'],
+                    y=from_node['position']['y'],
+                    z=Z_OFFSET
+                ),
+                Point(
+                    x=to_node['position']['x'],
+                    y=to_node['position']['y'],
+                    z=Z_OFFSET
+                )
             ]
             m.scale.x = EDGE_SCALE
 

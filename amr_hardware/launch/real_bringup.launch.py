@@ -181,6 +181,8 @@ def generate_launch_description():
             # [FIXED]: Explicitly enable depth & color streams
             'enable_depth': True,
             'enable_color': True,
+            # [CHANGED]: Try UVC mode for color stream
+            'use_uvc_camera': True,
             # [FIXED]: Disable hardware registration to fix Device.setProperty(5) error
             'enable_depth_to_color_registration': False,
             'depth_registration': False,

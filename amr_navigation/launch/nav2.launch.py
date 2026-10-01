@@ -34,7 +34,7 @@ def generate_launch_description():
     params_file = os.path.join(pkg_nav, 'config', 'nav2_params_real.yaml')
     map_file = os.path.join(pkg_mapping, 'maps', 'real_amr_map.yaml')
     graph_file = os.path.join(pkg_nav, 'config', 'graphs', 'real_route_graph.geojson')
-    rviz_config = os.path.join(pkg_nav, 'rviz', 'navigation.rviz')
+    rviz_config = os.path.join(pkg_nav, 'rviz', 'navigation_real.rviz')
 
     # ============================================
     # Map Server

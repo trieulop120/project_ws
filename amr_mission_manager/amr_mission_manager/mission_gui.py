@@ -74,7 +74,7 @@ class MissionGUI(tk.Tk):
         self._node = node
         self.title("AMR Mission Manager")
         # Auto size to fit all buttons
-        self.geometry("600x700")
+        self.geometry("400x500")
 
         # Main frame
         main_frame = ttk.Frame(self, padding="15")

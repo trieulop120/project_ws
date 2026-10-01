@@ -9,7 +9,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu, JointState
+from sensor_msgs.msg import Imu, JointState, BatteryState
 from std_msgs.msg import String
 import tf2_ros
 
@@ -42,6 +42,7 @@ class ESP32Bridge(Node):
         self.curr_er = 0
         self.curr_em3 = 0
         self.curr_gz = 0.0
+        self.curr_battery_percent = 0.0
         self.data_lock = threading.Lock()
 
         self.ser = None
@@ -51,6 +52,7 @@ class ESP32Bridge(Node):
         self.pub_imu = self.create_publisher(Imu, '/imu/data_raw', 10)
         self.pub_js = self.create_publisher(JointState, '/joint_states', 10)
         self.pub_odom = self.create_publisher(Odometry, '/odom_raw', 10)
+        self.pub_battery = self.create_publisher(BatteryState, '/battery_state', 10)
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self) if self.publish_tf else None
 
@@ -101,8 +103,20 @@ class ESP32Bridge(Node):
                 return
             self.get_logger().info(f'Connecting to serial: {self.port}')
             self.ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
-            time.sleep(1.0)
-            self.get_logger().info('Serial connection established successfully.')
+            time.sleep(0.5)  # Chờ hardware ổn định
+
+            # [FIXED] Gửi dummy command để sync ESP32 UART buffer
+            # Byte đầu tiên sau serial open có thể bị drop, gửi L0\nR0\n trước để flush/sync
+            self.get_logger().info('[UART Sync] Sending dummy commands to sync ESP32...')
+            self.ser.write(b'L0\nR0\n')
+            time.sleep(0.5)  # Đợi ESP32 xử lý
+
+            # Đọc và discard buffer response từ ESP32
+            if self.ser.in_waiting > 0:
+                self.ser.read(self.ser.in_waiting)
+                self.get_logger().info('[UART Sync] Buffer flushed')
+
+            self.get_logger().info('Serial connection established successfully. UART synced.')
         except Exception as e:
             self.get_logger().error(f'Serial connection failed: {e}')
 
@@ -162,18 +176,27 @@ class ESP32Bridge(Node):
     def parse_line(self, line):
         if line.startswith('PKT'):
             p = line.split(',')
-            if len(p) >= 5:
+            if len(p) >= 8:
                 try:
                     el = int(p[1])
                     er = int(p[2])
                     em3 = int(p[3])
-                    gz = float(p[4])
+
+                    # NOTE: ESP32 gửi "NAN" khi BNO055 lỗi/mất kết nối.
+                    # Giữ nguyên field gyro_z để không làm lệch index distance/battery/timestamp.
+                    if p[4].strip().upper() == 'NAN':
+                        gz = math.nan
+                    else:
+                        gz = float(p[4])
+
+                    battery_percent = float(p[6])
 
                     with self.data_lock:
                         self.curr_el = el
                         self.curr_er = er
                         self.curr_em3 = em3
                         self.curr_gz = gz
+                        self.curr_battery_percent = battery_percent
                 except Exception:
                     pass
 
@@ -191,6 +214,7 @@ class ESP32Bridge(Node):
             er = self.curr_er
             em3 = self.curr_em3
             gz = self.curr_gz
+            battery_percent = self.curr_battery_percent
 
         if self.first_run:
             self.last_el = el
@@ -202,12 +226,19 @@ class ESP32Bridge(Node):
         imu = Imu()
         imu.header.stamp = now
         imu.header.frame_id = 'imu_link'
-        imu.angular_velocity.z = gz
-        imu.angular_velocity_covariance = [
-            0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0,
-            0.0, 0.0, 0.02
-        ]
+
+        if math.isnan(gz):
+            # NOTE: gyro_z = NAN từ ESP32 -> không cung cấp angular velocity cho ROS/EKF.
+            # Covariance[0] = -1 báo sensor_msgs/Imu rằng angular velocity không khả dụng.
+            imu.angular_velocity_covariance[0] = -1.0
+        else:
+            imu.angular_velocity.z = gz
+            imu.angular_velocity_covariance = [
+                0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0,
+                0.0, 0.0, 0.02
+            ]
+
         self.pub_imu.publish(imu)
 
         # 2. Publish Joint States
@@ -260,12 +291,19 @@ class ESP32Bridge(Node):
             0.0,   0.001, 0.0,   0.0,   0.0,   0.0,
             0.0,   0.0,   99.0,  0.0,   0.0,   0.0,
             0.0,   0.0,   0.0,   99.0,  0.0,   0.0,
-            0.0,   0.0,   0.0,   0.0,   99.0,  0.0,
+            0.0,   0.0,   0.0,   0.0,   99.0,   0.0,
             0.0,   0.0,   0.0,   0.0,   0.0,   0.01
         ]
         self.pub_odom.publish(odom)
 
-        # 4. TF Broadcaster
+        # 4. Publish Battery State
+        battery = BatteryState()
+        battery.header.stamp = now
+        battery.header.frame_id = 'base_link'
+        battery.percentage = battery_percent
+        self.pub_battery.publish(battery)
+
+        # 5. TF Broadcaster
         if self.publish_tf and self.tf_broadcaster:
             t = TransformStamped()
             t.header.stamp = now
