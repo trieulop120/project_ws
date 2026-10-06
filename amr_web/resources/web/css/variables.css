@@ -1,0 +1,41 @@
+:root {
+    /* Bamboo Charcoal Theme Colors */
+    --bg-primary: #0F1416;
+    --bg-sidebar: #182023;
+    --bg-panel: #182023;
+    --bg-panel-secondary: #12181A;
+    --bg-panel-alt: #141C1F;
+    --border: #2A363B;
+    --text-primary: #E2E8F0;
+    --text-secondary: #94A3B3;
+    --text-muted: #64748B;
+    --accent: #55DDBB;
+    --accent-secondary: #06B6D4;
+    --warning: #F5B94C;
+    --error: #F16C70;
+    --success: #55DDBB;
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+}
+
+/* Custom Scrollbar Styles for Dark Theme */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track {
+    background: var(--bg-panel-secondary);
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb {
+    background: #2A363B;
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #3A4B52;
+}
+* {
+    scrollbar-width: thin;
+    scrollbar-color: #2A363B var(--bg-panel-secondary);
+}
