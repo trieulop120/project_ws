@@ -32,12 +32,19 @@ window.isSlamActive = false;
 window.laserData = null;  // Latest laser scan data
 window.slamPendingStart = false;  // Track if start_slam command is pending
 
+// Navigation Page State (on window for cross-module access)
+window.isNavigationActive = false;
+
 /**
  * Cập nhật laser scan data từ backend
  * @param {Object} d - Laser scan JSON payload
  */
 function updateLaser(d) {
     window.laserData = d;
+    // Trigger map render to show laser scan overlay
+    if (typeof window.renderMap === 'function') {
+        window.renderMap();
+    }
 }
 
 /**
@@ -71,9 +78,13 @@ function handleCommandResponse(d) {
             window.mapRenderer.hide();
         }
         updateSlamUI();
+        updateOpModeDisplay();
     } else if (cmd === 'save_map') {
         if (status === 'success') {
             addActivity('info', 'Map saved: ' + (d.path || 'unknown path'));
+            if (typeof showToast === 'function') {
+                showToast('Map is saved successfully', 'success', 5000);
+            }
         } else {
             addAlarm('error', 'Map save failed: ' + message);
         }
@@ -129,14 +140,25 @@ function updateOpModeDisplay() {
             subModeEl.className = 'mode-badge slam';
             subModeEl.innerHTML = '<span>Mapping Active</span>';
         }
-    } else {
+    } else if (window.isNavigationActive) {
         if (opModeEl) {
             opModeEl.textContent = 'Navigation';
+            opModeEl.className = 'metric-value accent';
+        }
+        if (subModeEl) {
+            // TODO: lấy Auto/Manual từ backend navigation state
+            subModeEl.className = 'mode-badge nav';
+            subModeEl.innerHTML = '<span>Auto</span>';
+        }
+    } else {
+        // Reset về mặc định
+        if (opModeEl) {
+            opModeEl.textContent = 'Unknown';
             opModeEl.className = 'metric-value muted';
         }
         if (subModeEl) {
-            subModeEl.className = 'mode-badge nav';
-            subModeEl.innerHTML = '<span>Idle</span>';
+            subModeEl.className = 'mode-badge';
+            subModeEl.innerHTML = '<span>--</span>';
         }
     }
 }

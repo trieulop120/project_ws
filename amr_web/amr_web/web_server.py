@@ -35,6 +35,108 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
         return {"status": "ok", "service": "amr_web", "version": "0.2.0"}
 
     # ============================================================
+    # Map & Route API Endpoints
+    # ============================================================
+
+    @app.get("/api/maps")
+    async def get_maps():
+        """Lấy danh sách maps từ ~/project_ws/maps/."""
+        if bridge_node:
+            maps = bridge_node.get_available_maps()
+            return {"status": "ok", "maps": maps}
+        return {"status": "error", "message": "Bridge node not available"}
+
+    @app.get("/api/map/image/{map_id}")
+    async def get_map_image(map_id: str):
+        """Lấy dữ liệu hình ảnh map từ file YAML + PGM."""
+        if not bridge_node:
+            return {"status": "error", "message": "Bridge node not available"}
+
+        import os
+        import yaml
+        import base64
+
+        maps_dir = os.path.expanduser('~/project_ws/maps')
+        yaml_path = os.path.join(maps_dir, f'{map_id}.yaml')
+
+        if not os.path.exists(yaml_path):
+            return {"status": "error", "message": f"Map {map_id} not found"}
+
+        try:
+            # Đọc YAML metadata
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                yaml_data = yaml.safe_load(f)
+
+            if not yaml_data:
+                return {"status": "error", "message": "Empty YAML data"}
+
+            # Đọc PGM image
+            pgm_filename = yaml_data.get('image', f'{map_id}.pgm')
+            pgm_path = os.path.join(maps_dir, pgm_filename)
+            if not os.path.exists(pgm_path):
+                return {"status": "error", "message": f"Image file not found: {pgm_path}"}
+
+            with open(pgm_path, 'rb') as f:
+                pgm_data = f.read()
+
+            # Parse PGM header - simple approach
+            # Find the newline after maxval to know where data starts
+            header_end = pgm_data.find(b'\n', pgm_data.find(b'\n', pgm_data.find(b'\n') + 1) + 1) + 1
+            img_data = pgm_data[header_end:]
+
+            # Parse width/height from header
+            header = pgm_data[:header_end].decode('ascii', errors='ignore')
+            parts = header.split()
+            # parts should be like ['P5', '108', '70', '255']
+            width = 0
+            height = 0
+            for i, p in enumerate(parts):
+                if p.isdigit() and int(p) > 0:
+                    if width == 0:
+                        width = int(p)
+                    elif height == 0:
+                        height = int(p)
+                        break
+
+            if width == 0 or height == 0:
+                return {"status": "error", "message": f"Invalid PGM dimensions: {width}x{height}"}
+
+            origin = yaml_data.get('origin', [0, 0, 0])
+
+            # Map & Route is an image editor: retain every original PGM gray
+            # value and its top-to-bottom row order.  It must not be converted
+            # to the three-state OccupancyGrid representation used by live SLAM.
+            expected_size = width * height
+            if len(img_data) < expected_size:
+                return {"status": "error", "message": "PGM pixel data is incomplete"}
+            encoded = base64.b64encode(img_data[:expected_size]).decode('ascii')
+
+            return {
+                "status": "ok",
+                "info": {
+                    "resolution": yaml_data.get('resolution', 0.05),
+                    "width": width,
+                    "height": height,
+                    "origin": {
+                        "x": origin[0],
+                        "y": origin[1],
+                        "theta": origin[2]
+                    }
+                },
+                "image_data": encoded
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    @app.get("/api/routes")
+    async def get_routes(map_id: str = None):
+        """Lấy danh sách routes từ ~/project_ws/maps/{map_id}/routes/."""
+        if bridge_node:
+            routes = bridge_node.get_available_routes(map_id)
+            return {"status": "ok", "routes": routes}
+        return {"status": "error", "message": "Bridge node not available"}
+
+    # ============================================================
     # Command Handlers
     # ============================================================
 
@@ -75,8 +177,12 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
 
         elif command == "save_map":
             map_name = cmd.get('map_name', 'map_01')
+            if node_logger:
+                node_logger.info(f'save_map received: map_name={map_name}')
             if bridge_node:
                 success, path = bridge_node.save_map(map_name)
+                if node_logger:
+                    node_logger.info(f'save_map result: success={success}, path={path}')
                 result["status"] = "success" if success else "failed"
                 result["path"] = path
                 result["message"] = f"Map saved to {path}" if success else "Save failed"

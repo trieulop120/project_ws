@@ -65,14 +65,34 @@ function navigateToPage(p) {
         window.mapRenderer.moveToViewport(p);
     }
 
+    // Reset Map & Route page when navigating away
+    if (p !== 'map' && typeof window.resetMapRoutePage === 'function') {
+        window.resetMapRoutePage();
+    }
+
     // Show SLAM UI if navigating to SLAM
     if (p === 'slam' && window.isSlamActive) {
         if (typeof showSlamActiveUI === 'function') showSlamActiveUI();
     }
 
+    // Show Navigation UI if navigating to Navigation
+    if (p === 'navigation' && window.isNavigationActive) {
+        if (typeof showNavActiveUI === 'function') showNavActiveUI();
+    }
+
     // Trigger SLAM page init
     if (p === 'slam' && window.onNavigateToSlam) {
         window.onNavigateToSlam();
+    }
+
+    // Trigger Navigation page init
+    if (p === 'navigation' && window.onNavigateToNav) {
+        window.onNavigateToNav();
+    }
+
+    // Trigger Map Route page init
+    if (p === 'map' && typeof window.initMapRoutePage === 'function') {
+        window.initMapRoutePage();
     }
 }
 
@@ -113,6 +133,14 @@ document.addEventListener('DOMContentLoaded', () => {
     let dragStart = { x: 0, y: 0 };
     let transformStart = { x: 0, y: 0, scale: 1 };
 
+    // Get correct viewTransform based on current viewport
+    function getCurrentViewTransform() {
+        if (window.currentViewport === 'slam') {
+            return window.slamViewTransform;
+        }
+        return window.overviewViewTransform;
+    }
+
     document.addEventListener('mousedown', e => {
         const vp = document.querySelector('.page.active .map-viewport, .page.active .slam-map-viewport');
         if (!vp || !vp.contains(e.target)) return;
@@ -120,14 +148,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
         isDragging = true;
         dragStart = { x: e.clientX, y: e.clientY };
-        transformStart = { ...(window.viewTransform || { x: 0, y: 0, scale: 1 }) };
+        const vt = getCurrentViewTransform();
+        transformStart = { ...vt };
         if (canvasEl) canvasEl.style.cursor = 'grabbing';
     });
 
     document.addEventListener('mousemove', e => {
-        if (!isDragging || !window.viewTransform) return;
-        window.viewTransform.x = transformStart.x + (e.clientX - dragStart.x);
-        window.viewTransform.y = transformStart.y + (e.clientY - dragStart.y);
+        if (!isDragging) return;
+        const vt = getCurrentViewTransform();
+        vt.x = transformStart.x + (e.clientX - dragStart.x);
+        vt.y = transformStart.y + (e.clientY - dragStart.y);
         if (typeof window.renderMap === 'function') window.renderMap();
     });
 
@@ -139,22 +169,22 @@ document.addEventListener('DOMContentLoaded', () => {
     if (canvasEl) {
         canvasEl.addEventListener('wheel', e => {
             e.preventDefault();
-            if (!window.viewTransform) return;
-            if (e.deltaY > 0) { window.viewTransform.scale *= 0.9; } 
-            else { window.viewTransform.scale *= 1.1; }
-            window.viewTransform.scale = Math.max(0.1, Math.min(10, window.viewTransform.scale));
+            const vt = getCurrentViewTransform();
+            if (e.deltaY > 0) { vt.scale *= 0.9; }
+            else { vt.scale *= 1.1; }
+            vt.scale = Math.max(0.1, Math.min(10, vt.scale));
             if (typeof window.renderMap === 'function') window.renderMap();
         });
     }
 
     // Toolbar buttons (active page only)
     document.addEventListener('click', e => {
-        if (!window.viewTransform) return;
+        const vt = getCurrentViewTransform();
         if (e.target.closest('#btnZoomIn') || e.target.closest('#slamBtnZoomIn')) {
-            window.viewTransform.scale *= 1.2;
+            vt.scale *= 1.2;
             if (typeof window.renderMap === 'function') window.renderMap();
         } else if (e.target.closest('#btnZoomOut') || e.target.closest('#slamBtnZoomOut')) {
-            window.viewTransform.scale *= 0.8;
+            vt.scale *= 0.8;
             if (typeof window.renderMap === 'function') window.renderMap();
         } else if (e.target.closest('#btnRecenter') || e.target.closest('#slamBtnRecenter')) {
             if (window.isSlamActive && window.mapRenderer) {
@@ -189,4 +219,15 @@ window.addEventListener('resize', () => {
     } else if (typeof window.resizeCanvas === 'function') {
         window.resizeCanvas();
     }
+});
+
+// Commit values from single-line inputs consistently when the user presses Enter.
+document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.isComposing) return;
+    const target = e.target;
+    if (!(target instanceof HTMLInputElement) || target.type === 'button') return;
+
+    e.preventDefault();
+    target.dispatchEvent(new Event('change', { bubbles: true }));
+    target.blur();
 });

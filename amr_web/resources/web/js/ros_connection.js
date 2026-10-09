@@ -64,7 +64,7 @@ function connect() {
                     case 'map':
                         console.log('[WS] Received map data, isSlamActive:', window.isSlamActive);
                         window.mapData = d;
-                        
+
                         // Cập nhật dữ liệu vào mapRenderer (hàm updateMap sẽ tự xử lý hiển thị theo isSlamActive)
                         if (window.mapRenderer && typeof window.mapRenderer.updateMap === 'function') {
                             window.mapRenderer.updateMap(d);

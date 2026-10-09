@@ -18,6 +18,7 @@ import subprocess
 import threading
 import time
 from typing import Optional
+from ament_index_python.packages import get_package_share_directory
 
 import rclpy
 from rclpy.node import Node
@@ -374,21 +375,25 @@ class WebBridge(Node):
 
     def save_map(self, map_name: str) -> tuple:
         """
-        Lưu bản đồ sử dụng map_saver.
+        Lưu bản đồ sử dụng slam_toolbox service.
         Trả về (success, path).
         """
         # Tạo thư mục maps nếu chưa có
         maps_dir = os.path.expanduser('~/project_ws/maps')
         os.makedirs(maps_dir, exist_ok=True)
 
+        # Đường dẫn tuyệt đối cho map
         map_path = os.path.join(maps_dir, map_name)
+        map_path_abs = os.path.expanduser(map_path)
 
         try:
+            # Dùng service call của slam_toolbox
             result = subprocess.run(
                 [
-                    'ros2', 'run', 'nav2_map_server', 'map_saver_cli',
-                    '--ros-args', '-p', f'map_subscribe_transient_local:=true',
-                    '--', '-f', map_path
+                    'ros2', 'service', 'call',
+                    '/slam_toolbox/save_map',
+                    'slam_toolbox/srv/SaveMap',
+                    f'{{name: {{data: "{map_path_abs}"}}}}'
                 ],
                 capture_output=True,
                 text=True,
@@ -396,7 +401,7 @@ class WebBridge(Node):
             )
 
             if result.returncode == 0:
-                yaml_path = f"{map_path}.yaml"
+                yaml_path = f"{map_path_abs}.yaml"
                 self.get_logger().info(f'Map saved: {yaml_path}')
                 return True, yaml_path
             else:
@@ -409,6 +414,67 @@ class WebBridge(Node):
         except Exception as e:
             self.get_logger().error(f'Map save error: {e}')
             return False, ""
+
+    def get_available_maps(self) -> list:
+        """
+        Lấy danh sách maps từ ~/project_ws/maps/
+        """
+        import time
+        maps = []
+
+        try:
+            maps_dir = os.path.expanduser('~/project_ws/maps')
+            if os.path.exists(maps_dir):
+                for f in sorted(os.listdir(maps_dir)):
+                    if f.endswith('.yaml'):
+                        full_path = os.path.join(maps_dir, f)
+                        map_id = f.replace('.yaml', '')
+                        # Lấy thời gian tạo thực tế từ file
+                        try:
+                            created = time.strftime('%Y-%m-%d', time.localtime(os.path.getctime(full_path)))
+                        except:
+                            created = time.strftime('%Y-%m-%d')
+                        maps.append({
+                            'id': map_id,
+                            'name': map_id,
+                            'path': full_path,
+                            'created': created
+                        })
+        except Exception as e:
+            self.get_logger().warn(f'Maps error: {e}')
+
+        return maps
+
+    def get_available_routes(self, map_id: str = None) -> list:
+        """
+        Lấy danh sách routes từ ~/project_ws/maps/{map_id}/routes/
+        """
+        import time
+        routes = []
+
+        try:
+            if map_id:
+                routes_dir = os.path.expanduser(f'~/project_ws/maps/{map_id}/routes')
+                if os.path.exists(routes_dir):
+                    for f in sorted(os.listdir(routes_dir)):
+                        if f.endswith('.yaml'):
+                            full_path = os.path.join(routes_dir, f)
+                            route_id = f.replace('.yaml', '')
+                            # Lấy thời gian tạo thực tế
+                            try:
+                                created = time.strftime('%Y-%m-%d', time.localtime(os.path.getctime(full_path)))
+                            except:
+                                created = time.strftime('%Y-%m-%d')
+                            routes.append({
+                                'id': route_id,
+                                'name': route_id,
+                                'path': full_path,
+                                'created': created
+                            })
+        except Exception as e:
+            self.get_logger().warn(f'Routes error: {e}')
+
+        return routes
 
     # ============================================================
     # Teleop & Lift Control

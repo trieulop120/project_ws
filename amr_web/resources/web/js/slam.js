@@ -49,6 +49,7 @@
         // 1. CLEAR old map data - start fresh for new SLAM
         window.mapData = null;
         window.mapImageData = null;
+        window.mapFitted = false;
 
         // 2. Set SLAM active
         window.isSlamActive = true;
@@ -98,6 +99,7 @@
         // 2. CLEAR map data completely - map no longer exists
         window.mapData = null;
         window.mapImageData = null;
+        window.mapFitted = false;
 
         // 3. Xóa toàn bộ dữ liệu Map & ép vẽ rỗng lập tức
         if (window.mapRenderer) {
@@ -117,8 +119,11 @@
     }
 
     function onSaveMapClick() {
-        const mapName = document.getElementById('slamMapName').value || 'map_01';
+        const mapNameInput = document.getElementById('slamMapName');
+        const mapName = mapNameInput?.value?.trim() || 'map_01';
+        console.log('[SLAM] Save map clicked, name:', mapName);
         const sent = sendCommand({ command: 'save_map', map_name: mapName });
+        console.log('[SLAM] Save command sent:', sent);
         if (!sent) {
             addAlarm('error', 'Cannot save map: WebSocket not connected');
         }
@@ -287,6 +292,19 @@
         btnSaveMap?.addEventListener('click', onSaveMapClick);
         btnSetHeight?.addEventListener('click', setHeight);
         btnSetHome?.addEventListener('click', setHome);
+
+        document.getElementById('slamMapName')?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                onSaveMapClick();
+            }
+        });
+        document.getElementById('slamTargetHeight')?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                setHeight();
+            }
+        });
 
         teleopKeys.forEach(key => {
             key.addEventListener('mousedown', () => handleTeleopKeyDown(key, key.dataset.key));

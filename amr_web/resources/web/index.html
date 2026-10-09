@@ -12,7 +12,7 @@
     <link rel="icon" href="data:,">
     <link rel="stylesheet" href="/css/variables.css?v=1.0.11">
     <link rel="stylesheet" href="/css/layout.css?v=1.0.11">
-    <link rel="stylesheet" href="/css/components.css?v=1.0.11">
+    <link rel="stylesheet" href="/css/components.css?v=1.0.16">
 </head>
 <body>
 <div class="app">
@@ -501,23 +501,137 @@
             </div>
         </div>
         <div class="page" id="page-navigation">
-            <div class="placeholder-page">
-                <svg class="placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <!-- Welcome Card - Initial State -->
+            <div class="slam-welcome-card" id="navWelcome">
+                <svg class="slam-welcome-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                     <circle cx="12" cy="12" r="10"/>
                     <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/>
                 </svg>
-                <div class="placeholder-title">Navigation Controls</div>
-                <div class="placeholder-desc">Navigation mode controls will be available in a future update.</div>
+                <h2 class="slam-welcome-title">Navigation Mode</h2>
+                <p class="slam-welcome-desc">Autonomous navigation with path planning and obstacle avoidance. Load a saved map and set navigation goals.</p>
+                <button class="slam-btn accent" id="btnStartNav">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="5 3 19 12 5 21 5 3"/>
+                    </svg>
+                    START NAVIGATION MODE
+                </button>
+            </div>
+
+            <!-- Active Navigation Layout (Empty for now) -->
+            <div class="nav-layout" id="navLayout" style="display: none;">
+                <div class="nav-viewport-wrap">
+                    <div class="nav-viewport-header">
+                        <span class="nav-status-badge">Navigation Inactive</span>
+                    </div>
+                    <div class="nav-content-placeholder">
+                        <svg class="placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/>
+                        </svg>
+                        <div class="placeholder-title">Navigation Controls</div>
+                        <div class="placeholder-desc">Navigation controls coming soon.</div>
+                    </div>
+                </div>
             </div>
         </div>
         <div class="page" id="page-map">
-            <div class="placeholder-page">
-                <svg class="placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/>
-                    <line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/>
-                </svg>
-                <div class="placeholder-title">Map & Route</div>
-                <div class="placeholder-desc">Map and route visualization will be available in a future update.</div>
+            <div class="map-route-layout">
+                <!-- Toolbar (top) -->
+                <div class="map-route-toolbar">
+                    <div class="tool-group">
+                        <button class="tool-btn active" data-tool="select" title="Select">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/>
+                            </svg>
+                        </button>
+                        <button class="tool-btn" data-tool="addNode" title="Add Node">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/>
+                                <line x1="12" y1="8" x2="12" y2="16"/>
+                                <line x1="8" y1="12" x2="16" y2="12"/>
+                            </svg>
+                        </button>
+                        <button class="tool-btn" data-tool="addEdge" title="Add Edge">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                                <polyline points="15 3 21 3 21 9"/>
+                                <line x1="10" y1="14" x2="21" y2="3"/>
+                            </svg>
+                        </button>
+                        <button class="tool-btn" data-tool="delete" title="Delete">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="3 6 5 6 21 6"/>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="tool-group">
+                        <button class="btn btn-accent" id="btnSaveRoute">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+                                <polyline points="17 21 17 13 7 13 7 21"/>
+                                <polyline points="7 3 7 8 15 8"/>
+                            </svg>
+                            Save Route
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 2x2 Grid -->
+                <div class="map-route-grid">
+                    <!-- Top Left: Canvas -->
+                    <div class="map-canvas-wrapper">
+                        <canvas id="routeCanvas"></canvas>
+                        <div class="map-empty" id="routeEmptyState">
+                            <svg class="map-empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/>
+                                <line x1="8" y1="2" x2="8" y2="18"/>
+                                <line x1="16" y1="6" x2="16" y2="22"/>
+                            </svg>
+                            <div class="map-empty-title">No Map Selected</div>
+                            <div class="map-empty-desc">Select a map from the panel on the right to edit its route.</div>
+                        </div>
+                    </div>
+
+                    <!-- Top Right: Maps -->
+                    <div class="maps-panel">
+                        <div class="section-header">
+                            <span>MAPS</span>
+                        </div>
+                        <div class="map-list" id="mapListPanel">
+                            <!-- Populated by JS -->
+                        </div>
+                    </div>
+
+                    <!-- Bottom Left: Nodes + Node Editor (same row) -->
+                    <div class="bottom-left-wrapper">
+                        <!-- Node Table -->
+                        <div class="node-table-wrapper">
+                            <div class="section-header">
+                                <span>NODES</span>
+                                <span class="route-stats" id="routeStats">0 | 0</span>
+                            </div>
+                            <div class="node-table" id="routeNodeTable">
+                                <!-- Populated by JS -->
+                            </div>
+                        </div>
+
+                        <!-- Node Editor -->
+                        <div class="node-editor-wrapper" id="nodeEditor">
+                            <!-- Populated by JS -->
+                        </div>
+                    </div>
+
+                    <!-- Bottom Right: Route -->
+                    <div class="route-panel">
+                        <div class="section-header">
+                            <span>ROUTE</span>
+                        </div>
+                        <div class="route-list" id="routeListPanel">
+                            <!-- Populated by JS -->
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
         <div class="page" id="page-system">
@@ -533,16 +647,44 @@
     </div>
 </div>
 
+<!-- Navigation Setup Modal -->
+<div id="navSetupModal" class="modal-overlay">
+    <div class="modal-content nav-modal">
+        <div class="modal-header">
+            <h3>Start Navigation</h3>
+            <button class="modal-close" id="navModalClose">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div class="form-group">
+                <label for="navMapSelect">Select Map</label>
+                <select id="navMapSelect" class="form-select">
+                    <option value="">-- Select a map --</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="navRouteSelect">Select Route</label>
+                <select id="navRouteSelect" class="form-select">
+                    <option value="">-- Select a route --</option>
+                </select>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" id="navModalCancel">Cancel</button>
+            <button class="btn btn-primary" id="navModalConfirm" disabled>Confirm</button>
+        </div>
+    </div>
+</div>
+
 <!-- JS Modules theo thứ tự phụ thuộc -->
-<script src="/js/state.js?v=1.0.11"></script>
-<script src="/js/ros_connection.js?v=1.0.11"></script>
-<script src="/js/map.js?v=1.0.11"></script>
-<script src="/js/overview.js?v=1.0.11"></script>
-<script src="/js/slam.js?v=1.0.11"></script>
-<script src="/js/navigation.js?v=1.0.11"></script>
-<script src="/js/map_route.js?v=1.0.11"></script>
+<script src="/js/overview.js?v=1.0.16"></script>
+<script src="/js/state.js?v=1.0.16"></script>
+<script src="/js/ros_connection.js?v=1.0.16"></script>
+<script src="/js/map.js?v=1.0.16"></script>
+<script src="/js/slam.js?v=1.0.16"></script>
+<script src="/js/navigation.js?v=1.0.16"></script>
+<script src="/js/map_route.js?v=1.0.16"></script>
 
 <!-- app.js luôn nằm dưới cùng -->
-<script src="/js/app.js?v=1.0.11"></script>
+<script src="/js/app.js?v=1.0.16"></script>
 </body>
 </html>

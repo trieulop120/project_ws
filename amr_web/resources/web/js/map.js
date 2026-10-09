@@ -1,16 +1,27 @@
 (function () {
     'use strict';
 
-    const COLORS = { unknown: [15, 20, 22], free: [24, 32, 35], occupied: [16, 185, 129] };
+    const COLORS = { 
+    unknown: [128, 128, 128], // Màu xám chuẩn ROS 2 (Mã hex: #808080)
+    free: [255, 255, 255],    // Màu trắng (Trống / Có thể di chuyển)
+    occupied: [0, 0, 0]       // Màu đen chuẩn ROS 2 (Vật cản / Tường)
+    };
 
-    // Shared view transform - MUST be exported to window for app.js access
-    window.viewTransform = { x: 0, y: 0, scale: 1 };
+    // SEPARATE view transforms for Overview and SLAM
+    window.overviewViewTransform = { x: 0, y: 0, scale: 1 };
+    window.slamViewTransform = { x: 0, y: 0, scale: 1 };
+    window.currentViewport = 'overview'; // Track which viewport canvas is in
 
     function initCanvas() {
         canvas = document.getElementById('mapCanvas');
         if (!canvas) return;
         ctx = canvas.getContext('2d');
         resizeCanvas();
+    }
+
+    // Get active viewTransform based on current viewport
+    function getActiveViewTransform() {
+        return window.currentViewport === 'slam' ? window.slamViewTransform : window.overviewViewTransform;
     }
 
     function resizeCanvas() {
@@ -25,7 +36,7 @@
 
         if (ctx) {
             ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
-            ctx.imageSmoothingEnabled = false; // Bắt buộc false để render pixel SLAM sắc nét
+            ctx.imageSmoothingEnabled = false;
         }
         render();
     }
@@ -38,12 +49,19 @@
         for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
         const img = ctx.createImageData(info.width, info.height);
         const pix = img.data;
-        for (let i = 0; i < bytes.length; i++) {
-            const c = COLORS[bytes[i] === 0 ? 'unknown' : bytes[i] === 1 ? 'free' : 'occupied'];
-            pix[i * 4] = c[0];
-            pix[i * 4 + 1] = c[1];
-            pix[i * 4 + 2] = c[2];
-            pix[i * 4 + 3] = 255;
+        // OccupancyGrid starts at its lower-left cell, while Canvas starts at
+        // its upper-left pixel.  Flip rows so Canvas +Y maps to ROS -Y.
+        for (let y = 0; y < info.height; y++) {
+            const canvasY = info.height - 1 - y;
+            for (let x = 0; x < info.width; x++) {
+                const sourceIndex = y * info.width + x;
+                const pixelIndex = (canvasY * info.width + x) * 4;
+                const c = COLORS[bytes[sourceIndex] === 0 ? 'unknown' : bytes[sourceIndex] === 1 ? 'free' : 'occupied'];
+                pix[pixelIndex] = c[0];
+                pix[pixelIndex + 1] = c[1];
+                pix[pixelIndex + 2] = c[2];
+                pix[pixelIndex + 3] = 255;
+            }
         }
         return img;
     }
@@ -53,7 +71,7 @@
         const { info } = mapData;
         return {
             x: (wx - info.origin.x) / info.resolution,
-            y: (wy - info.origin.y) / info.resolution
+            y: info.height - (wy - info.origin.y) / info.resolution
         };
     }
 
@@ -66,9 +84,10 @@
         const pad = 20;
         const scaleX = (rect.width - pad * 2) / info.width;
         const scaleY = (rect.height - pad * 2) / info.height;
-        viewTransform.scale = Math.min(scaleX, scaleY);
-        viewTransform.x = (rect.width - info.width * viewTransform.scale) / 2;
-        viewTransform.y = (rect.height - info.height * viewTransform.scale) / 2;
+        const vt = getActiveViewTransform();
+        vt.scale = Math.min(scaleX, scaleY);
+        vt.x = (rect.width - info.width * vt.scale) / 2;
+        vt.y = (rect.height - info.height * vt.scale) / 2;
     }
 
     function render() {
@@ -79,17 +98,16 @@
         ctx.imageSmoothingEnabled = false;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        // CHỈ RENDER NẾU SLAM DANG ACTIVE VÀ CÓ DỮ LIỆU MAP
-        if (!window.isSlamActive || !mapData || !mapImageData) {
-            ctx.fillStyle = '#0F1416';
-            ctx.fillRect(0, 0, rect.width, rect.height);
-            return;
+        // CHỈ RENDER MAP KHI CÓ DỮ LIỆU
+        if (!mapData || !mapImageData) {
+            return; // Để empty state hiển thị
         }
 
         const { info } = mapData;
+        const vt = getActiveViewTransform();
         ctx.save();
-        ctx.translate(viewTransform.x, viewTransform.y);
-        ctx.scale(viewTransform.scale, viewTransform.scale);
+        ctx.translate(vt.x, vt.y);
+        ctx.scale(vt.scale, vt.scale);
 
         const tmp = document.createElement('canvas');
         tmp.width = info.width;
@@ -100,26 +118,29 @@
 
         ctx.drawImage(tmp, 0, 0);
 
-        if (robotPose && robotPose.frame_id === 'map') {
+        if (robotPose && robotPose.position && robotPose.orientation) {
             const pos = robotPose.position;
             const yaw = robotPose.orientation.yaw;
             const cp = worldToCanvas(pos.x, pos.y);
             ctx.save();
             ctx.translate(cp.x, cp.y);
+            // Canvas +Y points down, so ROS's counter-clockwise yaw is negated.
             ctx.rotate(-yaw);
             ctx.fillStyle = '#10B981';
             ctx.beginPath();
-            ctx.arc(0, 0, 8 / viewTransform.scale, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.fillStyle = '#34D399';
-            ctx.beginPath();
-            ctx.moveTo(12 / viewTransform.scale, 0);
-            ctx.lineTo(-4 / viewTransform.scale, -6 / viewTransform.scale);
-            ctx.lineTo(-4 / viewTransform.scale, 6 / viewTransform.scale);
+            // Robot footprint: 0.66m x 0.48m = 13.2 x 9.6 pixels @ 0.05m/cell
+            // Vẽ bằng map pixels (ko chia scale), tỷ lệ cố định theo map
+            ctx.moveTo(6.5, 0);                          // đỉnh phía trước (+0.33m)
+            ctx.lineTo(-6.5, -5);                        // vai trái
+            ctx.lineTo(-6.5, 5);                         // vai phải
             ctx.closePath();
             ctx.fill();
             ctx.restore();
         }
+
+        // Draw LiDAR scan overlay
+        drawLaserScan();
+
         ctx.restore();
     }
 
@@ -130,6 +151,9 @@
         const overviewViewport = document.querySelector('.map-viewport');
         const slamViewport = document.querySelector('.slam-map-viewport');
         const targetViewport = (page === 'slam' && slamViewport) ? slamViewport : overviewViewport;
+
+        // Track current viewport for viewTransform selection
+        window.currentViewport = (page === 'slam') ? 'slam' : 'overview';
 
         if (targetViewport && canvas.parentElement !== targetViewport) {
             targetViewport.appendChild(canvas);
@@ -167,6 +191,7 @@
             mapData = null;
             mapImageData = null;
             window.mapData = null;
+            window.mapFitted = false;
 
             const cardName = document.getElementById('cardMapName');
             const cardStatus = document.getElementById('cardMapStatus');
@@ -201,7 +226,12 @@
         // Cập nhật Overview Card Active Map
         updateOverviewMapCard(data);
 
-        fitToView();
+        // Chỉ fitToView lần đầu khi map load, không fit lại mỗi khi map cập nhật
+        if (!window.mapFitted) {
+            fitToView();
+            window.mapFitted = true;
+        }
+
         render();
     }
 
@@ -220,7 +250,7 @@
             cardName.className = 'metric-value' + (isSlamMode ? ' accent' : ' accent');
         }
         if (cardStatus) {
-            cardStatus.textContent = 'Loaded';
+            cardStatus.textContent = isSlamMode ? 'SLAM Live' : 'Loaded';
         }
         if (mapEmpty) {
             mapEmpty.style.display = 'none';
@@ -239,19 +269,75 @@
 
         const rect = canvas.parentElement.getBoundingClientRect();
         const pos = worldToCanvas(robotPose.position.x, robotPose.position.y);
-        viewTransform.x = (rect.width / 2) - pos.x * viewTransform.scale;
-        viewTransform.y = (rect.height / 2) - pos.y * viewTransform.scale;
+        const vt = getActiveViewTransform();
+        vt.x = (rect.width / 2) - pos.x * vt.scale;
+        vt.y = (rect.height / 2) - pos.y * vt.scale;
         render();
     }
 
     function slamMapZoomIn() {
-        viewTransform.scale *= 1.2;
+        const vt = getActiveViewTransform();
+        vt.scale *= 1.2;
         render();
     }
 
     function slamMapZoomOut() {
-        viewTransform.scale *= 0.8;
+        const vt = getActiveViewTransform();
+        vt.scale *= 0.8;
         render();
+    }
+
+    /**
+     * Draw LiDAR scan data onto the canvas.
+     * Laser points are transformed from robot pose to world (map) coordinates,
+     * then projected to canvas coordinates using the same worldToCanvas() function
+     * used by the robot pose marker.
+     *
+     * Assumes laser frame == base_link (laser mounted on robot body),
+     * so laser scan in laser frame is transformed by robot pose to get world position.
+     */
+    function drawLaserScan() {
+        if (!window.laserData || !robotPose || !mapData) return;
+
+        const laser = window.laserData;
+        const ranges = laser.ranges;
+        if (!ranges || ranges.length === 0) return;
+
+        const { angle_min, angle_increment, range_min, range_max } = laser;
+        const robotYaw = robotPose.orientation.yaw;
+        const robotX = robotPose.position.x;
+        const robotY = robotPose.position.y;
+        const vt = getActiveViewTransform();
+
+        ctx.fillStyle = 'rgba(0, 230, 200, 0.7)';
+
+        for (let i = 0; i < ranges.length; i++) {
+            const r = ranges[i];
+
+            // Skip invalid values
+            if (r === null || r === undefined) continue;
+            if (typeof r !== 'number') continue;
+            if (!isFinite(r)) continue;
+            if (r < range_min || r > range_max) continue;
+
+            // Compute laser ray angle in laser frame
+            const angle = angle_min + i * angle_increment;
+
+            // Transform from laser frame to world frame:
+            // Laser point in laser frame: (r*cos(angle), r*sin(angle), 0)
+            // World point = robot_pose + R(yaw) * laser_point
+            const worldX = robotX + r * Math.cos(angle + robotYaw);
+            const worldY = robotY + r * Math.sin(angle + robotYaw);
+
+            // Convert world point to canvas pixel
+            const cp = worldToCanvas(worldX, worldY);
+
+            // Draw laser point as a small filled circle
+            const radius = 2 / vt.scale;
+            ctx.beginPath();
+            ctx.arc(cp.x, cp.y, radius, 0, Math.PI * 2);
+            ctx.fill();
+        }
     }
 
     // Export public functions sang window
