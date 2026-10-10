@@ -430,8 +430,9 @@ class WebBridge(Node):
         return maps
 
     def get_available_routes(self, map_id: str = None) -> list:
-        """Lấy danh sách routes từ ~/project_ws/maps/{map_id}/routes/"""
+        """Lấy danh sách routes đầy đủ nodes & edges từ ~/project_ws/maps/{map_id}/routes/"""
         import time
+        import yaml
         routes = []
 
         try:
@@ -439,18 +440,39 @@ class WebBridge(Node):
                 routes_dir = os.path.expanduser(f'~/project_ws/maps/{map_id}/routes')
                 if os.path.exists(routes_dir):
                     for f in sorted(os.listdir(routes_dir)):
-                        if f.endswith('.yaml'):
+                        if f.endswith('.yaml') and not f.endswith('_poses.yaml'):
                             full_path = os.path.join(routes_dir, f)
                             route_id = f.replace('.yaml', '')
                             try:
                                 created = time.strftime('%Y-%m-%d', time.localtime(os.path.getctime(full_path)))
                             except:
                                 created = time.strftime('%Y-%m-%d')
+                            
+                            # Read route content
+                            nodes = []
+                            edges = []
+                            try:
+                                with open(full_path, 'r', encoding='utf-8') as rf:
+                                    rdata = yaml.safe_load(rf) or {}
+                                    raw_nodes = rdata.get('nodes', {})
+                                    if isinstance(raw_nodes, dict):
+                                        nodes = list(raw_nodes.values())
+                                    elif isinstance(raw_nodes, list):
+                                        nodes = raw_nodes
+                                    edges = rdata.get('edges', [])
+                            except Exception as re:
+                                self.get_logger().warn(f'Error reading route file {full_path}: {re}')
+
                             routes.append({
                                 'id': route_id,
                                 'name': route_id,
                                 'path': full_path,
-                                'created': created
+                                'created': created,
+                                'graph_name': route_id,
+                                'nodes': nodes,
+                                'edges': edges,
+                                'nodeCount': len(nodes),
+                                'edgeCount': len(edges)
                             })
         except Exception as e:
             self.get_logger().warn(f'Routes error: {e}')

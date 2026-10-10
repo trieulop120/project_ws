@@ -211,3 +211,217 @@ html, body {
         grid-template-columns: 1fr;
     }
 }
+/* ========================================
+   Custom Scrollbar chuẩn Dark Theme cho Mobile & PC
+   ======================================== */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track {
+    background: var(--bg-primary);
+}
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: var(--accent);
+}
+
+/* ========================================
+   Header & Sidebar Toggle Controls
+   ======================================== */
+/* Mặc định trên PC (Màn hình lớn): Nút Toggle Menu BẮT BUỘC ẨN */
+.btn-sidebar-toggle {
+    display: none !important;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    cursor: pointer;
+    padding: 6px;
+    border-radius: var(--radius-sm);
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-sidebar-toggle:hover {
+    background: var(--bg-panel-secondary);
+    color: var(--accent);
+}
+
+
+/* ========================================
+   Responsive Mobile Adjustments (< 768px) - FIX HOÀN CHỈNH
+   ======================================== */
+@media (max-width: 768px) {
+    /* Cho phép cuộn trang toàn màn hình tự do, không bị giật/trồi bật lại */
+    html, body, .app {
+        height: auto !important;
+        min-height: 100vh !important;
+        overflow-x: hidden !important;
+        overflow-y: auto !important;
+    }
+
+    .main {
+        height: auto !important;
+        min-height: 100vh !important;
+        overflow: visible !important;
+    }
+
+    .page {
+        display: none;
+        height: auto !important;
+        min-height: 100vh !important;
+        overflow: visible !important;
+        padding: 8px !important;
+    }
+
+    .page.active {
+        display: flex !important;
+        flex-direction: column !important;
+    }
+
+    /* 1. Header & Sidebar Toggle */
+    .btn-sidebar-toggle {
+        display: flex !important;
+    }
+
+    .header {
+        padding: 8px 12px;
+    }
+
+    .clock-date {
+        display: none;
+    }
+
+    .sidebar {
+        position: fixed !important;
+        top: 0;
+        left: -220px;
+        height: 100vh;
+        z-index: 1000;
+        transition: left 0.25s ease-in-out;
+        box-shadow: 4px 0 15px rgba(0, 0, 0, 0.6);
+    }
+
+    .sidebar.show {
+        left: 0 !important;
+    }
+
+    /* 2. OVERVIEW PAGE MOBILE: Hiện đủ Card, không bị lẹm hay lấn khung */
+    .overview-page {
+        height: auto !important;
+        overflow: visible !important;
+        gap: 12px !important;
+    }
+
+    .metrics-bar {
+        grid-template-columns: repeat(2, 1fr) !important;
+        gap: 8px !important;
+    }
+
+    .metric-card {
+        height: auto !important;
+        min-height: 90px !important;
+        max-height: none !important;
+        padding: 10px !important;
+    }
+
+    .content-grid, .left-column, .right-column {
+        display: flex !important;
+        flex-direction: column !important;
+        height: auto !important;
+        overflow: visible !important;
+        gap: 12px !important;
+    }
+
+    /* Khung Live Map nằm gọn trong 320px, không che các Card bên dưới */
+    .live-map-panel {
+        height: 320px !important;
+        min-height: 320px !important;
+        max-height: 320px !important;
+        position: relative !important;
+        flex: none !important;
+        overflow: hidden !important;
+        display: flex !important;
+        flex-direction: column !important;
+    }
+
+    .map-viewport {
+        position: relative !important;
+        width: 100% !important;
+        height: calc(100% - 35px) !important;
+    }
+
+    .activity-panel, .alarms-panel {
+        height: auto !important;
+        min-height: 180px !important;
+    }
+
+    /* 3. SLAM PAGE MOBILE: Cuộn đến đâu dừng đến đó, không bị trồi lên lại */
+    .slam-layout {
+        display: flex !important;
+        flex-direction: column !important;
+        height: auto !important;
+        min-height: auto !important;
+        overflow: visible !important;
+        gap: 12px !important;
+    }
+
+    .slam-viewport-wrap {
+        height: 320px !important;
+        min-height: 320px !important;
+        flex: none !important;
+        position: relative !important;
+    }
+
+    .slam-sidebar-panel {
+        display: flex !important;
+        flex-direction: column !important;
+        height: auto !important;
+        overflow: visible !important;
+        gap: 12px !important;
+    }
+
+    .slam-sidebar-panel .panel-card {
+        height: auto !important;
+        min-height: min-content !important;
+        flex-shrink: 0 !important;
+    }
+
+    /* 4. MAP & ROUTE PAGE MOBILE: Hiện đủ bảng Nodes & Editor */
+    .map-route-layout, .map-route-grid, .bottom-left-wrapper {
+        display: flex !important;
+        flex-direction: column !important;
+        height: auto !important;
+        overflow: visible !important;
+        gap: 12px !important;
+    }
+
+    .map-canvas-wrapper {
+        height: 320px !important;
+        min-height: 320px !important;
+        flex: none !important;
+        position: relative !important;
+    }
+
+    .node-table-wrapper, 
+    .node-editor-wrapper, 
+    .maps-panel, 
+    .route-panel {
+        height: auto !important;
+        min-height: 160px !important;
+        max-height: none !important;
+        overflow: visible !important;
+    }
+
+    /* 5. Nút bấm cảm ứng to dễ nhấn */
+    .teleop-btn {
+        min-height: 48px !important;
+    }
+
+    .btn {
+        padding: 10px 14px !important;
+    }
+}

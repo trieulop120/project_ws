@@ -390,12 +390,21 @@
 /* ========================================
    SLAM Sidebar Panel
    ======================================== */
+/* SLAM Sidebar Panel Fix */
 .slam-sidebar-panel {
     display: flex;
     flex-direction: column;
     gap: 10px;
     overflow-y: auto;
     min-height: 0;
+    height: 100%;
+}
+
+.slam-sidebar-panel .panel-card {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    flex-shrink: 0; /* Giúp các Card giữ đúng chiều cao nội dung, không bị ép bẹt */
 }
 
 .panel-card {
@@ -1762,4 +1771,83 @@
 .confirm-actions .btn {
     padding: 8px 16px;
     font-size: 0.8rem;
+}
+
+/* ========================================
+   Toast Notification (Green Bottom-Right)
+   ======================================== */
+.toast-container {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    pointer-events: none;
+}
+
+.toast {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 280px;
+    padding: 12px 16px;
+    background: #182023;
+    border: 1px solid #55DDBB;
+    border-left: 4px solid #55DDBB;
+    border-radius: 6px;
+    color: #E2E8F0;
+    font-size: 0.8rem;
+    font-weight: 500;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), 0 0 10px rgba(85, 221, 187, 0.2);
+    pointer-events: auto;
+    animation: toastIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+.toast.toast-success {
+    border-color: #55DDBB;
+    border-left-color: #55DDBB;
+}
+
+.toast.toast-error {
+    border-color: #F16C70;
+    border-left-color: #F16C70;
+}
+
+.toast-icon {
+    width: 18px;
+    height: 18px;
+    color: #55DDBB;
+    flex-shrink: 0;
+}
+
+.toast.toast-error .toast-icon {
+    color: #F16C70;
+}
+
+.toast-message {
+    flex: 1;
+}
+
+@keyframes toastIn {
+    from {
+        opacity: 0;
+        transform: translateY(20px) scale(0.95);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+@keyframes toastOut {
+    from {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+    to {
+        opacity: 0;
+        transform: translateY(10px) scale(0.9);
+    }
 }

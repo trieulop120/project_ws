@@ -2,6 +2,36 @@
 (function() {
     'use strict';
 
+    // ========================================
+    // Toast Notification System
+    // ========================================
+    function showToast(message, type = 'success') {
+        let container = document.querySelector('.toast-container');
+        if (!container) {
+            container = document.createElement('div');
+            container.className = 'toast-container';
+            document.body.appendChild(container);
+        }
+
+        const toast = document.createElement('div');
+        toast.className = `toast toast-${type}`;
+        toast.innerHTML = `
+            <svg class="toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                ${type === 'success' 
+                    ? '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>'
+                    : '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>'}
+            </svg>
+            <span class="toast-message">${message}</span>
+        `;
+
+        container.appendChild(toast);
+
+        setTimeout(() => {
+            toast.style.animation = 'toastOut 0.3s forwards';
+            setTimeout(() => toast.remove(), 300);
+        }, 3000);
+    }
+
     // DOM Elements
     const routeNodeTable = document.getElementById('routeNodeTable');
     const nodeEditor = document.getElementById('nodeEditor');
@@ -892,20 +922,13 @@
 
         let bgGrayHex = '#cdcdcd';
 
-        if (currentMapImage) {
-            try {
-                const decoded = atob(currentMapImage);
-                if (decoded.length > 0) {
-                    const firstPixelVal = decoded.charCodeAt(0);
-                    bgGrayHex = `rgb(${firstPixelVal}, ${firstPixelVal}, ${firstPixelVal})`;
-                }
-            } catch (e) {
-                console.warn('[MapRoute] Failed to parse background color:', e);
-            }
-        }
-
         ctx.fillStyle = bgGrayHex;
         ctx.fillRect(0, 0, width, height);
+
+        // Bổ sung kiểm tra an toàn tránh vỡ canvas khi zoom
+        if (!isFinite(canvasScale) || canvasScale <= 0) canvasScale = 1;
+        if (!isFinite(canvasOffsetX)) canvasOffsetX = 0;
+        if (!isFinite(canvasOffsetY)) canvasOffsetY = 0;
 
         // 1. Vẽ Map PGM Image
         if (currentMapImage && currentMapInfo) {
@@ -916,41 +939,45 @@
             const mapW = info.width * res;
             const mapH = info.height * res;
 
-            const decoded = atob(currentMapImage);
-            const bytes = new Uint8Array(decoded.length);
-            for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+            try {
+                const decoded = atob(currentMapImage);
+                const bytes = new Uint8Array(decoded.length);
+                for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
 
-            const tmp = document.createElement('canvas');
-            tmp.width = info.width;
-            tmp.height = info.height;
-            const tmpCtx = tmp.getContext('2d');
-            const imgData = tmpCtx.createImageData(info.width, info.height);
-            const pix = imgData.data;
+                const tmp = document.createElement('canvas');
+                tmp.width = info.width;
+                tmp.height = info.height;
+                const tmpCtx = tmp.getContext('2d');
+                const imgData = tmpCtx.createImageData(info.width, info.height);
+                const pix = imgData.data;
 
-            const w = info.width;
-            const h = info.height;
+                const w = info.width;
+                const h = info.height;
 
-            for (let y = 0; y < h; y++) {
-                for (let x = 0; x < w; x++) {
-                    const srcIdx = y * w + x;
-                    const destIdx = srcIdx * 4;
-                    const val = bytes[srcIdx];
-                    pix[destIdx] = val;
-                    pix[destIdx + 1] = val;
-                    pix[destIdx + 2] = val;
-                    pix[destIdx + 3] = 255;
+                for (let y = 0; y < h; y++) {
+                    for (let x = 0; x < w; x++) {
+                        const srcIdx = y * w + x;
+                        const destIdx = srcIdx * 4;
+                        const val = bytes[srcIdx];
+                        pix[destIdx] = val;
+                        pix[destIdx + 1] = val;
+                        pix[destIdx + 2] = val;
+                        pix[destIdx + 3] = 255;
+                    }
                 }
+                tmpCtx.putImageData(imgData, 0, 0);
+
+                ctx.save();
+                ctx.translate(width / 2 + canvasOffsetX, height / 2 + canvasOffsetY);
+                ctx.scale(canvasScale, canvasScale);
+                ctx.imageSmoothingEnabled = false;
+
+                // Draw map at exact ROS World coordinates
+                ctx.drawImage(tmp, originX, -originY - mapH, mapW, mapH);
+                ctx.restore();
+            } catch (e) {
+                console.error('[MapRoute] Error rendering map image:', e);
             }
-            tmpCtx.putImageData(imgData, 0, 0);
-
-            ctx.save();
-            ctx.translate(width / 2 + canvasOffsetX, height / 2 + canvasOffsetY);
-            ctx.scale(canvasScale, canvasScale);
-            ctx.imageSmoothingEnabled = false;
-
-            // Draw map at exact ROS World coordinates
-            ctx.drawImage(tmp, originX, -originY - mapH, mapW, mapH);
-            ctx.restore();
         }
 
         // 2. Vẽ Edges (Đường nối các node)
@@ -1093,46 +1120,44 @@
 
     async function saveRoute() {
         if (!selectedMapId) {
-            alert('Please select a map first');
+            showToast('Please select a map first', 'error');
             return;
         }
 
         if (!selectedRouteId) {
-            alert('Please create a route first');
+            showToast('Please create a route first', 'error');
             return;
         }
 
-        if (hasUnsavedChanges) {
-            availableRoutes[selectedMapId] = {
-                ...availableRoutes[selectedMapId],
-                graph_name: currentRoute.graph_name,
-                nodes: currentRoute.nodes,
-                edges: currentRoute.edges,
-                nodeCount: currentRoute.nodes.length,
-                edgeCount: currentRoute.edges.length
-            };
+        availableRoutes[selectedMapId] = {
+            ...availableRoutes[selectedMapId],
+            graph_name: currentRoute.graph_name,
+            nodes: currentRoute.nodes,
+            edges: currentRoute.edges,
+            nodeCount: currentRoute.nodes.length,
+            edgeCount: currentRoute.edges.length
+        };
 
-            try {
-                const response = await fetch('/api/routes', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        map_id: selectedMapId,
-                        route: currentRoute
-                    })
-                });
-                const data = await response.json();
-                if (data.status === 'ok') {
-                    hasUnsavedChanges = false;
-                    alert('Route saved successfully!');
-                    renderRouteList();
-                }
-            } catch (err) {
-                console.error('[MapRoute] Failed to save route:', err);
-                alert('Failed to save route');
+        try {
+            const response = await fetch('/api/routes', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    map_id: selectedMapId,
+                    route: currentRoute
+                })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                hasUnsavedChanges = false;
+                showToast(`Route "${currentRoute.graph_name}" saved successfully!`, 'success');
+                renderRouteList();
+            } else {
+                showToast(`Failed to save route: ${data.message}`, 'error');
             }
-        } else {
-            alert('Route is already saved!');
+        } catch (err) {
+            console.error('[MapRoute] Failed to save route:', err);
+            showToast('Failed to save route due to network error', 'error');
         }
     }
 

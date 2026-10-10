@@ -122,10 +122,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const canvasEl = document.getElementById('mapCanvas');
     if (canvasEl) canvasEl.style.cursor = 'grab';
 
-    // Navigation events
+    // Navigation events (Tự động đóng Sidebar khi chọn Tab trên mobile)
     navItems.forEach(i => i.addEventListener('click', e => {
         e.preventDefault();
         navigateToPage(i.dataset.page);
+        
+        // Đóng sidebar drawer trên thiết bị di động
+        const sidebar = document.querySelector('.sidebar');
+        if (window.innerWidth <= 768 && sidebar) {
+            sidebar.classList.remove('show');
+        }
     }));
 
     // Canvas drag events
