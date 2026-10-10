@@ -38,13 +38,6 @@
     let canvasInteractionsBound = false;
     let mapRouteControlsBound = false;
 
-    // COLORS for map rendering (same as map.js)
-    const MAP_COLORS = {
-        unknown: [128, 128, 128],
-        free: [255, 255, 255],
-        occupied: [0, 0, 0]
-    };
-
     function inferNodeType(name) {
         const upper = (name || '').trim().toUpperCase();
         if (upper.startsWith('HOME') || upper.startsWith('NODE_HOME')) return 'home';
@@ -98,9 +91,7 @@
         const res = currentMapInfo.resolution || 0.05;
         const mapW = currentMapInfo.width * res;
         const mapH = currentMapInfo.height * res;
-        
-        // Allow zooming out beyond the initial fit while keeping the map usable.
-        return Math.max(0.1, Math.min(rect.width / mapW, rect.height / mapH) * 0.1);
+        return Math.max(0.01, Math.min(rect.width / mapW, rect.height / mapH) * 0.1);
     }
 
     function setupCanvasInteraction() {
@@ -121,7 +112,7 @@
                     const nodeName = currentRoute.nodes[clickedNodeIdx].name;
                     showConfirmModal(
                         'Delete Node',
-                        `Delete node "${nodeName}"?`,
+                        `Delete node "${nodeName}" and its connected edges?`,
                         () => deleteNode(clickedNodeIdx),
                         () => {}
                     );
@@ -129,10 +120,13 @@
                     if (edgeStartNodeIdx !== null && edgeStartNodeIdx !== clickedNodeIdx) {
                         const fromNode = currentRoute.nodes[edgeStartNodeIdx];
                         const toNode = currentRoute.nodes[clickedNodeIdx];
+                        
+                        // CHỈ KIỂM TRA ĐÚNG CHÍNH XÁC CHIỀU (from -> to)
+                        // Cho phép nối thêm chiều ngược lại (to -> from) trong danh sách edges
                         const edgeExists = currentRoute.edges.some(e =>
-                            (e.from === fromNode.name && e.to === toNode.name) ||
-                            (e.from === toNode.name && e.to === fromNode.name)
+                            e.from === fromNode.name && e.to === toNode.name
                         );
+
                         if (!edgeExists) {
                             currentRoute.edges.push({
                                 from: fromNode.name,
@@ -152,6 +146,20 @@
                     selectNode(clickedNodeIdx);
                 }
             } else {
+                if (currentTool === 'delete') {
+                    const clickedEdgeIdx = getEdgeAtScreenPosition(mouseX, mouseY);
+                    if (clickedEdgeIdx !== null) {
+                        const edge = currentRoute.edges[clickedEdgeIdx];
+                        showConfirmModal(
+                            'Delete Edge',
+                            `Delete edge between "${edge.from}" and "${edge.to}"?`,
+                            () => deleteEdge(clickedEdgeIdx),
+                            () => {}
+                        );
+                        return;
+                    }
+                }
+
                 isDragging = true;
                 lastMouseX = e.clientX;
                 lastMouseY = e.clientY;
@@ -205,16 +213,34 @@
             }
         });
 
-        // Mouse wheel zoom - Giới hạn minScale không zoom out xa hơn map
         routeCanvas.addEventListener('wheel', (e) => {
             e.preventDefault();
-            const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-            const minScale = getMinScale();
-            const maxScale = 15.0;
 
-            canvasScale *= zoomFactor;
-            canvasScale = Math.max(minScale, Math.min(maxScale, canvasScale));
-            renderCanvas();
+            const rect = routeCanvas.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+
+            const zoomFactor = e.deltaY < 0 ? 1.15 : 0.85;
+            const minScale = getMinScale();
+            const maxScale = 500.0;
+
+            let newScale = canvasScale * zoomFactor;
+            newScale = Math.max(minScale, Math.min(maxScale, newScale));
+
+            if (newScale !== canvasScale && !isNaN(newScale)) {
+                const scaleRatio = newScale / canvasScale;
+
+                const centerWorldX = mouseX - rect.width / 2;
+                const centerWorldY = mouseY - rect.height / 2;
+
+                canvasOffsetX = centerWorldX - (centerWorldX - canvasOffsetX) * scaleRatio;
+                canvasOffsetY = centerWorldY - (centerWorldY - canvasOffsetY) * scaleRatio;
+                canvasScale = newScale;
+
+                renderCanvas();
+            }
         }, { passive: false });
     }
 
@@ -225,8 +251,8 @@
         const width = rect.width;
         const height = rect.height;
 
-        const worldX = (screenX - width/2 - canvasOffsetX) / canvasScale;
-        const worldY = -(screenY - height/2 - canvasOffsetY) / canvasScale;
+        const worldX = (screenX - width / 2 - canvasOffsetX) / canvasScale;
+        const worldY = -(screenY - height / 2 - canvasOffsetY) / canvasScale;
 
         return { x: worldX, y: worldY };
     }
@@ -238,22 +264,50 @@
         const width = rect.width;
         const height = rect.height;
 
-        const screenX = width/2 + canvasOffsetX + worldX * canvasScale;
-        const screenY = height/2 + canvasOffsetY - worldY * canvasScale;
+        const screenX = width / 2 + canvasOffsetX + worldX * canvasScale;
+        const screenY = height / 2 + canvasOffsetY - worldY * canvasScale;
 
         return { x: screenX, y: screenY };
     }
 
     function getNodeAtScreenPosition(screenX, screenY) {
         const world = screenToWorld(screenX, screenY);
-        const nodeRadius = 20 / canvasScale;
+        const clickRadiusWorld = 20 / canvasScale;
 
         for (let i = currentRoute.nodes.length - 1; i >= 0; i--) {
             const node = currentRoute.nodes[i];
             const dx = world.x - node.position.x;
             const dy = world.y - node.position.y;
             const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist <= nodeRadius) {
+            if (dist <= clickRadiusWorld) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    function distToSegmentSquared(p, v, w) {
+        const l2 = (w.x - v.x) ** 2 + (w.y - v.y) ** 2;
+        if (l2 === 0) return (p.x - v.x) ** 2 + (p.y - v.y) ** 2;
+        let t = ((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2;
+        t = Math.max(0, Math.min(1, t));
+        return (p.x - (v.x + t * (w.x - v.x))) ** 2 + (p.y - (v.y + t * (w.y - v.y))) ** 2;
+    }
+
+    function getEdgeAtScreenPosition(screenX, screenY) {
+        const thresholdPx = 10;
+
+        for (let i = 0; i < currentRoute.edges.length; i++) {
+            const edge = currentRoute.edges[i];
+            const fromNode = currentRoute.nodes.find(n => n.name === edge.from);
+            const toNode = currentRoute.nodes.find(n => n.name === edge.to);
+            if (!fromNode || !toNode) continue;
+
+            const fromPos = worldToScreen(fromNode.position.x, fromNode.position.y);
+            const toPos = worldToScreen(toNode.position.x, toNode.position.y);
+
+            const distSq = distToSegmentSquared({ x: screenX, y: screenY }, fromPos, toPos);
+            if (distSq <= thresholdPx * thresholdPx) {
                 return i;
             }
         }
@@ -262,11 +316,21 @@
 
     function addNodeAtPosition(screenX, screenY) {
         const world = screenToWorld(screenX, screenY);
-        const nextId = currentRoute.nodes.length;
+
+        let maxJIndex = 0;
+        currentRoute.nodes.forEach(node => {
+            const match = (node.name || '').match(/^J_(\d+)$/i);
+            if (match) {
+                const val = parseInt(match[1], 10);
+                if (val > maxJIndex) maxJIndex = val;
+            }
+        });
+
+        const nextJName = `J_${maxJIndex + 1}`;
 
         const newNode = {
-            name: `NODE_${nextId}`,
-            position: { x: parseFloat(world.x.toFixed(1)), y: parseFloat(world.y.toFixed(1)), z: 0 },
+            name: nextJName,
+            position: { x: parseFloat(world.x.toFixed(2)), y: parseFloat(world.y.toFixed(2)), z: 0 },
             orientation: { yaw: 0 },
             type: 'transit',
             floor: 1,
@@ -290,7 +354,6 @@
         canvasOffsetY = 0;
     }
 
-    // Fit Map vừa khít Viewport
     function fitMapToView() {
         const canvas = routeCanvas;
         if (!canvas) return;
@@ -313,20 +376,18 @@
         const originX = info.origin?.x || 0;
         const originY = info.origin?.y || 0;
 
-        const scaleX = width / mapW;
-        const scaleY = height / mapH;
+        const scaleX = (width * 0.85) / mapW;
+        const scaleY = (height * 0.85) / mapH;
         canvasScale = Math.min(scaleX, scaleY);
 
-        // Tính toán tâm của map trong hệ tọa độ World
         const mapCenterX = originX + mapW / 2;
         const mapCenterY = originY + mapH / 2;
 
-        // Căn tâm Map vào tâm Viewport
         canvasOffsetX = -mapCenterX * canvasScale;
         canvasOffsetY = mapCenterY * canvasScale;
     }
 
-    // Render Map List, Route List, Node Table, Node Editor (Giữ nguyên)
+    // UI Renderers
     function renderMapList() {
         if (!mapListPanel) return;
 
@@ -419,9 +480,11 @@
                 <div class="route-name">${route.name}</div>
                 <div class="route-meta">${route.nodeCount || 0} nodes | ${route.edgeCount || 0} edges</div>
             </div>
-            <button class="btn btn-accent btn-block" id="btnNewRoute">
-                + New Route
-            </button>
+            <div style="display: flex; justify-content: center; margin-top: 12px;">
+                <button class="btn btn-accent" id="btnNewRoute">
+                    + New Route
+                </button>
+            </div>
         `;
 
         routeListPanel.querySelector('.route-info')?.addEventListener('click', () => {
@@ -525,16 +588,23 @@
             </div>
         `;
 
-        const applyNodeName = (value) => {
-            node.name = value;
-            node.type = inferNodeType(value);
+        const applyNodeName = (oldName, newName) => {
+            node.name = newName;
+            node.type = inferNodeType(newName);
+
+            currentRoute.edges.forEach(e => {
+                if (e.from === oldName) e.from = newName;
+                if (e.to === oldName) e.to = newName;
+            });
+
             hasUnsavedChanges = true;
             renderNodeTable();
             renderCanvas();
         };
 
         document.getElementById('editNodeName')?.addEventListener('input', (e) => {
-            applyNodeName(e.target.value);
+            const oldName = node.name;
+            applyNodeName(oldName, e.target.value);
         });
 
         document.getElementById('editNodeId')?.addEventListener('change', (e) => {
@@ -680,9 +750,11 @@
 
         const nodeName = currentRoute.nodes[nodeIdx]?.name;
 
-        currentRoute.edges = currentRoute.edges.filter(e =>
-            e.from !== nodeName && e.to !== nodeName
-        );
+        if (nodeName) {
+            currentRoute.edges = currentRoute.edges.filter(e =>
+                e.from !== nodeName && e.to !== nodeName
+            );
+        }
 
         currentRoute.nodes.splice(nodeIdx, 1);
 
@@ -695,6 +767,14 @@
         hasUnsavedChanges = true;
         renderNodeTable();
         renderNodeEditor();
+        renderCanvas();
+    }
+
+    function deleteEdge(edgeIdx) {
+        if (edgeIdx === null || edgeIdx === undefined) return;
+
+        currentRoute.edges.splice(edgeIdx, 1);
+        hasUnsavedChanges = true;
         renderCanvas();
     }
 
@@ -784,7 +864,7 @@
     }
 
     // ========================================
-    // Canvas Rendering (Sửa chính xác tọa độ vẽ Map)
+    // Canvas Rendering Pipeline (Đã chuẩn hóa)
     // ========================================
 
     function renderCanvas() {
@@ -810,10 +890,24 @@
         const width = rect.width;
         const height = rect.height;
 
-        // Keep the Map & Route viewport consistent with the live map background.
-        ctx.fillStyle = '#808080';
+        let bgGrayHex = '#cdcdcd';
+
+        if (currentMapImage) {
+            try {
+                const decoded = atob(currentMapImage);
+                if (decoded.length > 0) {
+                    const firstPixelVal = decoded.charCodeAt(0);
+                    bgGrayHex = `rgb(${firstPixelVal}, ${firstPixelVal}, ${firstPixelVal})`;
+                }
+            } catch (e) {
+                console.warn('[MapRoute] Failed to parse background color:', e);
+            }
+        }
+
+        ctx.fillStyle = bgGrayHex;
         ctx.fillRect(0, 0, width, height);
 
+        // 1. Vẽ Map PGM Image
         if (currentMapImage && currentMapInfo) {
             const info = currentMapInfo;
             const res = info.resolution || 0.05;
@@ -822,7 +916,6 @@
             const mapW = info.width * res;
             const mapH = info.height * res;
 
-            // Decode Base64 Image
             const decoded = atob(currentMapImage);
             const bytes = new Uint8Array(decoded.length);
             for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
@@ -837,7 +930,6 @@
             const w = info.width;
             const h = info.height;
 
-            // Preserve the PGM pixels exactly: PGM row 0 is the visible top row.
             for (let y = 0; y < h; y++) {
                 for (let x = 0; x < w; x++) {
                     const srcIdx = y * w + x;
@@ -851,23 +943,17 @@
             }
             tmpCtx.putImageData(imgData, 0, 0);
 
-            // 3. Render ra Viewport
             ctx.save();
             ctx.translate(width / 2 + canvasOffsetX, height / 2 + canvasOffsetY);
-            
-            // The PGM itself remains top-to-bottom; this placement preserves
-            // the existing ROS-world alignment for route nodes and edges.
             ctx.scale(canvasScale, canvasScale);
-
             ctx.imageSmoothingEnabled = false;
-        
-            // Vẽ đúng tọa độ World (Lưu ý: Trong hệ Canvas Top-Down, Y_screen hướng xuống nên dùng -originY)
-            ctx.drawImage(tmp, originX, -originY - mapH, mapW, mapH);
 
+            // Draw map at exact ROS World coordinates
+            ctx.drawImage(tmp, originX, -originY - mapH, mapW, mapH);
             ctx.restore();
         }
 
-        // 3. Vẽ Route Nodes & Edges
+        // 2. Vẽ Edges (Đường nối các node)
         if (currentRoute.nodes.length > 0) {
             currentRoute.edges.forEach((edge) => {
                 const fromNode = currentRoute.nodes.find(n => n.name === edge.from);
@@ -885,6 +971,22 @@
                 ctx.stroke();
             });
 
+            if (currentTool === 'addEdge' && edgeStartNodeIdx !== null && pendingMousePos) {
+                const startNode = currentRoute.nodes[edgeStartNodeIdx];
+                if (startNode) {
+                    const from = worldToScreen(startNode.position.x, startNode.position.y);
+                    ctx.strokeStyle = '#f59e0b';
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([6, 6]);
+                    ctx.beginPath();
+                    ctx.moveTo(from.x, from.y);
+                    ctx.lineTo(pendingMousePos.x, pendingMousePos.y);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                }
+            }
+
+            // 3. Vẽ Nodes
             currentRoute.nodes.forEach((node, idx) => {
                 const pos = worldToScreen(node.position.x, node.position.y);
 
@@ -895,8 +997,9 @@
                     transit: '#22c55e',
                     charging: '#9ca3af'
                 };
-                const color = colors[node.type] || '#9ca3af';
-                const radius = node.type === 'home' ? 12 : 8;
+                const color = colors[node.type] || '#22c55e';
+
+                const radius = node.type === 'home' ? 6 : 4.5;
 
                 ctx.fillStyle = color;
                 ctx.beginPath();
@@ -904,43 +1007,45 @@
                 ctx.fill();
 
                 if (selectedNodeId === idx) {
-                    ctx.strokeStyle = '#fff';
-                    ctx.lineWidth = 3;
+                    ctx.strokeStyle = '#ffffff';
+                    ctx.lineWidth = 2;
                     ctx.beginPath();
-                    ctx.arc(pos.x, pos.y, radius + 6, 0, Math.PI * 2);
+                    ctx.arc(pos.x, pos.y, radius + 3, 0, Math.PI * 2);
                     ctx.stroke();
                 }
 
-                const yaw = node.orientation.yaw;
-                const arrowLen = 20;
-                const arrowX = pos.x + Math.cos(-yaw) * arrowLen;
-                const arrowY = pos.y + Math.sin(-yaw) * arrowLen;
+                if (node.type !== 'transit') {
+                    const yaw = node.orientation.yaw;
+                    const arrowLen = 12;
+                    const arrowX = pos.x + Math.cos(-yaw) * arrowLen;
+                    const arrowY = pos.y + Math.sin(-yaw) * arrowLen;
 
-                ctx.strokeStyle = color;
-                ctx.lineWidth = 3;
-                ctx.lineCap = 'round';
-                ctx.beginPath();
-                ctx.moveTo(pos.x, pos.y);
-                ctx.lineTo(arrowX, arrowY);
-                ctx.stroke();
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = 2;
+                    ctx.lineCap = 'round';
+                    ctx.beginPath();
+                    ctx.moveTo(pos.x, pos.y);
+                    ctx.lineTo(arrowX, arrowY);
+                    ctx.stroke();
 
-                const arrowAngle = Math.atan2(arrowY - pos.y, arrowX - pos.x);
+                    const arrowAngle = Math.atan2(arrowY - pos.y, arrowX - pos.x);
+                    ctx.fillStyle = color;
+                    ctx.beginPath();
+                    ctx.moveTo(arrowX, arrowY);
+                    ctx.lineTo(arrowX - 5 * Math.cos(arrowAngle - 0.4), arrowY - 5 * Math.sin(arrowAngle - 0.4));
+                    ctx.lineTo(arrowX - 5 * Math.cos(arrowAngle + 0.4), arrowY - 5 * Math.sin(arrowAngle + 0.4));
+                    ctx.closePath();
+                    ctx.fill();
+                }
+
                 ctx.fillStyle = color;
-                ctx.beginPath();
-                ctx.moveTo(arrowX, arrowY);
-                ctx.lineTo(arrowX - 8 * Math.cos(arrowAngle - 0.4), arrowY - 8 * Math.sin(arrowAngle - 0.4));
-                ctx.lineTo(arrowX - 8 * Math.cos(arrowAngle + 0.4), arrowY - 8 * Math.sin(arrowAngle + 0.4));
-                ctx.closePath();
-                ctx.fill();
-
-                ctx.fillStyle = color;
-                ctx.font = 'bold 12px sans-serif';
+                ctx.font = 'bold 11px sans-serif';
                 ctx.textAlign = 'center';
-                ctx.fillText(node.name, pos.x, pos.y - radius - 8);
+                ctx.fillText(node.name, pos.x, pos.y - radius - 5);
 
-                ctx.font = '10px monospace';
-                ctx.fillStyle = '#888';
-                ctx.fillText(`#${idx}`, pos.x, pos.y + radius + 14);
+                ctx.font = '9px monospace';
+                ctx.fillStyle = '#aaaaaa';
+                ctx.fillText(`#${idx}`, pos.x, pos.y + radius + 11);
             });
         }
 

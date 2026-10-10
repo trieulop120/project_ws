@@ -136,6 +136,34 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             return {"status": "ok", "routes": routes}
         return {"status": "error", "message": "Bridge node not available"}
 
+    @app.post("/api/routes")
+    async def save_route(payload: dict):
+        """API tiếp nhận dữ liệu POST từ nút Save Route trên Web SCADA."""
+        if not bridge_node:
+            return {"status": "error", "message": "Bridge node not available"}
+
+        map_id = payload.get('map_id')
+        route_data = payload.get('route')
+
+        if not map_id or not route_data:
+            return {"status": "error", "message": "Missing map_id or route payload"}
+
+        success, msg = bridge_node.save_route(map_id, route_data)
+        if success:
+            return {"status": "ok", "message": msg}
+        return {"status": "error", "message": msg}
+
+    @app.delete("/api/maps/{map_id}")
+    async def delete_map(map_id: str):
+        """API tiếp nhận yêu cầu xóa Map và các Route liên quan."""
+        if not bridge_node:
+            return {"status": "error", "message": "Bridge node not available"}
+
+        success, msg = bridge_node.delete_map_and_routes(map_id)
+        if success:
+            return {"status": "ok", "message": msg}
+        return {"status": "error", "message": msg}
+    
     # ============================================================
     # Command Handlers
     # ============================================================

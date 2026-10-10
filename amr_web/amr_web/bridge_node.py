@@ -295,30 +295,26 @@ class WebBridge(Node):
 
     def start_slam(self) -> bool:
         """Khởi chạy SLAM launch file."""
-        # Check if process is actually running
         if self._slam_process and self._slam_process.poll() is None:
             self.get_logger().warn('SLAM process still running')
             return False
 
         try:
-            # Source workspace properly
             ws_setup = os.path.expanduser('~/project_ws/install/setup.bash')
 
             cmd = f'source {ws_setup} && ros2 launch amr_mapping slam_web.launch.py'
 
             self._slam_process = subprocess.Popen(
                 ['bash', '-c', cmd],
-                stdout=subprocess.DEVNULL,  # Don't capture output
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 preexec_fn=os.setsid
             )
             self._slam_active = True
             self.get_logger().info('SLAM started: amr_mapping slam_web.launch.py')
 
-            # Small delay to let process initialize
             time.sleep(0.5)
 
-            # Verify process is still running
             if self._slam_process.poll() is not None:
                 self.get_logger().error('SLAM process exited immediately')
                 self._slam_active = False
@@ -333,14 +329,12 @@ class WebBridge(Node):
 
     def get_slam_state(self) -> bool:
         """Trả về trạng thái SLAM đang chạy hay không."""
-        # Kiểm tra cả process và flag
         if self._slam_process and self._slam_process.poll() is None:
             return True
         return self._slam_active
 
     def stop_slam(self) -> None:
         """Dừng SLAM - kill process group và các ROS nodes."""
-        # Kill ROS nodes trước
         try:
             subprocess.run(
                 ['bash', '-c',
@@ -354,7 +348,6 @@ class WebBridge(Node):
         except Exception as e:
             self.get_logger().warn(f'Node kill warning: {e}')
 
-        # Kill process group
         if self._slam_process:
             try:
                 pgid = os.getpgid(self._slam_process.pid)
@@ -374,20 +367,14 @@ class WebBridge(Node):
                 self._slam_active = False
 
     def save_map(self, map_name: str) -> tuple:
-        """
-        Lưu bản đồ sử dụng slam_toolbox service.
-        Trả về (success, path).
-        """
-        # Tạo thư mục maps nếu chưa có
+        """Lưu bản đồ sử dụng slam_toolbox service."""
         maps_dir = os.path.expanduser('~/project_ws/maps')
         os.makedirs(maps_dir, exist_ok=True)
 
-        # Đường dẫn tuyệt đối cho map
         map_path = os.path.join(maps_dir, map_name)
         map_path_abs = os.path.expanduser(map_path)
 
         try:
-            # Dùng service call của slam_toolbox
             result = subprocess.run(
                 [
                     'ros2', 'service', 'call',
@@ -416,9 +403,7 @@ class WebBridge(Node):
             return False, ""
 
     def get_available_maps(self) -> list:
-        """
-        Lấy danh sách maps từ ~/project_ws/maps/
-        """
+        """Lấy danh sách maps từ ~/project_ws/maps/"""
         import time
         maps = []
 
@@ -429,7 +414,6 @@ class WebBridge(Node):
                     if f.endswith('.yaml'):
                         full_path = os.path.join(maps_dir, f)
                         map_id = f.replace('.yaml', '')
-                        # Lấy thời gian tạo thực tế từ file
                         try:
                             created = time.strftime('%Y-%m-%d', time.localtime(os.path.getctime(full_path)))
                         except:
@@ -446,9 +430,7 @@ class WebBridge(Node):
         return maps
 
     def get_available_routes(self, map_id: str = None) -> list:
-        """
-        Lấy danh sách routes từ ~/project_ws/maps/{map_id}/routes/
-        """
+        """Lấy danh sách routes từ ~/project_ws/maps/{map_id}/routes/"""
         import time
         routes = []
 
@@ -460,7 +442,6 @@ class WebBridge(Node):
                         if f.endswith('.yaml'):
                             full_path = os.path.join(routes_dir, f)
                             route_id = f.replace('.yaml', '')
-                            # Lấy thời gian tạo thực tế
                             try:
                                 created = time.strftime('%Y-%m-%d', time.localtime(os.path.getctime(full_path)))
                             except:
@@ -475,6 +456,114 @@ class WebBridge(Node):
             self.get_logger().warn(f'Routes error: {e}')
 
         return routes
+
+    # ============================================================
+    # Route & Map Management Methods (Đã di chuyển vào trong Class)
+    # ============================================================
+
+    def save_route(self, map_id: str, route_data: dict) -> tuple:
+        """Lưu route graph YAML, tự động tạo GeoJSON và Poses YAML."""
+        import yaml
+        import json
+        import math
+
+        try:
+            routes_dir = os.path.expanduser(f'~/project_ws/maps/{map_id}/routes')
+            os.makedirs(routes_dir, exist_ok=True)
+
+            graph_name = route_data.get('graph_name', f'{map_id}_route')
+            yaml_path = os.path.join(routes_dir, f'{graph_name}.yaml')
+            geojson_path = os.path.join(routes_dir, f'{graph_name}.geojson')
+            poses_path = os.path.join(routes_dir, f'{graph_name}_poses.yaml')
+
+            # 1. Ghi file YAML Route Graph
+            yaml_content = {
+                'graph_name': graph_name,
+                'version': '1.0',
+                'nodes': {},
+                'edges': route_data.get('edges', [])
+            }
+            for idx, node in enumerate(route_data.get('nodes', [])):
+                yaml_content['nodes'][node['name']] = node
+
+            with open(yaml_path, 'w', encoding='utf-8') as f:
+                yaml.dump(yaml_content, f, default_flow_style=False, sort_keys=False)
+
+            # 2. Chuyển đổi trực tiếp sang GeoJSON
+            node_id_map = {}
+            features = []
+            for idx, (name, n_data) in enumerate(yaml_content['nodes'].items()):
+                node_id_map[name] = idx
+                pos = n_data.get('position', {})
+                features.append({
+                    'type': 'Feature',
+                    'properties': {'id': idx, 'frame': 'map'},
+                    'geometry': {'type': 'Point', 'coordinates': [pos.get('x', 0.0), pos.get('y', 0.0)]}
+                })
+
+            for edge in yaml_content['edges']:
+                from_name, to_name = edge.get('from'), edge.get('to')
+                if from_name in node_id_map and to_name in node_id_map:
+                    from_pos = yaml_content['nodes'][from_name]['position']
+                    to_pos = yaml_content['nodes'][to_name]['position']
+                    features.append({
+                        'type': 'Feature',
+                        'properties': {'id': len(features), 'startid': node_id_map[from_name], 'endid': node_id_map[to_name]},
+                        'geometry': {'type': 'MultiLineString', 'coordinates': [[[from_pos['x'], from_pos['y']], [to_pos['x'], to_pos['y']]]]}
+                    })
+
+            geojson_data = {
+                'type': 'FeatureCollection',
+                'name': graph_name,
+                'crs': {'type': 'name', 'properties': {'name': 'urn:ogc:def:crs:EPSG::4326'}},
+                'features': features
+            }
+            with open(geojson_path, 'w', encoding='utf-8') as f:
+                json.dump(geojson_data, f, indent=2)
+
+            # 3. Tạo file Poses YAML
+            poses_data = {'frame_id': 'map', 'poses': {}}
+            for name, n_data in yaml_content['nodes'].items():
+                pos = n_data.get('position', {})
+                yaw = n_data.get('orientation', {}).get('yaw', 0.0)
+                poses_data['poses'][name] = {
+                    'id': node_id_map[name],
+                    'pose_stamped': {
+                        'header': {'frame_id': 'map'},
+                        'pose': {
+                            'position': {'x': pos.get('x', 0.0), 'y': pos.get('y', 0.0), 'z': pos.get('z', 0.0)},
+                            'orientation': {'x': 0.0, 'y': 0.0, 'z': math.sin(yaw / 2.0), 'w': math.cos(yaw / 2.0)}
+                        }
+                    }
+                }
+            with open(poses_path, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(poses_data, f, sort_keys=False)
+
+            self.get_logger().info(f'Route saved successfully: {yaml_path}')
+            return True, "Route and associated files saved successfully"
+
+        except Exception as e:
+            self.get_logger().error(f'Failed to save route: {e}')
+            return False, str(e)
+
+    def delete_map_and_routes(self, map_id: str) -> tuple:
+        """Xóa Map (.pgm, .yaml) và xóa toàn bộ Route liên quan đến Map đó."""
+        import shutil
+        try:
+            maps_dir = os.path.expanduser('~/project_ws/maps')
+            yaml_path = os.path.join(maps_dir, f'{map_id}.yaml')
+            pgm_path = os.path.join(maps_dir, f'{map_id}.pgm')
+            routes_dir = os.path.join(maps_dir, map_id)
+
+            if os.path.exists(yaml_path): os.remove(yaml_path)
+            if os.path.exists(pgm_path): os.remove(pgm_path)
+            if os.path.exists(routes_dir): shutil.rmtree(routes_dir)
+
+            self.get_logger().info(f'Deleted map and routes for {map_id}')
+            return True, "Map and routes deleted"
+        except Exception as e:
+            self.get_logger().error(f'Failed to delete map: {e}')
+            return False, str(e)
 
     # ============================================================
     # Teleop & Lift Control
@@ -492,13 +581,12 @@ class WebBridge(Node):
         cmd = String()
 
         if action == "UP":
-            cmd.data = "M30"  # Default lift up speed
+            cmd.data = "M30"
         elif action == "DOWN":
-            cmd.data = "M-30"  # Default lift down speed
+            cmd.data = "M-30"
         elif action == "HOME":
             cmd.data = "HOME"
         elif action == "SET_HEIGHT":
-            # target_mm -> cm cho ESP32 protocol
             cmd.data = f"H{target_mm / 10:.1f}"
         else:
             return
@@ -527,7 +615,7 @@ def main(args=None):
         pass
     finally:
         bridge._running = False
-        bridge.stop_slam()  # Cleanup SLAM process
+        bridge.stop_slam()
         executor.remove_node(bridge)
         bridge.destroy_node()
         rclpy.shutdown()
