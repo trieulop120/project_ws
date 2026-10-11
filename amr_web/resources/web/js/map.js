@@ -2,9 +2,9 @@
     'use strict';
 
     const COLORS = { 
-    unknown: [128, 128, 128], // Màu xám chuẩn ROS 2 (Mã hex: #808080)
-    free: [255, 255, 255],    // Màu trắng (Trống / Có thể di chuyển)
-    occupied: [0, 0, 0]       // Màu đen chuẩn ROS 2 (Vật cản / Tường)
+        unknown: [205, 205, 205], // #CDCDCD - trùng nền viewport và Map & Route
+        free: [254, 254, 254],    // trắng như PGM (254)
+        occupied: [0, 0, 0]       // đen: vật cản / tường
     };
 
     // SEPARATE view transforms for Overview and SLAM

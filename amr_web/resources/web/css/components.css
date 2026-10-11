@@ -146,7 +146,7 @@
 .panel-title { font-size: .7rem; font-weight: 600; color: var(--text-secondary); }
 
 .map-viewport {
-    flex: 1; position: relative; background: #808080; overflow: hidden; min-height: 0;
+    flex: 1; position: relative; background: var(--map-bg); overflow: hidden; min-height: 0;
 }
 #mapCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
 .map-toolbar {
@@ -374,7 +374,7 @@
 .slam-map-viewport {
     flex: 1;
     position: relative;
-    background: #808080;
+    background: var(--map-bg);
     min-height: 0;
     overflow: hidden;
 }

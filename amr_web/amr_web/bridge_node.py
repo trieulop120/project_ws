@@ -4,8 +4,8 @@ amr_web/bridge_node.py
 ======================
 ROS 2 Entry Point Node - Optimized for Overview Dashboard
 - Heartbeat monitoring cho 4 thiết bị phần cứng
-- Tắt camera stream (không encode/broadcast ảnh)
 - MultiThreadedExecutor cho ROS callbacks
+- Demand-driven Camera Streaming (RGB & DEPTH) qua WebSocket
 - SLAM web control: start/stop SLAM, save map, teleop, lift
 """
 
@@ -31,7 +31,7 @@ import uvicorn
 
 from amr_web.websocket_manager import WebSocketManager
 from amr_web.state_bridge import StateBridge
-from amr_web.converters import odom_to_json, map_to_json, laser_to_json
+from amr_web.converters import odom_to_json, map_to_json, laser_to_json, image_to_json
 from amr_web.web_server import create_app
 
 
@@ -61,6 +61,7 @@ class WebBridge(Node):
         self.declare_parameter('battery_topic', '/battery_state')
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('camera_topic', '/color/image_raw')
+        self.declare_parameter('depth_camera_topic', '/depth/image_raw')
         self.declare_parameter('lidar_topic', '/scan_filtered')
         self.declare_parameter('joint_topic', '/joint_states')
         self.declare_parameter('pose_rate', 5.0)
@@ -75,6 +76,7 @@ class WebBridge(Node):
         self._battery_topic = self.get_parameter('battery_topic').value
         self._map_topic = self.get_parameter('map_topic').value
         self._camera_topic = self.get_parameter('camera_topic').value
+        self._depth_camera_topic = self.get_parameter('depth_camera_topic').value
         self._lidar_topic = self.get_parameter('lidar_topic').value
         self._joint_topic = self.get_parameter('joint_topic').value
         self._pose_rate = self.get_parameter('pose_rate').value
@@ -82,6 +84,10 @@ class WebBridge(Node):
         self._system_status_rate = self.get_parameter('system_status_rate').value
         self._map_on_change = self.get_parameter('map_on_change').value
         self._verbose = self.get_parameter('verbose').value
+
+        # Camera Streaming Control Flag
+        self._camera_streaming = False
+        self._camera_mode = 'off'  # 'rgb', 'depth', 'off'
 
         # State Managers
         self._state_bridge = StateBridge()
@@ -109,7 +115,7 @@ class WebBridge(Node):
             state_bridge=self._state_bridge,
             ws_manager=self._ws_manager,
             node_logger=self.get_logger() if self._verbose else None,
-            bridge_node=self  # Pass self để xử lý commands
+            bridge_node=self
         )
 
         # ROS Subscriptions
@@ -120,7 +126,9 @@ class WebBridge(Node):
         self._map_sub = self.create_subscription(
             OccupancyGrid, self._map_topic, self._on_map, qos_profile=sensor_qos())
         self._camera_sub = self.create_subscription(
-            Image, self._camera_topic, self._on_camera, qos_profile=sensor_qos())
+            Image, self._camera_topic, self._on_camera_rgb, qos_profile=sensor_qos())
+        self._depth_camera_sub = self.create_subscription(
+            Image, self._depth_camera_topic, self._on_camera_depth, qos_profile=sensor_qos())
         self._lidar_sub = self.create_subscription(
             LaserScan, self._lidar_topic, self._on_lidar, qos_profile=sensor_qos())
         self._joint_sub = self.create_subscription(
@@ -143,11 +151,44 @@ class WebBridge(Node):
         self._last_laser_send = 0.0
         self._last_map_send = 0.0
         self._map_interval = 0.5  # 2 Hz for map broadcast
-        self._map_pending = False  # Flag: map data changed, needs broadcast
+        self._map_pending = False
 
         if self._verbose:
             self.get_logger().info(f'Web Bridge Running on {self._host}:{self._port}')
             self.get_logger().info(f'Lift tracking: joint={self._joint_topic} (position in meters → mm)')
+
+    def set_camera_stream(self, enable: bool, mode: str = 'off') -> None:
+        """Bật/tắt camera stream dynamic theo yêu cầu từ Web SCADA."""
+        self._camera_streaming = enable
+        self._camera_mode = mode if enable else 'off'
+        if self._verbose:
+            self.get_logger().info(f"Camera stream set: enable={enable}, mode={self._camera_mode}")
+
+    def _process_and_broadcast_cam(self, msg: Image, cam_type: str) -> None:
+        """Hàm chung cập nhật heartbeat và encode ảnh khi có yêu cầu từ client."""
+        self._state_bridge.update_heartbeat('camera')
+
+        # Nếu không stream hoặc client đang yêu cầu mode khác -> Bỏ qua ngay (0% CPU encode)
+        if not self._camera_streaming or self._camera_mode != cam_type:
+            return
+
+        try:
+            img_data = image_to_json(msg, max_width=480, quality=60)
+            if img_data and self._loop and self._loop.is_running():
+                img_data['cam_mode'] = cam_type
+                asyncio.run_coroutine_threadsafe(
+                    self._ws_manager.broadcast(json.dumps(img_data)),
+                    self._loop
+                )
+        except Exception as e:
+            if self._verbose:
+                self.get_logger().warn(f'Camera encode error ({cam_type}): {e}')
+
+    def _on_camera_rgb(self, msg: Image) -> None:
+        self._process_and_broadcast_cam(msg, 'rgb')
+
+    def _on_camera_depth(self, msg: Image) -> None:
+        self._process_and_broadcast_cam(msg, 'depth')
 
     def _on_pose(self, msg: Odometry) -> None:
         try:
@@ -181,21 +222,15 @@ class WebBridge(Node):
         try:
             map_data = map_to_json(msg)
             self._state_bridge.update_map(map_data)
-            self._map_pending = True  # Flag: map changed, needs broadcast
+            self._map_pending = True
         except Exception as e:
             if self._verbose:
                 self.get_logger().warn(f'Map error: {e}')
 
-    def _on_camera(self, msg: Image) -> None:
-        """Camera callback - CHỈ cập nhật heartbeat."""
-        self._state_bridge.update_heartbeat('camera')
-
     def _on_lidar(self, msg: LaserScan) -> None:
-        """Callback cho LiDAR - chỉ cập nhật heartbeat."""
         self._state_bridge.update_heartbeat('lidar')
 
     def _on_laser(self, msg: LaserScan) -> None:
-        """Callback cho laser scan - broadcast lên WebSocket."""
         try:
             laser_data = laser_to_json(msg)
             self._state_bridge.update_laser(laser_data)
@@ -204,27 +239,18 @@ class WebBridge(Node):
                 self.get_logger().warn(f'Laser error: {e}')
 
     def _on_joint(self, msg: JointState) -> None:
-        """Callback cho Joint States - cập nhật lift height từ joint_states position."""
         if 'encoder_lift_joint' in msg.name:
             self._state_bridge.update_heartbeat('lift')
-
             try:
                 joint_idx = msg.name.index('encoder_lift_joint')
-
-                # Lấy vị trí theo mét (JointState cho Prismatic Joint dùng đơn vị Mét)
                 lift_height_m = max(0.0, float(msg.position[joint_idx]))
-
-                # Đổi sang mm nguyên (ép kiểu int tròn)
                 height_mm = int(round(lift_height_m * 1000.0))
 
-                # Đánh dấu đã initialized (đã home)
                 if not self._lift_initialized:
                     self._lift_initialized = True
                     self._state_bridge.set_lift_initialized(True)
 
                 self._lift_height_mm = height_mm
-
-                # Cập nhật state bridge
                 self._state_bridge.update_lift_height(self._lift_height_mm)
             except (ValueError, IndexError):
                 pass
@@ -260,7 +286,6 @@ class WebBridge(Node):
                         await self._ws_manager.broadcast(json.dumps(laser))
                         self._last_laser_send = current_time
 
-                # Broadcast map khi có thay đổi (rate-limited)
                 if self._map_pending and (current_time - self._last_map_send) >= self._map_interval:
                     map_data = self._state_bridge.get_latest_map()
                     if map_data:
@@ -289,19 +314,14 @@ class WebBridge(Node):
         server = uvicorn.Server(config)
         server.run()
 
-    # ============================================================
     # SLAM Process Management
-    # ============================================================
-
     def start_slam(self) -> bool:
-        """Khởi chạy SLAM launch file."""
         if self._slam_process and self._slam_process.poll() is None:
             self.get_logger().warn('SLAM process still running')
             return False
 
         try:
             ws_setup = os.path.expanduser('~/project_ws/install/setup.bash')
-
             cmd = f'source {ws_setup} && ros2 launch amr_mapping slam_web.launch.py'
 
             self._slam_process = subprocess.Popen(
@@ -314,7 +334,6 @@ class WebBridge(Node):
             self.get_logger().info('SLAM started: amr_mapping slam_web.launch.py')
 
             time.sleep(0.5)
-
             if self._slam_process.poll() is not None:
                 self.get_logger().error('SLAM process exited immediately')
                 self._slam_active = False
@@ -328,13 +347,11 @@ class WebBridge(Node):
             return False
 
     def get_slam_state(self) -> bool:
-        """Trả về trạng thái SLAM đang chạy hay không."""
         if self._slam_process and self._slam_process.poll() is None:
             return True
         return self._slam_active
 
     def stop_slam(self) -> None:
-        """Dừng SLAM - kill process group và các ROS nodes."""
         try:
             subprocess.run(
                 ['bash', '-c',
@@ -367,7 +384,6 @@ class WebBridge(Node):
                 self._slam_active = False
 
     def save_map(self, map_name: str) -> tuple:
-        """Lưu bản đồ sử dụng slam_toolbox service."""
         maps_dir = os.path.expanduser('~/project_ws/maps')
         os.makedirs(maps_dir, exist_ok=True)
 
@@ -403,10 +419,7 @@ class WebBridge(Node):
             return False, ""
 
     def get_available_maps(self) -> list:
-        """Lấy danh sách maps từ ~/project_ws/maps/"""
-        import time
         maps = []
-
         try:
             maps_dir = os.path.expanduser('~/project_ws/maps')
             if os.path.exists(maps_dir):
@@ -430,11 +443,8 @@ class WebBridge(Node):
         return maps
 
     def get_available_routes(self, map_id: str = None) -> list:
-        """Lấy danh sách routes đầy đủ nodes & edges từ ~/project_ws/maps/{map_id}/routes/"""
-        import time
         import yaml
         routes = []
-
         try:
             if map_id:
                 routes_dir = os.path.expanduser(f'~/project_ws/maps/{map_id}/routes')
@@ -448,7 +458,6 @@ class WebBridge(Node):
                             except:
                                 created = time.strftime('%Y-%m-%d')
                             
-                            # Read route content
                             nodes = []
                             edges = []
                             try:
@@ -479,16 +488,8 @@ class WebBridge(Node):
 
         return routes
 
-    # ============================================================
-    # Route & Map Management Methods (Đã di chuyển vào trong Class)
-    # ============================================================
-
     def save_route(self, map_id: str, route_data: dict) -> tuple:
-        """Lưu route graph YAML, tự động tạo GeoJSON và Poses YAML."""
         import yaml
-        import json
-        import math
-
         try:
             routes_dir = os.path.expanduser(f'~/project_ws/maps/{map_id}/routes')
             os.makedirs(routes_dir, exist_ok=True)
@@ -498,7 +499,6 @@ class WebBridge(Node):
             geojson_path = os.path.join(routes_dir, f'{graph_name}.geojson')
             poses_path = os.path.join(routes_dir, f'{graph_name}_poses.yaml')
 
-            # 1. Ghi file YAML Route Graph
             yaml_content = {
                 'graph_name': graph_name,
                 'version': '1.0',
@@ -511,7 +511,6 @@ class WebBridge(Node):
             with open(yaml_path, 'w', encoding='utf-8') as f:
                 yaml.dump(yaml_content, f, default_flow_style=False, sort_keys=False)
 
-            # 2. Chuyển đổi trực tiếp sang GeoJSON
             node_id_map = {}
             features = []
             for idx, (name, n_data) in enumerate(yaml_content['nodes'].items()):
@@ -543,7 +542,6 @@ class WebBridge(Node):
             with open(geojson_path, 'w', encoding='utf-8') as f:
                 json.dump(geojson_data, f, indent=2)
 
-            # 3. Tạo file Poses YAML
             poses_data = {'frame_id': 'map', 'poses': {}}
             for name, n_data in yaml_content['nodes'].items():
                 pos = n_data.get('position', {})
@@ -569,7 +567,6 @@ class WebBridge(Node):
             return False, str(e)
 
     def delete_map_and_routes(self, map_id: str) -> tuple:
-        """Xóa Map (.pgm, .yaml) và xóa toàn bộ Route liên quan đến Map đó."""
         import shutil
         try:
             maps_dir = os.path.expanduser('~/project_ws/maps')
@@ -587,21 +584,14 @@ class WebBridge(Node):
             self.get_logger().error(f'Failed to delete map: {e}')
             return False, str(e)
 
-    # ============================================================
-    # Teleop & Lift Control
-    # ============================================================
-
     def publish_cmd_vel(self, linear: float, angular: float) -> None:
-        """Publish cmd_vel cho teleop."""
         twist = Twist()
         twist.linear.x = float(linear)
         twist.angular.z = float(angular)
         self._cmd_vel_pub.publish(twist)
 
     def publish_lift(self, action: str, target_mm: int) -> None:
-        """Publish lift commands qua /esp32_cmd."""
         cmd = String()
-
         if action == "UP":
             cmd.data = "M30"
         elif action == "DOWN":

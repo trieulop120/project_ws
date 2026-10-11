@@ -13,8 +13,6 @@ from fastapi.staticfiles import StaticFiles
 from amr_web.websocket_manager import WebSocketManager
 from amr_web.state_bridge import StateBridge
 
-
-# BẮT BUỘC: Ép Python nhận đúng MIME Type chuẩn cho Firefox/Chrome
 mimetypes.add_type('text/css', '.css')
 mimetypes.add_type('application/javascript', '.js')
 
@@ -22,25 +20,18 @@ mimetypes.add_type('application/javascript', '.js')
 def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_logger=None, bridge_node=None) -> FastAPI:
     app = FastAPI(title="AMR Web Bridge")
 
-    # Lấy đường dẫn cài đặt gốc trong install/
     pkg_share_dir = get_package_share_directory('amr_web')
     web_dir = os.path.join(pkg_share_dir, 'resources', 'web')
 
     if node_logger:
         node_logger.info(f"Serving web directory from: {web_dir}")
 
-    # Health Check Endpoint
     @app.get("/health")
     async def health():
         return {"status": "ok", "service": "amr_web", "version": "0.2.0"}
 
-    # ============================================================
-    # Map & Route API Endpoints
-    # ============================================================
-
     @app.get("/api/maps")
     async def get_maps():
-        """Lấy danh sách maps từ ~/project_ws/maps/."""
         if bridge_node:
             maps = bridge_node.get_available_maps()
             return {"status": "ok", "maps": maps}
@@ -48,11 +39,9 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
 
     @app.get("/api/map/image/{map_id}")
     async def get_map_image(map_id: str):
-        """Lấy dữ liệu hình ảnh map từ file YAML + PGM."""
         if not bridge_node:
             return {"status": "error", "message": "Bridge node not available"}
 
-        import os
         import yaml
         import base64
 
@@ -63,14 +52,12 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             return {"status": "error", "message": f"Map {map_id} not found"}
 
         try:
-            # Đọc YAML metadata
             with open(yaml_path, 'r', encoding='utf-8') as f:
                 yaml_data = yaml.safe_load(f)
 
             if not yaml_data:
                 return {"status": "error", "message": "Empty YAML data"}
 
-            # Đọc PGM image
             pgm_filename = yaml_data.get('image', f'{map_id}.pgm')
             pgm_path = os.path.join(maps_dir, pgm_filename)
             if not os.path.exists(pgm_path):
@@ -79,18 +66,14 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             with open(pgm_path, 'rb') as f:
                 pgm_data = f.read()
 
-            # Parse PGM header - simple approach
-            # Find the newline after maxval to know where data starts
             header_end = pgm_data.find(b'\n', pgm_data.find(b'\n', pgm_data.find(b'\n') + 1) + 1) + 1
             img_data = pgm_data[header_end:]
 
-            # Parse width/height from header
             header = pgm_data[:header_end].decode('ascii', errors='ignore')
             parts = header.split()
-            # parts should be like ['P5', '108', '70', '255']
             width = 0
             height = 0
-            for i, p in enumerate(parts):
+            for p in parts:
                 if p.isdigit() and int(p) > 0:
                     if width == 0:
                         width = int(p)
@@ -102,10 +85,6 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                 return {"status": "error", "message": f"Invalid PGM dimensions: {width}x{height}"}
 
             origin = yaml_data.get('origin', [0, 0, 0])
-
-            # Map & Route is an image editor: retain every original PGM gray
-            # value and its top-to-bottom row order.  It must not be converted
-            # to the three-state OccupancyGrid representation used by live SLAM.
             expected_size = width * height
             if len(img_data) < expected_size:
                 return {"status": "error", "message": "PGM pixel data is incomplete"}
@@ -130,7 +109,6 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
 
     @app.get("/api/routes")
     async def get_routes(map_id: str = None):
-        """Lấy danh sách routes từ ~/project_ws/maps/{map_id}/routes/."""
         if bridge_node:
             routes = bridge_node.get_available_routes(map_id)
             return {"status": "ok", "routes": routes}
@@ -138,7 +116,6 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
 
     @app.post("/api/routes")
     async def save_route(payload: dict):
-        """API tiếp nhận dữ liệu POST từ nút Save Route trên Web SCADA."""
         if not bridge_node:
             return {"status": "error", "message": "Bridge node not available"}
 
@@ -155,7 +132,6 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
 
     @app.delete("/api/maps/{map_id}")
     async def delete_map(map_id: str):
-        """API tiếp nhận yêu cầu xóa Map và các Route liên quan."""
         if not bridge_node:
             return {"status": "error", "message": "Bridge node not available"}
 
@@ -163,23 +139,35 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
         if success:
             return {"status": "ok", "message": msg}
         return {"status": "error", "message": msg}
-    
-    # ============================================================
-    # Command Handlers
-    # ============================================================
 
-    async def handle_command(cmd: dict) -> dict:
-        """Xử lý commands từ WebSocket client."""
+    async def handle_command(cmd: dict, websocket: WebSocket) -> dict:
         command = cmd.get('command', '')
         result = {"type": "command_response", "command": command}
 
-        if command == "start_slam":
+        if command == "start_camera":
+            mode = cmd.get('mode', 'rgb')
+            if bridge_node:
+                bridge_node.set_camera_stream(True, mode)
+                result["status"] = "ok"
+                result["mode"] = mode
+            else:
+                result["status"] = "error"
+                result["message"] = "Bridge node not available"
+
+        elif command == "stop_camera":
+            if bridge_node:
+                bridge_node.set_camera_stream(False, 'off')
+                result["status"] = "ok"
+            else:
+                result["status"] = "error"
+                result["message"] = "Bridge node not available"
+
+        elif command == "start_slam":
             if bridge_node:
                 success = bridge_node.start_slam()
                 result["status"] = "started" if success else "failed"
                 result["message"] = "SLAM started" if success else "SLAM already running or failed"
 
-                # Broadcast slam_state to ALL clients
                 await ws_manager.broadcast(json.dumps({
                     "type": "slam_state",
                     "is_slam_active": bridge_node.get_slam_state()
@@ -194,7 +182,6 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                 result["status"] = "stopped"
                 result["message"] = "SLAM stopped"
 
-                # Broadcast slam_state to ALL clients
                 await ws_manager.broadcast(json.dumps({
                     "type": "slam_state",
                     "is_slam_active": False
@@ -242,23 +229,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
 
-        elif command == "get_map":
-            # Push current map data immediately to client
-            if state_bridge:
-                latest_map = state_bridge.get_latest_map()
-                if latest_map:
-                    await websocket.send_text(json.dumps(latest_map))
-                    result["status"] = "found"
-                    result["message"] = "Map sent"
-                else:
-                    result["status"] = "not_found"
-                    result["message"] = "No map available"
-            else:
-                result["status"] = "error"
-                result["message"] = "State bridge not available"
-
-        elif command == "request_map":
-            # Alias for get_map - push current map data immediately to client
+        elif command in ["get_map", "request_map"]:
             if state_bridge:
                 latest_map = state_bridge.get_latest_map()
                 if latest_map:
@@ -278,9 +249,6 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
 
         return result
 
-    # ============================================================
-    # WebSocket Endpoint
-    # ============================================================
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         await websocket.accept()
@@ -294,11 +262,9 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             for key, data in state.items():
                 await websocket.send_text(json.dumps(data))
 
-            # Gửi system_status ngay khi client kết nối
             system_status = state_bridge.get_system_overview_state()
             await websocket.send_text(json.dumps(system_status))
 
-            # Gửi slam_state hiện tại cho client mới
             if bridge_node:
                 await websocket.send_text(json.dumps({
                     "type": "slam_state",
@@ -308,19 +274,16 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             while True:
                 try:
                     data = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
-
-                    # Xử lý command từ client
                     try:
                         cmd = json.loads(data)
                         if 'command' in cmd:
-                            response = await handle_command(cmd)
+                            response = await handle_command(cmd, websocket)
                             await websocket.send_text(json.dumps(response))
                             continue
                     except json.JSONDecodeError:
                         pass
 
                 except asyncio.TimeoutError:
-                    # Gửi system_status thay vì robot_status
                     system_status = state_bridge.get_system_overview_state()
                     await websocket.send_text(json.dumps(system_status))
 
@@ -331,7 +294,6 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             if node_logger:
                 node_logger.info('Client disconnected')
 
-    # MOUNT STATIC FILES VỚI DẤU HOẶC AN TOÀN DÀNH CHO FIREFOX
     if os.path.exists(web_dir):
         app.mount("/", StaticFiles(directory=web_dir, html=True), name="static")
 

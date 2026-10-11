@@ -16,11 +16,9 @@ def system_status_to_json(
     Tạo JSON payload cho trạng thái hệ thống và thiết bị.
     Bao gồm: system_status, devices heartbeat, telemetry cơ bản.
     """
-    # Đếm số thiết bị connected
     connected_count = sum(1 for d in devices.values() if d.get('connected', False))
     total_devices = len(devices)
 
-    # Xác định system_status
     if connected_count == 0:
         system_status = "Offline"
     elif connected_count < total_devices:
@@ -41,7 +39,6 @@ def system_status_to_json(
         }
     }
 
-    # Thêm battery telemetry nếu có
     if battery_data:
         result["battery"] = battery_data
 
@@ -140,26 +137,69 @@ def map_to_json(msg: OccupancyGrid) -> dict:
     }
 
 
-def image_to_json(msg: Image, max_width: int = 640, quality: int = 75) -> dict:
-    """Convert ROS Image message to JPEG base64 for web display."""
+def image_to_json(msg: Image, max_width: int = 480, quality: int = 60) -> dict:
+    """Convert ROS Image message (RGB/BGR/Mono/Depth) to JPEG base64."""
     try:
         import cv2
         import numpy as np
 
-        if msg.encoding == 'rgb8':
-            np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-            np_image = np_image[:, :, ::-1]
-        elif msg.encoding == 'bgr8':
-            np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-        elif msg.encoding == 'mono8':
-            np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
-        elif msg.encoding == 'rgba8':
-            np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 4)
-            np_image = np_image[:, :, :3]
-            np_image = np_image[:, :, ::-1]
-        else:
-            np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        encoding = msg.encoding.lower() if hasattr(msg, 'encoding') else 'rgb8'
+        np_image = None
 
+        # 1. Xử lý ảnh Depth 16UC1 / MONO16 (16-bit uint - mm)
+        if '16u' in encoding or 'mono16' in encoding:
+            depth_data = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+            depth_clipped = np.clip(depth_data, 0, 5000)  # Giới hạn 0 - 5000mm (5m)
+            depth_normalized = cv2.normalize(depth_clipped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            np_image = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+
+        # 2. Xử lý ảnh Depth 32FC1 (32-bit float - m)
+        elif '32f' in encoding:
+            depth_data = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+            depth_data = np.nan_to_num(depth_data, nan=0.0)
+            depth_clipped = np.clip(depth_data, 0.0, 5.0)  # Giới hạn 0 - 5.0m
+            depth_normalized = (depth_clipped / 5.0 * 255.0).astype(np.uint8)
+            np_image = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+
+        # 3. Các định dạng RGB/BGR/Mono8 thông thường
+        elif 'rgb' in encoding:
+            np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+            np_image = np_image[:, :, ::-1]  # RGB sang BGR
+        elif 'bgr' in encoding:
+            np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        elif 'mono8' in encoding or '8uc1' in encoding:
+            np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
+        elif 'rgba' in encoding:
+            np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 4)
+            np_image = np_image[:, :, :3][:, :, ::-1]
+        else:
+            # Dự phòng tự động suy luận kiểu dữ liệu theo kích thước buffer
+            total_elements = len(msg.data)
+            num_pixels = msg.height * msg.width
+            bytes_per_pixel = total_elements // num_pixels
+
+            if bytes_per_pixel == 2:  # Ảnh 16-bit Depth
+                depth_data = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+                depth_clipped = np.clip(depth_data, 0, 5000)
+                depth_normalized = cv2.normalize(depth_clipped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                np_image = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+            elif bytes_per_pixel == 4:  # Ảnh 32-bit Float Depth
+                depth_data = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+                depth_data = np.nan_to_num(depth_data, nan=0.0)
+                depth_clipped = np.clip(depth_data, 0.0, 5.0)
+                depth_normalized = (depth_clipped / 5.0 * 255.0).astype(np.uint8)
+                np_image = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+            else:
+                channels = max(1, bytes_per_pixel)
+                if channels == 1:
+                    np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
+                else:
+                    np_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, channels)[:, :, :3]
+
+        if np_image is None:
+            return None
+
+        # Resize ảnh để tối ưu băng thông truyền qua WebSocket
         if max_width > 0 and np_image.shape[1] > max_width:
             scale = max_width / np_image.shape[1]
             new_height = int(np_image.shape[0] * scale)

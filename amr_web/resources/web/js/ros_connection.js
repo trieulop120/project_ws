@@ -9,7 +9,9 @@ let reconnectDelay = 1000;
 const maxReconnectDelay = 30000;
 
 function setWsConnected(c) {
-    isWsConnected = c;
+    if (typeof isWsConnected !== 'undefined') {
+        isWsConnected = c;
+    }
     const badge = document.getElementById('devWebsocket');
     const dot = document.querySelector('#devWebsocket')?.parentElement?.querySelector('.status-dot');
     if (badge) {
@@ -108,6 +110,12 @@ function connect() {
                         break;
 
                     case 'camera':
+                        // ĐÃ BỔ SUNG: Truyền dữ liệu frame ảnh sang cho navigation.js xử lý vẽ
+                        if (typeof updateCameraFeed === 'function') {
+                            updateCameraFeed(d);
+                        } else if (window.updateCameraFeed) {
+                            window.updateCameraFeed(d);
+                        }
                         break;
 
                     case 'robot_status':
@@ -181,4 +189,11 @@ function sendCommand(cmd) {
         console.error('Failed to send command:', e);
         return false;
     }
+}
+
+// Tự động kết nối WebSocket khi file JS này được nạp
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', connect);
+} else {
+    connect();
 }

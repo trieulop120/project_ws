@@ -2,17 +2,15 @@
 (function() {
     'use strict';
 
-    // ========================================
     // Navigation State & Data Mapping
-    // ========================================
     window.isNavigationActive = false;
     window.selectedNavMap = null;
     window.selectedNavRoute = null;
     window.showRouteOverlay = true;
 
     let availableMaps = [];
-    let mapToRouteMap = {}; // Key: map_id -> { id, rawData }
-    let routeToMapMap = {}; // Key: route_id -> map_id
+    let mapToRouteMap = {};
+    let routeToMapMap = {};
     let isBindingInProgress = false;
 
     // DOM Elements
@@ -26,7 +24,6 @@
     const navRouteSelect = document.getElementById('navRouteSelect');
     const btnToggleRouteVisibility = document.getElementById('btnToggleRouteVisibility');
 
-    // Helper: Trích xuất ID từ Map Item (dù là Object hay String)
     function extractMapId(mapItem) {
         if (!mapItem) return '';
         if (typeof mapItem === 'object') {
@@ -35,7 +32,6 @@
         return String(mapItem);
     }
 
-    // Helper: Trích xuất Route ID từ Route Item
     function extractRouteId(routeItem, defaultMapId) {
         if (!routeItem) return '';
         if (typeof routeItem === 'object') {
@@ -44,21 +40,13 @@
         return String(routeItem);
     }
 
-    // ========================================
-    // Modal Functions (Load Maps & Routes chuẩn map_route.js)
-    // ========================================
-
     async function showNavSetupModal() {
-        console.log('[Navigation] Showing setup modal...');
-
-        // 1. Reset Selections & UI
         window.selectedNavMap = null;
         window.selectedNavRoute = null;
         if (navMapSelect) navMapSelect.innerHTML = '<option value="">-- Select a map --</option>';
         if (navRouteSelect) navRouteSelect.innerHTML = '<option value="">-- Select a route --</option>';
         if (navModalConfirm) navModalConfirm.disabled = true;
 
-        // Reset hoặc tạo khung thông báo trạng thái
         let statusMsg = document.getElementById('navModalStatusMsg');
         if (!statusMsg && navSetupModal) {
             statusMsg = document.createElement('div');
@@ -73,14 +61,12 @@
         routeToMapMap = {};
 
         try {
-            // 2. Fetch danh sách Maps từ /api/maps (Giống map_route.js)
             const mapRes = await fetch('/api/maps');
             const mapData = await mapRes.json();
 
             if (mapData.status === 'ok' && Array.isArray(mapData.maps)) {
                 availableMaps = mapData.maps;
 
-                // Fill Map vào Dropdown
                 availableMaps.forEach(mapItem => {
                     const mapId = extractMapId(mapItem);
                     if (mapId && mapId !== '[object Object]') {
@@ -91,7 +77,6 @@
                     }
                 });
 
-                // 3. Fetch Route theo từng map_id (Cấu trúc API giống hệt map_route.js)
                 for (const mapItem of availableMaps) {
                     const mapId = extractMapId(mapItem);
                     if (!mapId) continue;
@@ -121,7 +106,6 @@
             console.error('[Navigation] Failed to load maps or routes:', err);
         }
 
-        // Show Modal
         if (navSetupModal) {
             navSetupModal.classList.add('active');
         }
@@ -132,10 +116,6 @@
             navSetupModal.classList.remove('active');
         }
     }
-
-    // ========================================
-    // Two-Way Binding Handlers
-    // ========================================
 
     function onMapSelectChange(e) {
         if (isBindingInProgress) return;
@@ -156,7 +136,6 @@
 
         window.selectedNavMap = selectedMapId;
 
-        // Nếu Map CÓ Route -> Auto Select Route
         if (mapToRouteMap[selectedMapId]) {
             const routeInfo = mapToRouteMap[selectedMapId];
             if (navRouteSelect) navRouteSelect.value = routeInfo.id;
@@ -171,7 +150,6 @@
             }
             if (navModalConfirm) navModalConfirm.disabled = false;
         } else {
-            // Nếu Map KHÔNG CÓ Route -> Báo lỗi & Khóa Confirm
             if (navRouteSelect) navRouteSelect.value = '';
             window.selectedNavRoute = null;
 
@@ -226,16 +204,9 @@
     }
 
     function onConfirmClick() {
-        console.log('[Navigation] Selected Map:', window.selectedNavMap);
-        console.log('[Navigation] Selected Route:', window.selectedNavRoute);
-
         hideNavSetupModal();
         startNavigation();
     }
-
-    // ========================================
-    // Route Visibility Toggle Feature
-    // ========================================
 
     function toggleRouteVisibility() {
         window.showRouteOverlay = !window.showRouteOverlay;
@@ -261,13 +232,7 @@
 
     window.toggleRouteVisibility = toggleRouteVisibility;
 
-    // ========================================
-    // Navigation Control Functions
-    // ========================================
-
     function startNavigation() {
-        console.log('[Navigation] Starting navigation mode...');
-
         window.isNavigationActive = true;
         showNavActiveUI();
         updateNavUI();
@@ -292,12 +257,9 @@
         if (typeof window.renderMap === 'function') {
             window.renderMap();
         }
-
-        console.log('[Navigation] Navigation mode started successfully');
     }
 
     function stopNavigation() {
-        console.log('[Navigation] Stopping navigation mode...');
         setCameraMode('off');
         window.isNavigationActive = false;
         window.selectedNavMap = null;
@@ -317,13 +279,7 @@
         if (typeof window.renderMap === 'function') {
             window.renderMap();
         }
-
-        console.log('[Navigation] Navigation mode stopped');
     }
-
-    // ========================================
-    // UI Helpers
-    // ========================================
 
     function showNavActiveUI() {
         const navWelcome = document.getElementById('navWelcome');
@@ -358,10 +314,6 @@
         }
     }
 
-    // ========================================
-    // Event Listeners
-    // ========================================
-
     function initEventListeners() {
         btnStartNav?.addEventListener('click', showNavSetupModal);
         btnStopNav?.addEventListener('click', stopNavigation);
@@ -384,20 +336,13 @@
                 hideNavSetupModal();
             }
         });
-
-        console.log('[Navigation] Event listeners initialized');
     }
 
     function initNavPage() {
-        console.log('[Navigation] Module Initializing...');
         initEventListeners();
-        console.log('[Navigation] Module Initialized!');
     }
 
-    window.onNavigateToNav = function() {
-        console.log('[Navigation] Navigated to Navigation page');
-    };
-
+    window.onNavigateToNav = function() {};
     window.showNavSetupModal = showNavSetupModal;
 
     if (document.readyState === 'loading') {
@@ -412,7 +357,7 @@
         if (!body || !empty) return;
 
         if (!list || !list.length) {
-            body.innerHTML = '';                 // không để dòng nào trong bảng
+            body.innerHTML = '';
             empty.classList.remove('hidden');
             return;
         }
@@ -427,8 +372,8 @@
 
     window.renderRecentMissions = renderRecentMissions;
 
-    // Quản lý chế độ Camera Navigation
-    let currentCamMode = 'off'; // 'rgb' | 'depth' | 'off'  (mặc định OFF)
+    // Demand-Driven Camera Control Logic
+    let currentCamMode = 'off'; // 'rgb' | 'depth' | 'off'
 
     const btnCamRgb = document.getElementById('btnCamRgb');
     const btnCamDepth = document.getElementById('btnCamDepth');
@@ -438,34 +383,67 @@
     function setCameraMode(mode) {
         currentCamMode = mode;
 
-        // Cập nhật giao diện 3 nút
         btnCamRgb?.classList.toggle('active', mode === 'rgb');
         btnCamDepth?.classList.toggle('active', mode === 'depth');
         btnNavToggleCam?.classList.toggle('active', mode === 'off');
 
         if (!navCameraFeed) return;
 
-        // OFF: xóa thẻ <img> để ngắt luôn kết nối stream
         if (mode === 'off') {
-            navCameraFeed.innerHTML = '<span class="muted" style="font-size: 0.75rem;" id="camStatusText">Camera Offline</span>';
-            return;
+            if (typeof sendCommand === 'function') {
+                sendCommand({ command: 'stop_camera' });
+            }
+            navCameraFeed.innerHTML = '<span class="muted" style="font-size: 0.75rem;">Camera Offline</span>';
+        } else {
+            if (typeof sendCommand === 'function') {
+                sendCommand({ command: 'start_camera', mode: mode });
+            }
+            navCameraFeed.innerHTML = `<span class="muted" style="font-size: 0.75rem;">Connecting to ${mode.toUpperCase()}...</span>`;
         }
-
-        // Đổi topic ROS tương ứng
-        const topicName = (mode === 'rgb')
-            ? '/camera/color/image_raw/compressed'
-            : '/camera/depth/image_raw/compressed';
-
-        // Stream từ Web Video Server
-        navCameraFeed.innerHTML =
-            `<img src="http://${window.location.hostname}:8080/stream?topic=${topicName}" style="width: 100%; height: 100%; object-fit: cover;" />`;
     }
 
     btnCamRgb?.addEventListener('click', () => setCameraMode('rgb'));
     btnCamDepth?.addEventListener('click', () => setCameraMode('depth'));
     btnNavToggleCam?.addEventListener('click', () => setCameraMode('off'));
 
-    // Đồng bộ UI với trạng thái mặc định ngay khi load trang
-    setCameraMode(currentCamMode);
+    function updateCameraFeed(data) {
+        if (currentCamMode === 'off' || !data || !data.data || data.cam_mode !== currentCamMode) return;
+
+        const navCameraFeed = document.getElementById('navCameraFeed');
+        if (!navCameraFeed) return;
+
+        let img = navCameraFeed.querySelector('img');
+        if (!img) {
+            navCameraFeed.innerHTML = '';
+            img = document.createElement('img');
+            img.style.cssText = 'width: 100%; height: 100%; object-fit: cover;';
+            navCameraFeed.appendChild(img);
+        }
+        img.src = 'data:image/jpeg;base64,' + data.data;
+    }
+
+    window.updateCameraFeed = updateCameraFeed;
+    window.setCameraMode = setCameraMode;
+
+    function updateNavPosition() {
+        if (typeof robotPose === 'undefined' || !robotPose) return;
+
+        const posX   = document.getElementById('navPosX');
+        const posY   = document.getElementById('navPosY');
+        const posYaw = document.getElementById('navPosYaw');
+
+        if (posX)   { posX.textContent   = robotPose.position.x.toFixed(2); posX.classList.remove('muted'); }
+        if (posY)   { posY.textContent   = robotPose.position.y.toFixed(2); posY.classList.remove('muted'); }
+        if (posYaw) {
+            posYaw.textContent = (robotPose.orientation.yaw * 180 / Math.PI).toFixed(1);
+            posYaw.classList.remove('muted');
+        }
+    }
+
+    function navUpdateLoop() {
+        if (window.isNavigationActive) updateNavPosition();
+        requestAnimationFrame(navUpdateLoop);
+    }
+    navUpdateLoop();
 
 })();
