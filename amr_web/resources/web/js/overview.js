@@ -178,56 +178,44 @@ function updateSystemStatus(status) {
 function updateLiftStatus(liftData) {
     if (!liftData) return;
 
-    const heightEl = document.getElementById('cardLiftHeight');
-    const stateEl = document.getElementById('cardLiftState');
-    const slamHeightEl = document.getElementById('slamLiftHeight');
-    const slamStateEl = document.getElementById('slamLiftState');
+    // Các Element hiển thị Lift Height
+    const heightEls = [
+        document.getElementById('cardLiftHeight'),
+        document.getElementById('slamLiftHeight'),
+        document.getElementById('navLiftHeight') // Trang Navigation mới
+    ];
 
-    // Cập nhật height cho Overview card
-    if (heightEl) {
+    // Các Element hiển thị Lift State Badge
+    const stateEls = [
+        document.getElementById('cardLiftState'),
+        document.getElementById('slamLiftState'),
+        document.getElementById('navLiftState') // Trang Navigation mới
+    ];
+
+    // Cập nhật giá trị Height
+    heightEls.forEach(el => {
+        if (!el) return;
         if (liftData.height !== null && liftData.height !== undefined) {
-            heightEl.textContent = liftData.height;
-            heightEl.classList.remove('muted');
+            el.textContent = liftData.height;
+            el.classList.remove('muted');
         } else {
-            heightEl.textContent = '--';
-            heightEl.classList.add('muted');
+            el.textContent = '--';
+            el.classList.add('muted');
         }
-    }
+    });
 
-    // Cập nhật state cho Overview card
-    if (stateEl) {
+    // Cập nhật giá trị State
+    stateEls.forEach(el => {
+        if (!el) return;
         const state = liftData.state;
         if (state) {
-            stateEl.textContent = state;
-            stateEl.className = 'lift-state ' + state.toLowerCase();
-            stateEl.style.display = '';
+            el.textContent = state;
+            el.className = 'lift-state ' + state.toLowerCase();
+            el.style.display = '';
         } else {
-            stateEl.style.display = 'none';
+            el.style.display = 'none';
         }
-    }
-
-    // Cập nhật height cho SLAM card
-    if (slamHeightEl) {
-        if (liftData.height !== null && liftData.height !== undefined) {
-            slamHeightEl.textContent = liftData.height;
-            slamHeightEl.classList.remove('muted');
-        } else {
-            slamHeightEl.textContent = '--';
-            slamHeightEl.classList.add('muted');
-        }
-    }
-
-    // Cập nhật state cho SLAM card
-    if (slamStateEl) {
-        const state = liftData.state;
-        if (state) {
-            slamStateEl.textContent = state;
-            slamStateEl.className = 'lift-state ' + state.toLowerCase();
-            slamStateEl.style.display = '';
-        } else {
-            slamStateEl.style.display = 'none';
-        }
-    }
+    });
 }
 
 function addAlarm(type, title) {

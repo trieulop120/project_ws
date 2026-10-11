@@ -1851,3 +1851,327 @@
         transform: translateY(10px) scale(0.9);
     }
 }
+
+/* ========================================
+   ACTIVE NAVIGATION PAGE (LAYOUT V5)
+   ======================================== */
+
+/* Fix triệt để trùng lặp Padding với thẻ .page */
+.nav-layout-wrapper {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  padding: 0; /* Đổi từ 12px thành 0 để không lặp padding với .page */
+  box-sizing: border-box;
+}
+
+/* Tỷ lệ cột chuẩn hóa 3 Cột: Cột trái (280px), Cột giữa (Flex), Cột phải (280px) đồng bộ với SLAM/Overview */
+.nav-main-grid {
+  display: grid;
+  grid-template-columns: 280px 1fr 280px; 
+  gap: 12px; /* Đồng bộ khoảng cách 12px */
+  flex: 1;
+  min-height: 0;
+}
+
+.nav-left-col, .nav-right-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px; /* Khoảng cách giữa các Card theo chiều dọc */
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.nav-center-col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* --- 2. Cột Trái: Safety, Mode, Telemetry --- */
+.btn-estop {
+  background: #DC2626;
+  color: white;
+  width: 100%;
+  padding: 14px 10px;
+  font-size: 1rem;
+  font-weight: 800;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 4px 0 #991B1B, 0 0 15px rgba(220, 38, 38, 0.4);
+  transition: transform 0.1s, box-shadow 0.1s;
+}
+.btn-estop:active {
+  transform: translateY(4px);
+  box-shadow: 0 0 0 #991B1B;
+}
+
+.mode-toggle {
+  display: flex;
+  background: var(--bg-primary);
+  border-radius: 6px;
+  padding: 4px;
+  border: 1px solid var(--border);
+}
+.btn-mode {
+  flex: 1;
+  padding: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-weight: 700;
+  font-size: 0.75rem;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-mode.active {
+  background: var(--accent);
+  color: #000;
+}
+
+.cargo-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 8px;
+  border-radius:4px;
+  font-weight: 700;
+  font-size: 0.65rem;
+  transition: all 0.3s ease;
+}
+.cargo-status.empty {
+  background: var(--bg-primary);
+  color: var(--text-muted);
+  border: 1px dashed var(--border);
+}
+.cargo-status.loaded {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10B981;
+  border: 1px solid #10B981;
+}
+
+/* --- 3. Cột Giữa: Bản đồ & Tools --- */
+#navMapCanvas {
+  width: 100%;
+  height: 100%;
+  cursor: crosshair; /* Thay đổi con trỏ để báo hiệu người dùng có thể click (Set pose/goal) */
+}
+
+/* Tools nằm ngang trên Header Bản đồ */
+#navMapTools {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+#navMapTools .map-btn {
+  position: relative;
+}
+
+/* Hiệu ứng Tooltip (chữ đen mờ) khi trỏ chuột vào các Tool */
+#navMapTools .map-btn::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  top: 130%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.9);
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  border: 1px solid var(--border);
+  transition: all 0.2s ease;
+  z-index: 20;
+}
+#navMapTools .map-btn:hover::after {
+  opacity: 1;
+  top: 110%; /* Nảy lên một chút khi hover */
+}
+#navMapTools .map-btn.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* --- 4. Cột Phải: Camera, Missions & AI --- */
+.camera-viewport-small {
+  width: 100%;
+  /* Bỏ height cố định, dùng tỷ lệ 16:9 chuẩn video để tự động co giãn theo chiều ngang */
+  aspect-ratio: 16 / 9; 
+  background: #000;
+  /* Chỉ bo tròn 2 góc bên dưới để khớp với đáy Card, 2 góc trên vuông vức để sát Header */
+  border-radius: 0 0 6px 6px; 
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.actions-grid-2col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.btn-action {
+  padding: 8px 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-action:hover {
+  border-color: var(--accent);
+  background: rgba(85, 221, 187, 0.05);
+}
+
+/* Làm mờ các nút khi Navigation đang chạy / Đang Auto */
+#navQuickMissions.disabled .btn-action {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.ai-chat-box {
+  flex: 1;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  overflow-y: auto;
+  font-size: 0.75rem;
+  min-height: 80px;
+}
+
+/* Nút Accent dạng viền (Outline) */
+.btn-outline-accent {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  transition: all 0.2s ease;
+}
+
+.btn-outline-accent:hover {
+  background: rgba(85, 221, 187, 0.1); /* Phủ một lớp màu xanh mờ khi trỏ chuột */
+}
+
+/* Badge Navigation Active - Đồng bộ 100% với SLAM */
+.nav-status-badge {
+  font-size: 0.7rem;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 4px;
+    background: var(--bg-panel-secondary);
+    color: var(--text-secondary);
+}
+
+/* ========================================
+   Camera RGB / DEPTH Mode Switcher
+   ======================================== */
+.cam-mode-selector {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-primary);
+  padding: 2px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.btn-cam-mode {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.6rem;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-cam-mode:hover {
+  color: var(--text-primary);
+}
+
+.btn-cam-mode.active {
+  background: var(--accent);
+  color: #000;
+}
+
+.btn-cam-mode.off.active {
+  background: var(--error);
+  color: #fff;
+}
+
+/* --- Cột trái: các card giữ đúng chiều cao nội dung --- */
+.nav-left-col > .panel-card {
+  flex-shrink: 0;
+}
+
+/* --- Recent Missions: co giãn lấp phần trống cột trái --- */
+.nav-left-col > .card-recent-missions {
+  flex: 1 1 0;          /* chiếm phần còn lại, không làm cột dài ra */
+  min-height: 110px;
+  display: flex;
+  flex-direction: column;
+}
+
+.mission-table-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;     /* nhiều mission thì cuộn, header vẫn sticky */
+  overflow-x: hidden;
+}
+
+/* Scrollbar tối, mảnh (Chrome / Edge / Safari) */
+.mission-table-wrap::-webkit-scrollbar {
+  width: 6px;
+}
+.mission-table-wrap::-webkit-scrollbar-track {
+  background: transparent;
+}
+.mission-table-wrap::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+.mission-table-wrap::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+.mission-table {
+  table-layout: fixed;  /* tên dài bị cắt bằng dấu … */
+  flex-shrink: 0;
+}
+
+.mission-table .mission-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Trạng thái rỗng: căn giữa ngang + dọc trong phần còn lại của card */
+.mission-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  font-size: 0.65rem;
+  color: var(--text-muted);
+}
+.mission-empty.hidden {
+  display: none;
+}

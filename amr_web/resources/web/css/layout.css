@@ -361,8 +361,10 @@ html, body {
 
     /* 3. SLAM PAGE MOBILE: Cuộn đến đâu dừng đến đó, không bị trồi lên lại */
     .slam-layout {
-        display: flex !important;
-        flex-direction: column !important;
+        /* KHÔNG đặt display: slam.js bật/tắt bằng style.display ('grid' / 'none') */
+        grid-template-columns: 1fr !important;   /* 1 cột thay vì 1fr 320px */
+        grid-template-rows: auto !important;
+        flex: none !important;
         height: auto !important;
         min-height: auto !important;
         overflow: visible !important;
@@ -423,5 +425,69 @@ html, body {
 
     .btn {
         padding: 10px 14px !important;
+    }
+
+    /* 6. NAVIGATION PAGE MOBILE: xếp thành 1 cột, cuộn theo trang */
+    .nav-layout-wrapper {
+        height: auto !important;
+        min-height: 0 !important;
+        overflow: visible !important;
+    }
+
+    .nav-main-grid {
+        display: flex !important;
+        flex-direction: column !important;
+        height: auto !important;
+        overflow: visible !important;
+        gap: 12px !important;
+    }
+
+    .nav-left-col,
+    .nav-right-col {
+        width: 100% !important;
+        min-width: 0 !important;
+        height: auto !important;
+        overflow: visible !important;
+        flex: none !important;
+    }
+
+    /* Mọi card giữ đúng chiều cao nội dung */
+    .nav-left-col > .panel-card,
+    .nav-right-col > .panel-card {
+        flex: none !important;
+        width: 100% !important;
+        min-width: 0 !important;
+    }
+
+    /* Bản đồ: cao cố định, đã có class slam-viewport-wrap nên chỉ cần ép chiều rộng */
+    .nav-center-col {
+        width: 100% !important;
+        min-width: 0 !important;
+        height: 360px !important;
+        min-height: 360px !important;
+        flex: none !important;
+    }
+
+    #navMapCanvas {
+        width: 100% !important;
+        height: 100% !important;
+    }
+
+    /* Recent Missions: không còn flex-grow, đặt chiều cao cố định và cuộn bên trong */
+    .nav-left-col > .card-recent-missions {
+        height: 200px !important;
+        min-height: 200px !important;
+    }
+
+    /* AI Assistant (đang có inline flex:1): đặt chiều cao cố định */
+    .nav-right-col > .panel-card:last-child {
+        height: 280px !important;
+        min-height: 280px !important;
+    }
+
+    /* Thanh công cụ trên header bản đồ không tràn ngang */
+    .slam-viewport-header {
+        flex-wrap: wrap;
+        gap: 6px;
     }
 }

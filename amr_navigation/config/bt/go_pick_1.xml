@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<!--
+  Mission: Go Pick 1
+  Uses ComputePathToPose and FollowPath directly to Pick 1 goal pose
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="go_pick_1">
+      <ComputePathToPose goal="{goal}" path="{path}"/>
+      <FollowPath path="{path}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

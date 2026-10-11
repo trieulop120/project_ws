@@ -8,7 +8,6 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     
-    <!-- ĐƯỜNG DẪN CSS CHUẨN MỚI -->
     <link rel="icon" href="data:,">
     <link rel="stylesheet" href="/css/variables.css?v=1.0.11">
     <link rel="stylesheet" href="/css/layout.css?v=1.0.11">
@@ -70,7 +69,6 @@
     <!-- Main Content -->
     <div class="main">
         <div class="header">
-            <!-- Nút Toggle Hamburger cho Mobile -->
             <button id="sidebarToggle" class="btn-sidebar-toggle" aria-label="Toggle Menu">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <line x1="3" y1="12" x2="21" y2="12"></line>
@@ -328,7 +326,6 @@
 
         <!-- SLAM Page -->
         <div class="page" id="page-slam">
-            <!-- Welcome Card - Initial State -->
             <div class="slam-welcome-card" id="slamWelcome">
                 <svg class="slam-welcome-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                     <polygon points="12 2 2 7 12 12 22 7 12 2"/>
@@ -348,7 +345,6 @@
 
             <!-- Active SLAM Layout -->
             <div class="slam-layout" id="slamLayout">
-                <!-- Left: Main Viewport -->
                 <div class="slam-viewport-wrap">
                     <div class="slam-viewport-header">
                         <span class="slam-status-badge">SLAM Active</span>
@@ -388,10 +384,7 @@
                     </div>
                 </div>
 
-                <!-- Right: Control Panel (Single unified panel) -->
                 <aside class="slam-sidebar-panel">
-
-                    <!-- CARD 1: MAP MANAGEMENT -->
                     <div class="panel-card">
                         <div class="panel-card-header">
                             <span class="card-title">Map Management</span>
@@ -402,25 +395,17 @@
                                 <input type="text" class="form-control" id="slamMapName" placeholder="map_01">
                             </div>
                             <div class="btn-group row gap-2">
-                                <button class="btn btn-outline-danger flex-1" id="btnStopSlam">
-                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><rect x="6" y="6" width="12" height="12"/></svg>
-                                    Stop SLAM
-                                </button>
-                                <button class="btn btn-accent flex-1" id="btnSaveMap">
-                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-                                    Save Map
-                                </button>
+                                <button class="btn btn-outline-danger flex-1" id="btnStopSlam">Stop SLAM</button>
+                                <button class="btn btn-accent flex-1" id="btnSaveMap">Save Map</button>
                             </div>
                         </div>
                     </div>
 
-                    <!-- CARD 2: ACTUATION & MOTION CONTROL -->
                     <div class="panel-card">
                         <div class="panel-card-header">
                             <span class="card-title">Actuation & Motion</span>
                         </div>
                         <div class="panel-card-body">
-                            <!-- SPEED INPUTS - 2 HÀNG RIÊNG BIỆT -->
                             <div class="speed-row mb-2">
                                 <label class="field-label">Linear:</label>
                                 <input type="number" class="speed-input" id="slamLinearSpeed" value="0.25" step="0.05" min="0">
@@ -432,25 +417,21 @@
                                 <span class="unit-text">rad/s</span>
                             </div>
 
-                            <!-- KEYBOARD TELEOP 3X3 -->
                             <div class="teleop-section mb-2">
                                 <span class="sub-label">KEYBOARD TELEOP</span>
                                 <div class="teleop-grid-3x3" id="teleopGrid">
                                     <button class="teleop-btn" data-key="u"><span class="arrow">↖</span></button>
                                     <button class="teleop-btn" data-key="i"><span class="arrow">↑</span></button>
                                     <button class="teleop-btn" data-key="o"><span class="arrow">↗</span></button>
-
                                     <button class="teleop-btn" data-key="j"><span class="arrow">↺</span></button>
                                     <button class="teleop-btn btn-stop" data-key="k"><span class="arrow">■</span></button>
                                     <button class="teleop-btn" data-key="l"><span class="arrow">↻</span></button>
-
                                     <button class="teleop-btn" data-key="m"><span class="arrow">↙</span></button>
                                     <button class="teleop-btn" data-key=","><span class="arrow">↓</span></button>
                                     <button class="teleop-btn" data-key="."><span class="arrow">↘</span></button>
                                 </div>
                             </div>
 
-                            <!-- LIFT CONTROL GỌN GÀNG -->
                             <div class="lift-section">
                                 <span class="sub-label">LIFT CONTROL</span>
                                 <button class="btn btn-secondary" id="btnSetHome">Set Home</button>
@@ -464,7 +445,6 @@
                         </div>
                     </div>
 
-                    <!-- CARD 3: POSITION & LIFT TELEMETRY -->
                     <div class="panel-card">
                         <div class="panel-card-header">
                             <span class="card-title">Position & Lift</span>
@@ -474,24 +454,15 @@
                                 <div class="pos-row">
                                     <div class="pos-item">
                                         <div class="pos-label">X</div>
-                                        <div class="pos-val-group">
-                                            <span class="pos-val muted" id="slamPosX">--</span>
-                                            <span class="pos-unit">m</span>
-                                        </div>
+                                        <div class="pos-val-group"><span class="pos-val muted" id="slamPosX">--</span><span class="pos-unit">m</span></div>
                                     </div>
                                     <div class="pos-item">
                                         <div class="pos-label">Y</div>
-                                        <div class="pos-val-group">
-                                            <span class="pos-val muted" id="slamPosY">--</span>
-                                            <span class="pos-unit">m</span>
-                                        </div>
+                                        <div class="pos-val-group"><span class="pos-val muted" id="slamPosY">--</span><span class="pos-unit">m</span></div>
                                     </div>
                                     <div class="pos-item">
                                         <div class="pos-label">YAW</div>
-                                        <div class="pos-val-group">
-                                            <span class="pos-val muted" id="slamPosYaw">--</span>
-                                            <span class="pos-unit">°</span>
-                                        </div>
+                                        <div class="pos-val-group"><span class="pos-val muted" id="slamPosYaw">--</span><span class="pos-unit">°</span></div>
                                     </div>
                                 </div>
                                 <div class="lift-row">
@@ -505,11 +476,13 @@
                             </div>
                         </div>
                     </div>
-
                 </aside>
             </div>
         </div>
+
+        <!-- NEW NAVIGATION PAGE (LAYOUT V5) -->
         <div class="page" id="page-navigation">
+            
             <!-- Welcome Card - Initial State -->
             <div class="slam-welcome-card" id="navWelcome">
                 <svg class="slam-welcome-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -522,30 +495,202 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <polygon points="5 3 19 12 5 21 5 3"/>
                     </svg>
-                    START NAVIGATION MODE
+                    START NAVIGATION
                 </button>
             </div>
 
-            <!-- Active Navigation Layout (Empty for now) -->
-            <div class="nav-layout" id="navLayout" style="display: none;">
-                <div class="nav-viewport-wrap">
-                    <div class="nav-viewport-header">
-                        <span class="nav-status-badge">Navigation Inactive</span>
+            <!-- Active Navigation Layout -->
+            <div class="nav-layout-wrapper" id="navLayout" style="display: none;">
+                
+                <div class="nav-main-grid">
+                  
+                  <!-- LEFT COLUMN: Safety, Status, Telemetry, Recent Missions -->
+                  <div class="nav-left-col">
+                    
+                    <!-- CARD 1: SAFETY & MODE -->
+                    <div class="panel-card panel-danger">
+                      <div class="panel-card-header">
+                        <span class="card-title">Safety & Mode</span>
+                      </div>
+                      <div class="panel-card-body">
+                        <button class="btn-estop" id="btnEmergencyStop">EMERGENCY STOP</button>
+                        <div class="mode-toggle mt-2 mb-2">
+                          <button class="btn-mode active" id="btnModeAuto">AUTO</button>
+                          <button class="btn-mode" id="btnModeManual">MANUAL</button>
+                        </div>
+                        <button class="btn btn-outline-danger" id="btnStopNav" style="width: 100%; font-weight: 600; padding: 8px;">
+                        STOP NAV MODE
+                        </button>
+                      </div>
                     </div>
-                    <div class="nav-content-placeholder">
-                        <svg class="placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <circle cx="12" cy="12" r="10"/>
-                            <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/>
-                        </svg>
-                        <div class="placeholder-title">Navigation Controls</div>
-                        <div class="placeholder-desc">Navigation controls coming soon.</div>
+
+                    <!-- CARD 2: MISSION STATUS -->
+                    <div class="panel-card">
+                      <div class="panel-card-header">
+                        <span class="card-title">Mission Status</span>
+                      </div>
+                      <div class="panel-card-body">
+                        <div class="nav-task-info">
+                          <div class="info-row"><span>Action:</span> <strong class="accent" id="navActionText">Idle</strong></div>
+                          <div class="info-row"><span>Target:</span> <strong id="navTargetText">--</strong></div>
+                          <div class="progress-bar-container mt-2">
+                            <div class="progress-fill" style="width: 0%;" id="navProgressBar"></div>
+                          </div>
+                          <div class="info-row mt-1"><span>Progress:</span> <strong id="navProgressText">0%</strong></div>
+                        </div>
+                        <div class="btn-group row gap-2 mt-3">
+                          <button class="btn btn-outline-accent flex-1" id="btnStartMission" style="font-weight: 700;">START</button>
+                          <button class="btn btn-outline-danger flex-1" id="btnCancelMission" style="font-weight: 700;">CANCEL</button>
+                        </div>
+                      </div>
                     </div>
-                </div>
+
+                    <!-- CARD 3: TELEMETRY & CARGO (CẤU TRÚC ĐỒNG BỘ LIFT HEIGHT STYLE) -->
+                    <div class="panel-card">
+                      <div class="panel-card-header">
+                        <span class="card-title">Telemetry & Cargo</span>
+                      </div>
+                      <div class="panel-card-body">
+                        <div class="pos-lift-grid">
+                            <div class="pos-row">
+                                <div class="pos-item">
+                                    <div class="pos-label">X</div>
+                                    <div class="pos-val-group"><span class="pos-val muted" id="navPosX">--</span><span class="pos-unit">m</span></div>
+                                </div>
+                                <div class="pos-item">
+                                    <div class="pos-label">Y</div>
+                                    <div class="pos-val-group"><span class="pos-val muted" id="navPosY">--</span><span class="pos-unit">m</span></div>
+                                </div>
+                                <div class="pos-item">
+                                    <div class="pos-label">YAW</div>
+                                    <div class="pos-val-group"><span class="pos-val muted" id="navPosYaw">--</span><span class="pos-unit">°</span></div>
+                                </div>
+                            </div>
+                            <div class="lift-row">
+                                <div class="lift-info">
+                                    <span class="lift-label">Lift height:</span>
+                                    <span class="lift-height muted" id="navLiftHeight">--</span>
+                                    <span class="lift-unit">mm</span>
+                                </div>
+                                <span class="lift-state unknown" id="navLiftState">UNKNOWN</span>
+                            </div>
+                        </div>
+                        <div class="cargo-status empty mt-2" id="navCargoStatus">
+                           <span id="navCargoText">EMPTY</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- CARD 4: RECENT MISSIONS (nằm TRONG .nav-left-col) -->
+                    <div class="panel-card card-recent-missions">
+                        <div class="panel-card-header">
+                            <span class="card-title">Recent Missions</span>
+                        </div>
+                        <div class="activity-table-wrap mission-table-wrap">
+                            <table class="activity-table mission-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width:70px">Time</th>
+                                        <th>Name</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="navRecentMissions">
+                            </table>
+                            <div class="mission-empty" id="navMissionEmpty">No recent missions</div>
+                        </div>
+                    </div>
+
+                  </div><!-- /.nav-left-col -->
+
+                  <!-- CENTER COLUMN: MAP & HEADER TOOLS -->
+                  <div class="nav-center-col slam-viewport-wrap">
+                    
+                    <div class="slam-viewport-header">
+                        <span class="nav-status-badge">Navigation Active</span>
+                        
+                        <!-- TOOLS nằm ngang trên Header -->
+                        <div class="map-toolbar-group" id="navMapTools">
+                            <button class="map-btn" data-tooltip="Set Initial Pose" id="toolSetPose">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v4M12 18v4M2 12h4M18 12h4"></path></svg>
+                            </button>
+                            <button class="map-btn" data-tooltip="Set Nav Goal" id="toolSetGoal">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg>
+                            </button>
+                            <button class="map-btn active" data-tooltip="Toggle Route" id="toolToggleRoute">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                            </button>
+                            <button class="map-btn" data-tooltip="Center Robot" id="toolCenterMap">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/></svg>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="slam-map-viewport" style="position: relative;">
+                        <canvas id="navMapCanvas"></canvas>
+                        <!-- Cảnh báo khi người dùng chưa Start Mission -->
+                        <div id="navMapOverlayMsg" style="position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); color: white; padding: 8px 16px; border-radius: 4px; font-size: 0.8rem; display: none;"></div>
+                    </div>
+                  </div>
+
+                  <!-- RIGHT COLUMN: Actions & AI -->
+                  <div class="nav-right-col">
+                    
+                    <!-- CARD 1: CAMERA -->
+                    <div class="panel-card">
+                        <div class="panel-card-header" style="justify-content: space-between; display: flex; align-items: center; width: 100%;">
+                            <span class="card-title">Camera View</span>
+                            <!-- Nhóm nút bấm chuyển mode Camera -->
+                            <div class="cam-mode-selector">
+                                <button class="btn-cam-mode" id="btnCamRgb">RGB</button>
+                                <button class="btn-cam-mode" id="btnCamDepth">DEPTH</button>
+                                <button class="btn-cam-mode off active" id="btnNavToggleCam">OFF</button>
+                            </div>
+                        </div>
+                        <div class="panel-card-body" style="padding: 0;">
+                            <div class="camera-viewport-small" id="navCameraFeed">
+                                <span class="muted" style="font-size: 0.75rem;" id="camStatusText">Camera Offline</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- CARD 2: QUICK GOALS (ĐÃ TINH GIẢN NÚT) -->
+                    <div class="panel-card">
+                       <div class="panel-card-header"><span class="card-title">Quick Goals</span></div>
+                       <div class="panel-card-body" id="navQuickMissions">
+                          <div class="actions-grid-2col">
+                             <button class="btn-action primary">Return Home</button>
+                             <button class="btn-action secondary">Go Pick 1</button>
+                             <button class="btn-action secondary">Go Pick 2</button>
+                             <button class="btn-action accent">Go Drop</button>
+                          </div>
+                       </div>
+                    </div>
+
+                    <!-- CARD 3: LLM AI ASSISTANT -->
+                    <div class="panel-card" style="flex: 1; display: flex; flex-direction: column;">
+                       <div class="panel-card-header" style="justify-content: space-between; display: flex; align-items: center; width: 100%;">
+                          <span class="card-title">AI Assistant</span>
+                          <span class="status-badge online" style="font-size: 0.55rem; padding: 2px 6px;">LLM ACTIVE</span>
+                       </div>
+                       <div class="panel-card-body" style="flex: 1; display: flex; flex-direction: column;">
+                          <div class="ai-chat-box">
+                             <div class="chat-msg ai" style="color: var(--text-muted); font-style: italic;">Ready for text commands...</div>
+                          </div>
+                          <div class="ai-input-row mt-2" style="display: flex; gap: 8px;">
+                             <input type="text" placeholder="Command..." class="form-control" style="flex: 1;" />
+                             <button class="btn btn-accent" style="padding: 0 12px;">➤</button>
+                          </div>
+                       </div>
+                    </div>
+
+                  </div><!-- /.nav-right-col -->
+                </div><!-- /.nav-main-grid -->
             </div>
         </div>
+
+        <!-- Map & Route Page -->
         <div class="page" id="page-map">
             <div class="map-route-layout">
-                <!-- Toolbar (top) -->
                 <div class="map-route-toolbar">
                     <div class="tool-group">
                         <button class="tool-btn active" data-tool="select" title="Select">
@@ -586,9 +731,7 @@
                     </div>
                 </div>
 
-                <!-- 2x2 Grid -->
                 <div class="map-route-grid">
-                    <!-- Top Left: Canvas -->
                     <div class="map-canvas-wrapper">
                         <canvas id="routeCanvas"></canvas>
                         <div class="map-empty" id="routeEmptyState">
@@ -602,7 +745,6 @@
                         </div>
                     </div>
 
-                    <!-- Top Right: Maps -->
                     <div class="maps-panel">
                         <div class="section-header">
                             <span>MAPS</span>
@@ -612,9 +754,7 @@
                         </div>
                     </div>
 
-                    <!-- Bottom Left: Nodes + Node Editor (same row) -->
                     <div class="bottom-left-wrapper">
-                        <!-- Node Table -->
                         <div class="node-table-wrapper">
                             <div class="section-header">
                                 <span>NODES</span>
@@ -624,14 +764,11 @@
                                 <!-- Populated by JS -->
                             </div>
                         </div>
-
-                        <!-- Node Editor -->
                         <div class="node-editor-wrapper" id="nodeEditor">
                             <!-- Populated by JS -->
                         </div>
                     </div>
 
-                    <!-- Bottom Right: Route -->
                     <div class="route-panel">
                         <div class="section-header">
                             <span>ROUTE</span>
@@ -643,6 +780,8 @@
                 </div>
             </div>
         </div>
+
+        <!-- System Page -->
         <div class="page" id="page-system">
             <div class="placeholder-page">
                 <svg class="placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -684,7 +823,6 @@
     </div>
 </div>
 
-<!-- JS Modules theo thứ tự phụ thuộc -->
 <script src="/js/overview.js?v=1.0.16"></script>
 <script src="/js/state.js?v=1.0.16"></script>
 <script src="/js/ros_connection.js?v=1.0.16"></script>
@@ -692,8 +830,6 @@
 <script src="/js/slam.js?v=1.0.16"></script>
 <script src="/js/navigation.js?v=1.0.16"></script>
 <script src="/js/map_route.js?v=1.0.16"></script>
-
-<!-- app.js luôn nằm dưới cùng -->
 <script src="/js/app.js?v=1.0.16"></script>
 </body>
 </html>

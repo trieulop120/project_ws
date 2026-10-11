@@ -81,12 +81,15 @@ function handleCommandResponse(d) {
         updateOpModeDisplay();
     } else if (cmd === 'save_map') {
         if (status === 'success') {
-            addActivity('info', 'Map saved: ' + (d.path || 'unknown path'));
-            if (typeof showToast === 'function') {
-                showToast('Map is saved successfully', 'success', 5000);
+            addActivity('info', 'Map saved successfully');
+            if (typeof window.showToast === 'function') {
+                window.showToast('Map saved successfully', 'success');
             }
         } else {
             addAlarm('error', 'Map save failed: ' + message);
+            if (typeof window.showToast === 'function') {
+                window.showToast('Map save failed: ' + message, 'error');
+            }
         }
     } else if (cmd === 'teleop') {
         // Teleop không cần feedback
