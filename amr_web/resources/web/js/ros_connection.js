@@ -6,6 +6,7 @@ const wsUrl = wsProtocol + '//' + location.host + '/ws';
 
 let ws = null;
 let reconnectDelay = 1000;
+let reconnectTimer = null;
 const maxReconnectDelay = 30000;
 
 function setWsConnected(c) {
@@ -26,11 +27,57 @@ function setWsConnected(c) {
     }
 }
 
+/**
+ * Update Navigation layout visibility based on global state (for multi-client sync)
+ */
+function updateNavLayoutVisibility() {
+    const navWelcome = document.getElementById('navWelcome');
+    const navLayout = document.getElementById('navLayout');
+
+    if (window.isNavigationActive) {
+        if (navWelcome) navWelcome.style.display = 'none';
+        if (navLayout) {
+            navLayout.style.display = 'grid';
+        }
+    } else {
+        if (navWelcome) navWelcome.style.display = 'flex';
+        if (navLayout) navLayout.style.display = 'none';
+    }
+}
+
+/**
+ * Update SLAM layout visibility based on global state (for multi-client sync)
+ */
+function updateSlamLayoutVisibility() {
+    const slamWelcome = document.getElementById('slamWelcome');
+    const slamLayout = document.getElementById('slamLayout');
+
+    if (window.isSlamActive) {
+        if (slamWelcome) slamWelcome.style.display = 'none';
+        if (slamLayout) {
+            slamLayout.style.display = 'grid';
+        }
+    } else {
+        if (slamWelcome) slamWelcome.style.display = 'flex';
+        if (slamLayout) slamLayout.style.display = 'none';
+    }
+}
+
 function connect() {
+    // B01 Fix: Idempotent - không tạo socket mới nếu đang open/connecting
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        return;
+    }
+    // B01 Fix: Clear reconnect timer cũ
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
     setWsConnected(false);
     try {
-        ws = new WebSocket(wsUrl);
-        
+        const sock = new WebSocket(wsUrl);
+        ws = sock;
+
         ws.onopen = () => {
             setWsConnected(true);
             reconnectDelay = 1000;
@@ -39,6 +86,8 @@ function connect() {
         };
 
         ws.onmessage = e => {
+            // B01 Fix: Bỏ qua message từ socket cũ (nếu có)
+            if (ws !== sock) return;
             // Safety check for empty or non-string data
             if (!e.data || typeof e.data !== 'string') {
                 return;
@@ -65,46 +114,47 @@ function connect() {
 
                     case 'map':
                         console.log('[WS] Received map data, isSlamActive:', window.isSlamActive);
-                        window.mapData = d;
 
-                        // Cập nhật dữ liệu vào mapRenderer (hàm updateMap sẽ tự xử lý hiển thị theo isSlamActive)
-                        if (window.mapRenderer && typeof window.mapRenderer.updateMap === 'function') {
-                            window.mapRenderer.updateMap(d);
-                        } else if (typeof updateMap === 'function') {
-                            updateMap(d);
+                        // Fix: Chi cap nhat map tu WS khi SLAM dang chay
+                        // Khi Navigation dang active voi PGM map (is_pgm_raw=true), bo qua OccupancyGrid tu Nav2
+                        const currentMapData = window.mapData;
+                        const isUsingPgmMap = currentMapData && currentMapData.is_pgm_raw === true;
+
+                        if (window.isSlamActive || !isUsingPgmMap) {
+                            window.mapData = d;
+
+                            // Cập nhật dữ liệu vào mapRenderer (hàm updateMap sẽ tự xử lý hiển thị theo isSlamActive)
+                            if (window.mapRenderer && typeof window.mapRenderer.updateMap === 'function') {
+                                window.mapRenderer.updateMap(d);
+                            } else if (typeof updateMap === 'function') {
+                                updateMap(d);
+                            }
+                        } else {
+                            console.log('[WS] Skipping OccupancyGrid - Navigation using PGM map');
                         }
                         break;
 
                     case 'slam_state':
                         console.log('[WS] Received slam_state:', d.is_slam_active);
-                        const prevState = window.isSlamActive;
+                        const prevSlam = window.isSlamActive;
                         window.isSlamActive = d.is_slam_active === true;
 
-                        // Sync map renderer đồng bộ ngay khi SLAM state thay đổi
+                        // P0-6 Fix: Only clear map when SLAM actually STOPPED (prev=true, now=false)
                         if (window.mapRenderer) {
                             if (window.isSlamActive) {
-                                // SLAM just started - move viewport and show
+                                // SLAM just started
                                 window.mapRenderer.moveToViewport('slam');
                                 window.mapRenderer.show();
-
-                                // NẾU đã có map data sẵn (từ trước khi slam_state đến), render ngay
-                                if (window.mapData) {
-                                    console.log('[WS] Have existing map data, rendering immediately');
-                                    window.mapRenderer.updateMap(window.mapData);
-                                }
-                            } else {
-                                // SLAM stopped - clear everything
-                                window.mapData = null;
-                                window.mapImageData = null;
+                                if (window.mapData) window.mapRenderer.updateMap(window.mapData);
+                            } else if (prevSlam) {
+                                // SLAM just stopped - clear map
                                 window.mapRenderer.hide(true);
-
-                                // Reset Overview map card
-                                if (typeof resetOverviewMapCard === 'function') {
-                                    resetOverviewMapCard();
-                                }
+                                if (typeof resetOverviewMapCard === 'function') resetOverviewMapCard();
                             }
                         }
 
+                        // Update UI visibility for multi-client sync
+                        updateSlamLayoutVisibility();
                         if (typeof updateSlamUI === 'function') updateSlamUI();
                         if (typeof updateOpModeDisplay === 'function') updateOpModeDisplay();
                         break;
@@ -143,6 +193,29 @@ function connect() {
                         }
                         break;
 
+                    case 'nav_state':
+                        // Broadcast nav_state to all clients for multi-client sync
+                        window.isNavigationActive = d.nav2_running === true;
+                        if (typeof handleNavStateUpdate === 'function') {
+                            handleNavStateUpdate(d);
+                        }
+                        // B06 Fix: Gọi updateOpModeDisplay để sync Operating Mode card
+                        if (typeof updateOpModeDisplay === 'function') {
+                            updateOpModeDisplay();
+                        }
+                        if (typeof window.updateNavUI === 'function') {
+                            window.updateNavUI();
+                        }
+                        // Update nav layout visibility based on isNavigationActive
+                        updateNavLayoutVisibility();
+                        break;
+
+                    case 'nav_result':
+                        if (typeof handleNavResult === 'function') {
+                            handleNavResult(d);
+                        }
+                        break;
+
                     case 'command_response':
                         if (typeof handleCommandResponse === 'function') {
                             handleCommandResponse(d);
@@ -158,7 +231,9 @@ function connect() {
             setWsConnected(false);
             if (typeof updateRobotStatus === 'function') updateRobotStatus(false);
             if (typeof addActivity === 'function') addActivity('warn', 'WebSocket connection lost. Reconnecting...');
-            setTimeout(connect, reconnectDelay);
+            // B01 Fix: Dùng reconnectTimer để tránh duplicate timers
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(connect, reconnectDelay);
             reconnectDelay = Math.min(reconnectDelay * 1.5, maxReconnectDelay);
         };
 

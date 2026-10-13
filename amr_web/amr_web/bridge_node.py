@@ -33,6 +33,7 @@ from amr_web.websocket_manager import WebSocketManager
 from amr_web.state_bridge import StateBridge
 from amr_web.converters import odom_to_json, map_to_json, laser_to_json, image_to_json
 from amr_web.web_server import create_app
+from amr_web.nav_bridge import NavBridge
 
 
 def sensor_qos():
@@ -102,6 +103,9 @@ class WebBridge(Node):
         self._slam_process: Optional[subprocess.Popen] = None
         self._slam_active: bool = False
 
+        # Navigation Bridge (Nav2 Action Client)
+        self._nav_bridge: Optional[NavBridge] = None
+
         # Publishers cho teleop và lift
         self._cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self._esp32_cmd_pub = self.create_publisher(String, '/esp32_cmd', 10)
@@ -123,8 +127,15 @@ class WebBridge(Node):
             Odometry, self._pose_topic, self._on_pose, qos_profile=sensor_qos())
         self._battery_sub = self.create_subscription(
             BatteryState, self._battery_topic, self._on_battery, qos_profile=sensor_qos())
+        # P0-5 Fix: Map QoS - TRANSIENT_LOCAL for reliable map delivery
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL
+        )
         self._map_sub = self.create_subscription(
-            OccupancyGrid, self._map_topic, self._on_map, qos_profile=sensor_qos())
+            OccupancyGrid, self._map_topic, self._on_map, qos_profile=map_qos)
         self._camera_sub = self.create_subscription(
             Image, self._camera_topic, self._on_camera_rgb, qos_profile=sensor_qos())
         self._depth_camera_sub = self.create_subscription(
@@ -139,6 +150,7 @@ class WebBridge(Node):
         self._ws_thread: Optional[threading.Thread] = None
         self._broadcast_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._broadcast_task: Optional[asyncio.Task] = None
 
         # Rate control
         self._pose_interval = 1.0 / self._pose_rate
@@ -157,12 +169,117 @@ class WebBridge(Node):
             self.get_logger().info(f'Web Bridge Running on {self._host}:{self._port}')
             self.get_logger().info(f'Lift tracking: joint={self._joint_topic} (position in meters → mm)')
 
+        # Initialize Navigation Bridge
+        self._init_nav_bridge()
+
     def set_camera_stream(self, enable: bool, mode: str = 'off') -> None:
         """Bật/tắt camera stream dynamic theo yêu cầu từ Web SCADA."""
         self._camera_streaming = enable
         self._camera_mode = mode if enable else 'off'
         if self._verbose:
             self.get_logger().info(f"Camera stream set: enable={enable}, mode={self._camera_mode}")
+
+    def _init_nav_bridge(self) -> None:
+        """Initialize Navigation Bridge."""
+        try:
+            self._nav_bridge = NavBridge(
+                node=self,
+                ws_broadcast_callback=self.broadcast_threadsafe
+            )
+            if self._verbose:
+                self.get_logger().info('NavBridge initialized')
+        except Exception as e:
+            self.get_logger().error(f'Failed to init NavBridge: {e}')
+            self._nav_bridge = None
+
+    # ============================================
+    # Event Loop Attachment (Phase 1 Fix)
+    # ============================================
+
+    def attach_server_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Attach to uvicorn's event loop for thread-safe broadcast."""
+        self._loop = loop
+        self._running = True
+        self._broadcast_task = loop.create_task(self._broadcast_forever())
+        if self._verbose:
+            self.get_logger().info('Attached to server event loop')
+
+    def detach_server_loop(self) -> None:
+        """Detach from event loop on shutdown."""
+        self._running = False
+        if self._broadcast_task:
+            self._broadcast_task.cancel()
+        self._loop = None
+        if self._verbose:
+            self.get_logger().info('Detached from server event loop')
+
+    def broadcast_threadsafe(self, message: str) -> None:
+        """Thread-safe broadcast via server loop. Called from any thread."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._ws_manager.broadcast(message),
+            loop
+        )
+
+    async def _broadcast_forever(self) -> None:
+        """Broadcast loop running in uvicorn's event loop."""
+        last_nav = 0.0
+        while self._running:
+            try:
+                now = time.time()
+
+                if now - self._last_pose_send >= self._pose_interval:
+                    pose = self._state_bridge.get_latest_pose()
+                    if pose:
+                        await self._ws_manager.broadcast(json.dumps(pose))
+                        self._last_pose_send = now
+
+                if now - self._last_battery_send >= self._battery_interval:
+                    battery = self._state_bridge.get_latest_battery()
+                    if battery:
+                        await self._ws_manager.broadcast(json.dumps(battery))
+                        self._last_battery_send = now
+
+                if now - self._last_system_status_send >= self._system_status_interval:
+                    system_status = self._state_bridge.get_system_overview_state()
+                    await self._ws_manager.broadcast(json.dumps(system_status))
+                    self._last_system_status_send = now
+
+                if now - self._last_laser_send >= self._laser_interval:
+                    laser = self._state_bridge.get_latest_laser()
+                    if laser:
+                        await self._ws_manager.broadcast(json.dumps(laser))
+                        self._last_laser_send = now
+
+                if self._map_pending and (now - self._last_map_send) >= self._map_interval:
+                    map_data = self._state_bridge.get_latest_map()
+                    if map_data:
+                        await self._ws_manager.broadcast(json.dumps(map_data))
+                        self._last_map_send = now
+                        self._map_pending = False
+
+                # P1-13 Fix: Broadcast nav_state periodically (1 Hz)
+                if now - last_nav >= 1.0:
+                    if self._nav_bridge:
+                        await self._ws_manager.broadcast(
+                            json.dumps(self._nav_bridge.get_navigation_state())
+                        )
+                    last_nav = now
+
+                await asyncio.sleep(0.1)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if self._verbose:
+                    self.get_logger().error(f'Broadcast tick error: {e}')
+
+    async def _broadcast_nav_state(self, message: str) -> None:
+        """Callback để broadcast navigation state qua WebSocket (legacy compatibility)."""
+        if self._ws_manager and self._loop and not self._loop.is_closed():
+            await self._ws_manager.broadcast(message)
 
     def _process_and_broadcast_cam(self, msg: Image, cam_type: str) -> None:
         """Hàm chung cập nhật heartbeat và encode ảnh khi có yêu cầu từ client."""
@@ -254,53 +371,6 @@ class WebBridge(Node):
                 self._state_bridge.update_lift_height(self._lift_height_mm)
             except (ValueError, IndexError):
                 pass
-
-    def _broadcast_loop(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-
-        async def run_broadcasts():
-            while self._running:
-                current_time = time.time()
-
-                if current_time - self._last_pose_send >= self._pose_interval:
-                    pose = self._state_bridge.get_latest_pose()
-                    if pose:
-                        await self._ws_manager.broadcast(json.dumps(pose))
-                        self._last_pose_send = current_time
-
-                if current_time - self._last_battery_send >= self._battery_interval:
-                    battery = self._state_bridge.get_latest_battery()
-                    if battery:
-                        await self._ws_manager.broadcast(json.dumps(battery))
-                        self._last_battery_send = current_time
-
-                if current_time - self._last_system_status_send >= self._system_status_interval:
-                    system_status = self._state_bridge.get_system_overview_state()
-                    await self._ws_manager.broadcast(json.dumps(system_status))
-                    self._last_system_status_send = current_time
-
-                if current_time - self._last_laser_send >= self._laser_interval:
-                    laser = self._state_bridge.get_latest_laser()
-                    if laser:
-                        await self._ws_manager.broadcast(json.dumps(laser))
-                        self._last_laser_send = current_time
-
-                if self._map_pending and (current_time - self._last_map_send) >= self._map_interval:
-                    map_data = self._state_bridge.get_latest_map()
-                    if map_data:
-                        await self._ws_manager.broadcast(json.dumps(map_data))
-                        self._last_map_send = current_time
-                        self._map_pending = False
-
-                await asyncio.sleep(0.05)
-
-        try:
-            self._loop.run_until_complete(run_broadcasts())
-        except Exception as e:
-            self.get_logger().error(f'Broadcast error: {e}')
-        finally:
-            self._loop.close()
 
     def start_websocket_server(self) -> None:
         self._ws_thread = threading.Thread(target=self._run_server, daemon=True)
@@ -607,6 +677,171 @@ class WebBridge(Node):
         if self._verbose:
             self.get_logger().info(f'Lift cmd: {cmd.data}')
 
+    # ============================================
+    # Navigation Methods (NavBridge wrapper)
+    # ============================================
+
+    def start_navigation(self, map_id: str, route_id: Optional[str] = None) -> tuple:
+        if not self._nav_bridge:
+            return False, "NavBridge not initialized"
+
+        try:
+            # P0-5 Fix: Clear old map before starting navigation
+            self._state_bridge.clear_map()
+            self._map_pending = False
+
+            maps_dir = os.path.expanduser('~/project_ws/maps')
+            map_yaml = os.path.join(maps_dir, f'{map_id}.yaml')
+
+            if not os.path.exists(map_yaml):
+                return False, f"Map file not found: {map_yaml}"
+
+            route_file = None
+            if route_id:
+                # Trỏ ưu tiên tới file .geojson (vì route_server bắt buộc đọc .geojson)
+                candidate_geojson = os.path.join(maps_dir, map_id, 'routes', f'{route_id}.geojson')
+                candidate_yaml = os.path.join(maps_dir, map_id, 'routes', f'{route_id}.yaml')
+
+                if os.path.exists(candidate_geojson):
+                    route_file = candidate_geojson
+                elif os.path.exists(candidate_yaml):
+                    route_file = candidate_yaml
+                else:
+                    self.get_logger().warn(f"Route file not found for: {route_id}")
+
+            # Gọi nav_bridge với file route chính xác (truyen day du map_id va route_id)
+            success, msg = self._nav_bridge.start_nav2(
+                map_path=map_yaml,
+                route_path=route_file,
+                map_id=map_id,
+                route_id=route_id
+            )
+
+            if success and self._verbose:
+                self.get_logger().info(f'Navigation started: map={map_id}, route={route_id}')
+
+            return success, msg
+
+        except Exception as e:
+            self.get_logger().error(f'Failed to start navigation: {e}')
+            return False, str(e)
+
+    def stop_navigation(self) -> tuple:
+        """
+        Stop Nav2 navigation.
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        if not self._nav_bridge:
+            return False, "NavBridge not initialized"
+
+        # P0-5 Fix: Clear map when stopping navigation
+        self._state_bridge.clear_map()
+        self._map_pending = False
+
+        return self._nav_bridge.stop_nav2()
+
+    def send_nav_goal(self, pose: dict, route_id: Optional[str] = None) -> tuple:
+        """
+        Send navigation goal to Nav2.
+
+        Args:
+            pose: dict với keys 'x', 'y', 'yaw'
+            route_id: Optional route identifier
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        if not self._nav_bridge:
+            return False, "NavBridge not initialized"
+
+        return self._nav_bridge.send_navigation_goal(pose, route_id)
+
+    def cancel_nav_goal(self) -> tuple:
+        """
+        Cancel active navigation goal.
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        if not self._nav_bridge:
+            return False, "NavBridge not initialized"
+
+        return self._nav_bridge.cancel_navigation()
+
+    def set_nav_initial_pose(self, pose: dict) -> tuple:
+        """
+        Set initial pose cho AMCL.
+
+        Args:
+            pose: dict với keys 'x', 'y', 'yaw'
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        if not self._nav_bridge:
+            return False, "NavBridge not initialized"
+
+        return self._nav_bridge.set_initial_pose(pose)
+
+    def get_nav_state(self) -> dict:
+        """
+        Get current navigation state.
+
+        Returns:
+            dict: Navigation state info
+        """
+        if not self._nav_bridge:
+            return {'type': 'nav_state', 'state': 'UNAVAILABLE'}
+
+        return self._nav_bridge.get_navigation_state()
+
+    def is_navigation_running(self) -> bool:
+        """Check if Nav2 is running."""
+        if not self._nav_bridge:
+            return False
+        return self._nav_bridge.is_nav_running()
+
+    def is_navigation_active(self) -> bool:
+        """Check if navigation goal is active."""
+        if not self._nav_bridge:
+            return False
+        return self._nav_bridge.is_nav_active()
+
+    def send_waypoint_mission(self, waypoints: list, mission_type: str = 'waypoints') -> tuple:
+        """
+        Send waypoint/route mission to Nav2.
+
+        Args:
+            waypoints: List of pose dicts [{x, y, yaw, name}, ...]
+            mission_type: 'waypoints' hoặc 'route'
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        if not self._nav_bridge:
+            return False, "NavBridge not initialized"
+
+        return self._nav_bridge.send_waypoint_mission(waypoints, mission_type)
+
+    def emergency_stop_robot(self) -> tuple:
+        """
+        Emergency stop - publish zero velocity immediately.
+
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        if not self._nav_bridge:
+            return False, "NavBridge not initialized"
+
+        try:
+            self._nav_bridge._emergency_stop()
+            return True, "Emergency stop applied"
+        except Exception as e:
+            self.get_logger().error(f'Emergency stop failed: {e}')
+            return False, str(e)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -619,15 +854,15 @@ def main(args=None):
     time.sleep(1.0)
 
     try:
-        bridge._broadcast_thread = threading.Thread(
-            target=bridge._broadcast_loop, daemon=True)
-        bridge._broadcast_thread.start()
+        # Phase 1 Fix: No more _broadcast_thread - using uvicorn's event loop instead
         executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         bridge._running = False
         bridge.stop_slam()
+        if bridge._nav_bridge:
+            bridge._nav_bridge.stop_nav2()
         executor.remove_node(bridge)
         bridge.destroy_node()
         rclpy.shutdown()

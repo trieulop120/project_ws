@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # amr_web/state_bridge.py
+"""
+Thread-safe state storage for Web Bridge.
+Phase 1 Fix: Use RLock instead of blocking=False to prevent stale data.
+"""
 import threading
 import time
 from typing import Optional, Dict
@@ -9,7 +13,8 @@ class StateBridge:
     """Thread-safe storage for heartbeat monitoring và state management."""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        # P0-5 Fix: Use RLock instead of Lock, blocking=True for all operations
+        self._lock = threading.RLock()
 
         # === Device Heartbeat Configuration (timeout = 3.0s) ===
         self._timeouts = {
@@ -54,70 +59,50 @@ class StateBridge:
     # === Device Heartbeat Methods ===
     def update_heartbeat(self, device_name: str) -> None:
         """Cập nhật heartbeat của thiết bị."""
-        if self._lock.acquire(blocking=False):
-            try:
-                self._last_seen[device_name] = time.time()
-                self._msg_counts[device_name] += 1
-            finally:
-                self._lock.release()
+        with self._lock:
+            self._last_seen[device_name] = time.time()
+            self._msg_counts[device_name] += 1
 
     def check_device_statuses(self) -> Dict[str, dict]:
         """Kiểm tra trạng thái kết nối của tất cả thiết bị."""
-        current_time = time.time()
+        with self._lock:
+            current_time = time.time()
 
-        if self._lock.acquire(blocking=False):
-            try:
-                elapsed = current_time - self._last_hz_check
-                if elapsed >= 1.0:
-                    for device in self._hz_values:
-                        count = self._msg_counts[device]
-                        self._hz_values[device] = count / elapsed
-                        self._msg_counts[device] = 0
-                    self._last_hz_check = current_time
+            elapsed = current_time - self._last_hz_check
+            if elapsed >= 1.0:
+                for device in self._hz_values:
+                    count = self._msg_counts[device]
+                    self._hz_values[device] = count / elapsed
+                    self._msg_counts[device] = 0
+                self._last_hz_check = current_time
 
-                devices = {}
-                for device, timeout in self._timeouts.items():
-                    last_seen = self._last_seen.get(device, 0.0)
-                    connected = (current_time - last_seen) <= timeout
-                    devices[device] = {
-                        'connected': connected,
-                        'hz': round(self._hz_values.get(device, 0.0), 1)
-                    }
+            devices = {}
+            for device, timeout in self._timeouts.items():
+                last_seen = self._last_seen.get(device, 0.0)
+                connected = (current_time - last_seen) <= timeout
+                devices[device] = {
+                    'connected': connected,
+                    'hz': round(self._hz_values.get(device, 0.0), 1)
+                }
 
-                return devices
-            finally:
-                self._lock.release()
-        else:
-            return {device: {'connected': False, 'hz': 0.0} for device in self._timeouts}
+            return devices
 
     # === Lift State Methods ===
     def set_lift_initialized(self, initialized: bool) -> None:
         """Đánh dấu lift đã được home."""
-        if self._lock.acquire(blocking=False):
-            try:
-                self._lift_initialized = initialized
-            finally:
-                self._lock.release()
+        with self._lock:
+            self._lift_initialized = initialized
 
     def update_lift_height(self, height_mm: int) -> None:
         """Cập nhật lift height."""
-        if self._lock.acquire(blocking=False):
-            try:
-                self._lift_height = height_mm
-            finally:
-                self._lock.release()
+        with self._lock:
+            self._lift_height = height_mm
 
     def get_lift_data(self) -> dict:
         """Lấy dữ liệu lift cho web."""
-        if self._lock.acquire(blocking=False):
-            try:
-                height = self._lift_height
-                initialized = self._lift_initialized
-            finally:
-                self._lock.release()
-        else:
-            height = None
-            initialized = False
+        with self._lock:
+            height = self._lift_height
+            initialized = self._lift_initialized
 
         # Chưa home → UNKNOWN
         if not initialized:
@@ -154,13 +139,8 @@ class StateBridge:
 
         lift_data = self.get_lift_data()
 
-        if self._lock.acquire(blocking=False):
-            try:
-                battery = self._battery if self._battery else None
-            finally:
-                self._lock.release()
-        else:
-            battery = None
+        with self._lock:
+            battery = self._battery if self._battery else None
 
         result = {
             "type": "system_status",
@@ -175,78 +155,52 @@ class StateBridge:
 
         return result
 
-    # === Original State Methods ===
+    # === Map State Methods (P0-5: Add clear methods) ===
+    def clear_map(self) -> None:
+        """Xoá map state - gọi khi start/stop navigation hoặc SLAM."""
+        with self._lock:
+            self._map = None
+
+    # === Original State Methods (P0-5 Fix: Use blocking RLock) ===
     def update_pose(self, pose_data: dict) -> None:
-        if self._lock.acquire(blocking=False):
-            try:
-                self._pose = pose_data
-            finally:
-                self._lock.release()
+        with self._lock:
+            self._pose = pose_data
 
     def update_battery(self, battery_data: dict) -> None:
-        if self._lock.acquire(blocking=False):
-            try:
-                self._battery = battery_data
-            finally:
-                self._lock.release()
+        with self._lock:
+            self._battery = battery_data
 
     def update_map(self, map_data: dict) -> None:
-        if self._lock.acquire(blocking=False):
-            try:
-                self._map = map_data
-            finally:
-                self._lock.release()
+        with self._lock:
+            self._map = map_data
 
     def update_laser(self, laser_data: dict) -> None:
-        if self._lock.acquire(blocking=False):
-            try:
-                self._laser = laser_data
-            finally:
-                self._lock.release()
+        with self._lock:
+            self._laser = laser_data
 
     def get_latest_pose(self) -> Optional[dict]:
-        if self._lock.acquire(blocking=False):
-            try:
-                return self._pose
-            finally:
-                self._lock.release()
-        return None
+        with self._lock:
+            return self._pose
 
     def get_latest_battery(self) -> Optional[dict]:
-        if self._lock.acquire(blocking=False):
-            try:
-                return self._battery
-            finally:
-                self._lock.release()
-        return None
+        with self._lock:
+            return self._battery
 
     def get_latest_map(self) -> Optional[dict]:
-        if self._lock.acquire(blocking=False):
-            try:
-                return self._map
-            finally:
-                self._lock.release()
-        return None
+        with self._lock:
+            return self._map
 
     def get_latest_laser(self) -> Optional[dict]:
-        if self._lock.acquire(blocking=False):
-            try:
-                return self._laser
-            finally:
-                self._lock.release()
-        return None
+        with self._lock:
+            return self._laser
 
     def get_all_state(self) -> dict:
-        if self._lock.acquire(blocking=False):
-            try:
-                result = {}
-                if self._pose:
-                    result["pose"] = self._pose
-                if self._battery:
-                    result["battery"] = self._battery
-                if self._map:
-                    result["map"] = self._map
-                return result
-            finally:
-                self._lock.release()
-        return {}
+        with self._lock:
+            result = {}
+            if self._pose:
+                result["pose"] = self._pose
+            if self._battery:
+                result["battery"] = self._battery
+            if self._map:
+                result["map"] = self._map
+            return result

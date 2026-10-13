@@ -65,6 +65,38 @@ function navigateToPage(p) {
         window.mapRenderer.moveToViewport(p);
     }
 
+    // Fix: ALWAYS hide SLAM layout when not on SLAM page (even if SLAM is active)
+    if (p !== 'slam') {
+        const slamLayout = document.getElementById('slamLayout');
+        const slamWelcome = document.getElementById('slamWelcome');
+        // Always hide slamLayout regardless of isSlamActive
+        if (slamLayout) {
+            slamLayout.style.display = 'none';
+            slamLayout.classList.remove('active');
+        }
+        // Show welcome if SLAM is inactive, hide if active
+        if (slamWelcome) {
+            slamWelcome.style.display = window.isSlamActive ? 'none' : 'flex';
+        }
+    } else {
+        // On SLAM page - show correct UI based on state
+        const slamLayout = document.getElementById('slamLayout');
+        const slamWelcome = document.getElementById('slamWelcome');
+        if (window.isSlamActive) {
+            if (slamLayout) {
+                slamLayout.style.display = 'grid';
+                slamLayout.classList.add('active');
+            }
+            if (slamWelcome) slamWelcome.style.display = 'none';
+        } else {
+            if (slamLayout) {
+                slamLayout.style.display = 'none';
+                slamLayout.classList.remove('active');
+            }
+            if (slamWelcome) slamWelcome.style.display = 'flex';
+        }
+    }
+
     // Reset Map & Route page when navigating away
     if (p !== 'map' && typeof window.resetMapRoutePage === 'function') {
         window.resetMapRoutePage();
@@ -134,7 +166,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }));
 
-    // Canvas drag events
+    // Canvas drag events - Skip if navigation tool is active
     let isDragging = false;
     let dragStart = { x: 0, y: 0 };
     let transformStart = { x: 0, y: 0, scale: 1 };
@@ -143,12 +175,19 @@ document.addEventListener('DOMContentLoaded', () => {
     function getCurrentViewTransform() {
         if (window.currentViewport === 'slam') {
             return window.slamViewTransform;
+        } else if (window.currentViewport === 'navigation') {
+            return window.navViewTransform;
         }
         return window.overviewViewTransform;
     }
 
     document.addEventListener('mousedown', e => {
-        const vp = document.querySelector('.page.active .map-viewport, .page.active .slam-map-viewport');
+        // Skip pan if navigation tool is active
+        if (typeof window.isCanvasToolActive !== 'undefined' && window.isCanvasToolActive) {
+            return;
+        }
+
+        const vp = document.querySelector('.page.active .map-viewport, .page.active .slam-map-viewport, .page.active #navMapViewport');
         if (!vp || !vp.contains(e.target)) return;
         if (e.target.closest('.map-toolbar') || e.target.closest('.map-empty')) return;
 

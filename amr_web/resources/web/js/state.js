@@ -1,7 +1,8 @@
 // Global Application State
-let mapData = null;
-let robotPose = null;
-let mapImageData = null;
+// P0-6 Fix: Use window.* for cross-module access (single source of truth)
+window.mapData = null;
+window.robotPose = null;
+window.mapImageData = null;
 let isWsConnected = false;
 let isRobotConnected = false;
 let activityLog = [];
@@ -58,8 +59,17 @@ function handleCommandResponse(d) {
 
     console.log('Command response:', cmd, status, message);
 
+    // Phase 5 Fix: Redirect nav commands to navigation.js
+    if (['start_navigation', 'stop_navigation', 'nav_goal', 'nav_cancel',
+         'waypoint_mission', 'set_initial_pose', 'emergency_stop'].includes(cmd)) {
+        if (typeof window.onNavCommandResponse === 'function') {
+            window.onNavCommandResponse(d);
+        }
+        return;
+    }
+
     if (cmd === 'start_slam') {
-        window.slamPendingStart = false;  // Clear pending flag
+        window.slamPendingStart = false;
 
         if (status === 'started') {
             addActivity('info', 'SLAM started successfully');
@@ -73,9 +83,9 @@ function handleCommandResponse(d) {
     } else if (cmd === 'stop_slam') {
         addActivity('info', 'SLAM stopped');
         window.isSlamActive = false;
-        // Clear map when SLAM is stopped
+        // P0-6 Fix: Only clear map when SLAM actually stops (not on every slam_state=false)
         if (window.mapRenderer) {
-            window.mapRenderer.hide();
+            window.mapRenderer.hide(true);
         }
         updateSlamUI();
         updateOpModeDisplay();
@@ -92,9 +102,9 @@ function handleCommandResponse(d) {
             }
         }
     } else if (cmd === 'teleop') {
-        // Teleop không cần feedback
+        // Teleop doesn't need feedback
     } else if (cmd === 'lift') {
-        // Lift không cần feedback
+        // Lift doesn't need feedback
     }
 }
 
@@ -149,9 +159,10 @@ function updateOpModeDisplay() {
             opModeEl.className = 'metric-value accent';
         }
         if (subModeEl) {
-            // TODO: lấy Auto/Manual từ backend navigation state
+            // Lấy Auto/Manual từ navigation.js hoặc backend
+            const opMode = window.currentOpMode || 'MANUAL';
             subModeEl.className = 'mode-badge nav';
-            subModeEl.innerHTML = '<span>Auto</span>';
+            subModeEl.innerHTML = `<span>${opMode}</span>`;
         }
     } else {
         // Reset về mặc định
@@ -165,3 +176,7 @@ function updateOpModeDisplay() {
         }
     }
 }
+
+// B06 Fix: Export updateOpModeDisplay cho ros_connection.js
+window.updateOpModeDisplay = updateOpModeDisplay;
+

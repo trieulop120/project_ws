@@ -224,7 +224,15 @@ def image_to_json(msg: Image, max_width: int = 480, quality: int = 60) -> dict:
 
 
 def laser_to_json(msg: LaserScan) -> dict:
-    """Convert LaserScan to application-level JSON for web visualization."""
+    """Convert LaserScan to application-level JSON for web visualization.
+    P1-8 Fix: Handle NaN values properly for valid JSON.
+    """
+    def clean_range(r):
+        """Clean range value: replace NaN/inf with None (JSON null)."""
+        if math.isnan(r) or math.isinf(r) or r < msg.range_min or r > msg.range_max:
+            return None
+        return round(r, 3)
+
     return {
         "type": "laser",
         "timestamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
@@ -234,5 +242,5 @@ def laser_to_json(msg: LaserScan) -> dict:
         "angle_increment": round(msg.angle_increment, 4),
         "range_min": round(msg.range_min, 3),
         "range_max": round(msg.range_max, 3),
-        "ranges": [round(r, 3) if not math.isinf(r) else msg.range_max for r in msg.ranges],
+        "ranges": [clean_range(r) for r in msg.ranges],
     }

@@ -46,6 +46,14 @@
     function onStartSlamClick() {
         console.log('[SLAM] Start clicked');
 
+        // Kiem tra Navigation dang chay khong - hien toast yeu cau tat Navigation truoc
+        if (window.isNavigationActive) {
+            if (typeof window.showToast === 'function') {
+                window.showToast('Please stop Navigation first to start SLAM', 'warn');
+            }
+            return;
+        }
+
         // 1. CLEAR old map data - start fresh for new SLAM
         window.mapData = null;
         window.mapImageData = null;

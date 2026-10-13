@@ -1,6 +1,6 @@
 function updatePose(d) {
     robotPose = d;
-    window.robotPose = d;  // Export to global so map.js can access
+    window.robotPose = d;  // Export to global for map.js and navigation.js
     const posX = document.getElementById('cardPosX');
     const posY = document.getElementById('cardPosY');
     const posYaw = document.getElementById('cardPosYaw');
@@ -15,7 +15,10 @@ function updatePose(d) {
         posYaw.classList.remove('muted');
     }
 
-    render();
+    // Phase 4 Fix: Update nav position display when pose arrives
+    if (typeof window.updateNavPosition === 'function') window.updateNavPosition();
+
+    if (typeof window.renderMap === 'function') window.renderMap();
     updateMapDisplay();
 }
 
@@ -41,38 +44,36 @@ function updateBattery(d) {
 }
 
 function updateMap(d) {
+    // B21 Fix: Không cập nhật map khi đang dừng navigation
+    if (!window.isSlamActive && !window.isNavigationActive) return;
+
     mapData = d;
     mapImageData = buildMapImageData();
     const n = document.getElementById('cardMapName');
-    if (n) {
-        // Phân biệt SLAM mode vs Navigation mode vs loaded map
-        const isSlamMode = window.isSlamActive === true;
-        const isNavMode = window.isNavigationActive === true;
-        n.textContent = isSlamMode ? 'SLAM Live' : isNavMode ? 'Navigation Live' : (d.frame_id || 'Active');
-        n.className = 'metric-value accent';
-    }
     const status = document.getElementById('cardMapStatus');
+
+    const isSlamMode = window.isSlamActive === true;
+
+    if (n) {
+        if (isSlamMode) {
+            n.textContent = 'SLAM Live';
+        } else {
+            // Lấy window.selectedNavMap nếu có, KHÔNG hiển thị "map" hoặc "map_01"
+            let mapId = window.selectedNavMap;
+            if (!mapId) {
+                mapId = (d.frame_id && d.frame_id !== 'map') ? d.frame_id : '--';
+            }
+            n.textContent = mapId;
+        }
+        n.className = 'metric-value' + (isSlamMode ? ' accent' : '');
+    }
+
     if (status) {
-        // Phân biệt SLAM mode vs Navigation mode vs loaded map
-        const isSlamMode = window.isSlamActive === true;
-        const isNavMode = window.isNavigationActive === true;
-        status.textContent = isSlamMode ? 'SLAM Live' : isNavMode ? 'Navigation Live' : 'Loaded';
+        status.textContent = isSlamMode ? 'SLAM Live' : 'Loaded';
     }
 
     updateMapDisplay();
-
-    // Only fitToView for Overview, not for SLAM mode (SLAM manages its own view)
-    if (!window.isSlamActive && !window.mapFitted) {
-        fitToView();
-        window.mapFitted = true;
-    }
-
-    // Update SLAM map renderer if SLAM is active
-    if (window.isSlamActive && window.mapRenderer) {
-        window.mapRenderer.updateMap(d);
-    }
-
-    addActivity('info', 'Map data received: ' + (d.frame_id || 'Unknown'));
+    if (typeof window.renderMap === 'function') window.renderMap();
 }
 
 function updateMapDisplay() {
@@ -80,22 +81,32 @@ function updateMapDisplay() {
     const ms = document.getElementById('mapStatusDisplay');
     const mn = document.getElementById('mapNameDisplay');
 
+    // B08 Fix: Không ghi đè map name khi Navigation đã stop
+    const isNavActive = window.isNavigationActive && window.selectedNavMap;
+
     if (mapData) {
         if (es) es.style.display = 'none';
         if (ms) {
             ms.textContent = isWsConnected ? 'Live' : 'Stale';
             ms.className = 'map-status' + (isWsConnected ? '' : ' stale');
         }
-        if (mn) mn.textContent = mapData.frame_id || 'Map';
+        // B07/B08 Fix: Chỉ hiển thị map ID khi có Navigation active hoặc SLAM
+        // KHÔNG hiển thị 'Map' khi Navigation đã stop
+        if (mn) {
+            if (window.isSlamActive) {
+                mn.textContent = window.selectedNavMap || mapData.frame_id || '--';
+            } else if (isNavActive) {
+                mn.textContent = window.selectedNavMap || '--';
+            }
+            // else: giữ nguyên text từ resetNavMapCard
+        }
     } else {
         if (es) es.style.display = 'flex';
         if (ms) {
             // Giữ nguyên text mặc định từ HTML "No map loaded"
             ms.className = 'map-status';
         }
-        if (mn) {
-            // Giữ nguyên text mặc định từ HTML "None"
-        }
+        // mapNameDisplay sẽ được reset bởi resetNavMapCard khi stop
     }
 }
 

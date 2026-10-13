@@ -46,7 +46,9 @@ class ESP32Bridge(Node):
         self.data_lock = threading.Lock()
 
         self.ser = None
-        self.connect_serial()
+        if not self.connect_serial():
+            self.get_logger().error('[FATAL] ESP32 Bridge startup FAILED. Serial not connected.')
+            # Tiếp tục chạy để có thể debug, nhưng serial commands sẽ không hoạt động
 
         # Publishers
         self.pub_imu = self.create_publisher(Imu, '/imu/data_raw', 10)
@@ -69,6 +71,10 @@ class ESP32Bridge(Node):
         self.last_er = 0
         self.first_run = True
         self.last_time = self.get_clock().now()
+
+        # (5) Lưu last commanded RPM để gửi liên tục mỗi 30Hz
+        self.last_rpm_left = 0.0
+        self.last_rpm_right = 0.0
 
         # Luồng đọc Serial riêng biệt
         threading.Thread(target=self.read_loop, daemon=True).start()
@@ -94,35 +100,97 @@ class ESP32Bridge(Node):
         return True
 
     def connect_serial(self):
-        try:
-            if not self.check_symlink_conflict():
-                self.get_logger().error('[FATAL] Xung đột Symlink USB!')
-                return
-            if not os.path.exists(self.port):
-                self.get_logger().error(f'[ERROR] Không tìm thấy cổng {self.port}!')
-                return
-            self.get_logger().info(f'Connecting to serial: {self.port}')
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
-            time.sleep(0.5)  # Chờ hardware ổn định
+        """Kết nối serial với ESP32, có retry và chờ ESP32 sẵn sàng."""
+        max_retries = 2
+        connected = False
 
-            # [FIXED] Gửi dummy command để sync ESP32 UART buffer
-            # Byte đầu tiên sau serial open có thể bị drop, gửi L0\nR0\n trước để flush/sync
-            self.get_logger().info('[UART Sync] Sending dummy commands to sync ESP32...')
-            self.ser.write(b'L0\nR0\n')
-            time.sleep(0.5)  # Đợi ESP32 xử lý
+        for attempt in range(max_retries + 1):
+            try:
+                # Kiểm tra symlink conflict
+                if not self.check_symlink_conflict():
+                    self.get_logger().error('[FATAL] Xung đột Symlink USB!')
+                    return False
 
-            # Đọc và discard buffer response từ ESP32
-            if self.ser.in_waiting > 0:
-                self.ser.read(self.ser.in_waiting)
-                self.get_logger().info('[UART Sync] Buffer flushed')
+                if not os.path.exists(self.port):
+                    self.get_logger().error(f'[ERROR] Không tìm thấy cổng {self.port}!')
+                    return False
 
-            self.get_logger().info('Serial connection established successfully. UART synced.')
-        except Exception as e:
-            self.get_logger().error(f'Serial connection failed: {e}')
+                self.get_logger().info(f'[Attempt {attempt + 1}] Connecting to serial: {self.port}')
+
+                # (1) Giữ timeout=0.1, không dùng 0
+                # (2) Tắt DTR/RTS TRƯỚC KHI open() để ESP32 không bị reset
+                self.ser = serial.Serial()
+                self.ser.port = self.port
+                self.ser.baudrate = self.baudrate
+                self.ser.timeout = 0.1
+                self.ser.dtr = False
+                self.ser.rts = False
+                self.ser.open()
+
+                self.get_logger().info('Serial port opened (DTR/RTS disabled)')
+
+                # (3) Chờ ESP32 báo sẵn sàng bằng cách đợi PKT telemetry
+                if self.wait_for_esp32_ready(timeout=10.0):
+                    # Sync buffer sau khi ESP32 sẵn sàng
+                    self.ser.write(b'L0\nR0\n')
+                    time.sleep(0.2)
+                    if self.ser.in_waiting > 0:
+                        self.ser.read(self.ser.in_waiting)
+
+                    self.get_logger().info('Serial connection established successfully.')
+                    connected = True
+                    break
+                else:
+                    # Hết timeout
+                    if attempt < max_retries:
+                        self.get_logger().warn(f'ESP32 timeout, retrying ({attempt + 1}/{max_retries})...')
+                        self.ser.close()
+                        time.sleep(1.0)
+                    else:
+                        self.get_logger().error(
+                            '[FATAL] ESP32 không phản hồi sau 2 retries (20s total). '
+                            'Kiểm tra: (1) ESP32 có đang chạy firmware đúng không, '
+                            '(2) baudrate có khớp không (115200), '
+                            '(3) TX/RX wiring có đúng không.'
+                        )
+                        self.ser.close()
+                        self.ser = None
+                        return False
+
+            except serial.SerialException as e:
+                if attempt < max_retries:
+                    self.get_logger().warn(f'Serial error: {e}, retrying ({attempt + 1}/{max_retries})...')
+                    time.sleep(1.0)
+                else:
+                    self.get_logger().error(f'[FATAL] Serial connection failed after {max_retries + 1} attempts: {e}')
+                    self.ser = None
+                    return False
+
+        return connected
+
+    def wait_for_esp32_ready(self, timeout=10.0):
+        """
+        (3) Chờ ESP32 gửi telemetry PKT,... làm tín hiệu sẵn sàng.
+        Đảm bảo read_loop chưa chạy (hoặc đã có dữ liệu) trước khi proceed.
+        """
+        start = time.time()
+        self.get_logger().info(f'Waiting for ESP32 ready signal (PKT,...) within {timeout}s...')
+
+        while time.time() - start < timeout:
+            if self.ser and self.ser.is_open and self.ser.in_waiting > 0:
+                data = self.ser.read(self.ser.in_waiting).decode('utf-8', errors='ignore')
+                if 'PKT,' in data:
+                    self.get_logger().info('ESP32 ready! Received telemetry PKT,')
+                    self.ser.reset_input_buffer()
+                    return True
+            time.sleep(0.05)  # Poll every 50ms
+
+        self.get_logger().warn('Timeout waiting for ESP32 PKT telemetry!')
+        return False
 
     def drive_cb(self, msg: Twist):
-        if not self.ser or not self.ser.is_open:
-            return
+        """(5) Chỉ lưu target RPM, KHÔNG gửi ngay.
+        Commands sẽ được gửi liên tục trong publish_loop_30hz."""
         vx, wz = msg.linear.x, msg.angular.z
         v_left = vx - wz * self.wheelbase / 2.0
         v_right = vx + wz * self.wheelbase / 2.0
@@ -130,12 +198,16 @@ class ESP32Bridge(Node):
         rpm_left = (v_left / (2.0 * math.pi * self.wheel_radius)) * 60.0
         rpm_right = (v_right / (2.0 * math.pi * self.wheel_radius)) * 60.0
 
-        rpm_left = max(min(rpm_left, self.max_rpm), -self.max_rpm)
-        rpm_right = max(min(rpm_right, self.max_rpm), -self.max_rpm)
+        self.last_rpm_left = max(min(rpm_left, self.max_rpm), -self.max_rpm)
+        self.last_rpm_right = max(min(rpm_right, self.max_rpm), -self.max_rpm)
 
+    def _send_drive_commands(self):
+        """Gửi lệnh L/R liên tục mỗi 30Hz (từ publish_loop)."""
+        if not self.ser or not self.ser.is_open:
+            return
         try:
-            self.ser.write(f"L{rpm_left:.2f}\n".encode('utf-8'))
-            self.ser.write(f"R{rpm_right:.2f}\n".encode('utf-8'))
+            self.ser.write(f"L{self.last_rpm_left:.2f}\n".encode('utf-8'))
+            self.ser.write(f"R{self.last_rpm_right:.2f}\n".encode('utf-8'))
         except Exception as e:
             self.get_logger().error(f'Failed to send drive cmd: {e}')
 
@@ -208,6 +280,9 @@ class ESP32Bridge(Node):
         if dt_sec <= 0:
             dt_sec = 0.033
         self.last_time = now_time
+
+        # (5) Gửi lệnh drive liên tục mỗi 30Hz (kể cả khi cmd_vel không đổi)
+        self._send_drive_commands()
 
         with self.data_lock:
             el = self.curr_el

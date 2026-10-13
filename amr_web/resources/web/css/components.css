@@ -2000,6 +2000,17 @@
   pointer-events: none;
 }
 
+#navMapTools .map-btn.active {
+  background: var(--accent);
+  color: #000;
+  border-color: var(--accent);
+}
+
+/* Canvas crosshair when tool is active */
+.canvas-crosshair {
+  cursor: crosshair !important;
+}
+
 /* --- 4. Cột Phải: Camera, Missions & AI --- */
 .camera-viewport-small {
   width: 100%;
