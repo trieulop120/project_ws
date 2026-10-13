@@ -107,39 +107,30 @@
         return img;
     }
 
-    // B04 Fix: worldToCanvas - PGM top-down, OccupancyGrid bottom-up (flip Y)
+    // B04 Fix: worldToCanvas - chuan hoa top-down: y tang = di len = canvasY giam
+    // buildMapImageData() da flip OccupancyGrid, nen chi can 1 cong thuc cho ca hai
     function worldToCanvas(wx, wy) {
         if (!window.mapData) return { x: 0, y: 0 };
         const { info } = window.mapData;
-        const { width, height, resolution: res, origin } = info;
-        const is_pgm_raw = window.mapData.is_pgm_raw;
-
-        const cellX = (wx - origin.x) / res;
-        // B04 Fix: PGM row 0 = trên (origin ở dưới-trái), OccupancyGrid row 0 = dưới (flip)
-        const cellY = is_pgm_raw
-            ? (wy - origin.y) / res                          // PGM: tăng theo world Y
-            : (height - 1) - (wy - origin.y) / res;          // OccupancyGrid: flip
-
-        return { x: cellX, y: cellY };
+        return {
+            x: (wx - info.origin.x) / info.resolution,
+            // origin thuong o duoi-trai, wy tang = di len trong the gioi
+            // tren canvas top-down, di len = canvasY giam
+            y: info.height - (wy - info.origin.y) / info.resolution
+        };
     }
 
-    // B04 Fix: canvasToWorld - reverse of worldToCanvas
+    // B04 Fix: canvasToWorld - reverse cua worldToCanvas
     function canvasToWorld(px, py) {
         if (!window.mapData) return null;
         const { info } = window.mapData;
-        const { width, height, resolution: res, origin } = info;
-        const is_pgm_raw = window.mapData.is_pgm_raw;
         const vt = getActiveViewTransform();
         const cellX = (px - vt.x) / vt.scale;
         const cellY = (py - vt.y) / vt.scale;
-
-        // Reverse: world = origin + cell * res (hoặc reverse flip)
-        const worldX = origin.x + cellX * res;
-        const worldY = is_pgm_raw
-            ? origin.y + cellY * res                          // PGM
-            : origin.y + (height - 1 - cellY) * res;           // OccupancyGrid: reverse flip
-
-        return { x: worldX, y: worldY };
+        return {
+            x: info.origin.x + cellX * info.resolution,
+            y: info.origin.y + (info.height - cellY) * info.resolution
+        };
     }
     window.canvasToWorld = canvasToWorld;
 
