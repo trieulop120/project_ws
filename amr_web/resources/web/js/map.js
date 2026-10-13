@@ -293,8 +293,74 @@
         ctx.restore();
     }
 
-    // P0-6 Fix: Draw drag preview for nav tools
+    // P0-6 Fix: Draw preview for nav tools (RVIZ-style)
     function drawDragPreview() {
+        // Check for tool pending from navigation.js
+        const toolPending = window.toolPending;
+        const toolPendingX = window.toolPendingX;
+        const toolPendingY = window.toolPendingY;
+        const toolPendingYaw = window.toolPendingYaw;
+
+        if (toolPending && window.currentViewport === 'navigation') {
+            // RVIZ-style preview: crosshair + arrow (scaled with zoom)
+            const vt = getActiveViewTransform();
+            const p0 = worldToCanvas(toolPendingX, toolPendingY);
+            const color = toolPending === 'pose' ? '#FFA500' : '#10B981';
+
+            ctx.save();
+
+            // Scale with zoom for consistent visual size
+            const scale = vt.scale;
+
+            // Crosshair
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1.5 / scale;
+            const crossSize = 10 / scale;
+            ctx.beginPath();
+            ctx.moveTo(p0.x - crossSize, p0.y);
+            ctx.lineTo(p0.x + crossSize, p0.y);
+            ctx.moveTo(p0.x, p0.y - crossSize);
+            ctx.lineTo(p0.x, p0.y + crossSize);
+            ctx.stroke();
+
+            // Arrow showing yaw (scaled)
+            const arrowLen = 30 / scale;
+            const endX = p0.x + Math.cos(toolPendingYaw) * arrowLen;
+            const endY = p0.y - Math.sin(toolPendingYaw) * arrowLen;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2 / scale;
+            ctx.beginPath();
+            ctx.moveTo(p0.x, p0.y);
+            ctx.lineTo(endX, endY);
+            ctx.stroke();
+
+            // Arrowhead
+            const arrowHeadSize = 6 / scale;
+            const angle = Math.atan2(p0.y - endY, endX - p0.x);
+            ctx.beginPath();
+            ctx.moveTo(endX, endY);
+            ctx.lineTo(endX - arrowHeadSize * Math.cos(angle - Math.PI / 6),
+                      endY + arrowHeadSize * Math.sin(angle - Math.PI / 6));
+            ctx.lineTo(endX - arrowHeadSize * Math.cos(angle + Math.PI / 6),
+                      endY + arrowHeadSize * Math.sin(angle + Math.PI / 6));
+            ctx.closePath();
+            ctx.fillStyle = color;
+            ctx.fill();
+
+            // Yaw label (only show when zoomed in enough)
+            if (scale > 10) {
+                const yawDeg = (toolPendingYaw * 180 / Math.PI).toFixed(1);
+                ctx.fillStyle = color;
+                ctx.font = `${12 / scale}px sans-serif`;
+                ctx.textAlign = 'left';
+                ctx.fillText(`Yaw: ${yawDeg}°`, p0.x + crossSize + 5 / scale, p0.y + 4 / scale);
+            }
+
+            ctx.restore();
+            return;
+        }
+
+        // Legacy drag preview (for backward compatibility)
         const st = window.navDragState;
         if (!st || !st.isDragging || window.currentViewport !== 'navigation') return;
         const vt = getActiveViewTransform();

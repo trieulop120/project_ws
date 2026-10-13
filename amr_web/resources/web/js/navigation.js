@@ -21,6 +21,20 @@
     let pendingGoalName = '';
     let mapReqTimer = null;
 
+    // Tool state (RVIZ-style: click to place, move to aim, click/Enter to confirm, ESC to cancel)
+    let toolPending = null;      // 'pose' or 'goal' when aiming
+    let toolPendingX = 0;        // world X of placement
+    let toolPendingY = 0;        // world Y of placement
+    let toolPendingYaw = 0;      // yaw from mouse direction
+    let toolPendingMouseX = 0;   // screen X when placed
+    let toolPendingMouseY = 0;   // screen Y when placed
+    let toolPositionSet = false; // true after first click sets position
+    // Export for map.js preview
+    window.toolPending = null;
+    window.toolPendingX = 0;
+    window.toolPendingY = 0;
+    window.toolPendingYaw = 0;
+
     // Alias for internal use
     let currentOpMode = window.currentOpMode;
 
@@ -204,7 +218,7 @@
                 statusMsg.style.background = 'rgba(16, 185, 129, 0.15)';
                 statusMsg.style.color = '#10B981';
                 statusMsg.style.border = '1px solid #10B981';
-                statusMsg.textContent = `Đã chọn tự động Route: "${routeInfo.id}"`;
+                statusMsg.textContent = `Auto-selected route: "${routeInfo.id}"`;
             }
             if (navModalConfirm) navModalConfirm.disabled = false;
         } else {
@@ -258,7 +272,7 @@
                 statusMsg.style.background = 'rgba(16, 185, 129, 0.15)';
                 statusMsg.style.color = '#10B981';
                 statusMsg.style.border = '1px solid #10B981';
-                statusMsg.textContent = `Route thuộc Map: "${linkedMapId}". Đã tự động chọn Map!`;
+                statusMsg.textContent = `Route belongs to map: "${linkedMapId}". Auto-selected map!`;
             }
             if (navModalConfirm) navModalConfirm.disabled = false;
         }
@@ -564,11 +578,10 @@
         toolSetGoal?.classList.toggle('active', tool === 'goal');
         const c = document.getElementById('mapCanvas');
         if (c) c.style.cursor = tool ? 'crosshair' : 'grab';
-        showNavOverlayMsg(tool ? `Nhấn &amp; kéo trên bản đồ để đặt ${tool === 'pose' ? 'Initial Pose' : 'Nav Goal'}` : '');
     }
 
     function selectTool(tool) {
-        console.debug('[NAVTOOL] selectTool:', tool, 'activeTool:', activeTool, 'isNavActive:', window.isNavigationActive, 'opMode:', currentOpMode);
+        console.debug('[NAVTOOL] selectTool:', tool, 'toolPending:', toolPending);
         if (!window.isNavigationActive) {
             if (typeof window.showToast === 'function') window.showToast('Start Navigation first', 'warn');
             return;
@@ -577,7 +590,35 @@
             if (typeof window.showToast === 'function') window.showToast('Switch to MANUAL mode to use tools', 'warn');
             return;
         }
-        setActiveTool(activeTool === tool ? null : tool);
+        // Toggle: click same tool to cancel
+        if (toolPending === tool) {
+            cancelToolPending();
+            return;
+        }
+        toolPending = tool;
+        toolPositionSet = false;  // Reset position flag
+        // Do NOT set toolPendingX/Y yet - wait for first click on map
+        // Export for map.js - only set when actually placing
+        window.toolPending = null;  // Don't show preview until click on map
+        window.toolPendingX = 0;
+        window.toolPendingY = 0;
+        window.toolPendingYaw = 0;
+        setActiveTool(tool);
+    }
+
+    function cancelToolPending() {
+        toolPending = null;
+        toolPositionSet = false;
+        toolPendingX = 0;
+        toolPendingY = 0;
+        toolPendingYaw = 0;
+        // Clear window vars
+        window.toolPending = null;
+        window.toolPendingX = 0;
+        window.toolPendingY = 0;
+        window.toolPendingYaw = 0;
+        showNavOverlayMsg('');
+        setActiveTool(null);
     }
 
     function toggleRouteVisibility() {
@@ -711,60 +752,86 @@
     }
 
     function onPointerDown(e) {
-        console.debug('[NAVTOOL] onPointerDown:', { activeTool, isNavActive: window.isNavigationActive, opMode: currentOpMode, target: e.target.id, mapData: !!window.mapData });
-        if (!activeTool || !window.isNavigationActive || currentOpMode !== 'MANUAL') return;
-        const p = canvasXY(e);
-        const w = window.canvasToWorld ? window.canvasToWorld(p.x, p.y) : null;
+        console.debug('[NAVTOOL] onPointerDown:', { toolPending, toolPositionSet, isNavActive: window.isNavigationActive });
+        if (!toolPending || !window.isNavigationActive || currentOpMode !== 'MANUAL') return;
+
+        const w = window.canvasToWorld ? window.canvasToWorld(e.offsetX, e.offsetY) : null;
         if (!w) {
             if (typeof window.showToast === 'function') window.showToast('No map available', 'warn');
             return;
         }
         e.preventDefault();
         e.stopPropagation();
-        navViewport?.setPointerCapture(e.pointerId);
-        Object.assign(window.navDragState, {
-            isDragging: true, startX: p.x, startY: p.y, currentX: p.x, currentY: p.y,
-            startMapX: w.x, startMapY: w.y, yaw: 0, tool: activeTool
-        });
-        showNavOverlayMsg('Thả chuột để xác nhận – Esc để huỷ');
+
+        if (!toolPositionSet) {
+            // First click: set position and start aiming
+            toolPendingX = w.x;
+            toolPendingY = w.y;
+            toolPendingMouseX = e.clientX;
+            toolPendingMouseY = e.clientY;
+            toolPositionSet = true;
+            showNavOverlayMsg(`${toolPending === 'pose' ? 'Initial Pose' : 'Nav Goal'}: Move mouse to aim, click to confirm, ESC to cancel`);
+        }
+        // Export for map.js preview
+        window.toolPending = toolPending;
+        window.toolPendingX = toolPendingX;
+        window.toolPendingY = toolPendingY;
+        window.toolPendingYaw = toolPendingYaw;
+
         if (typeof window.renderMap === 'function') window.renderMap();
     }
 
     function onPointerMove(e) {
-        if (!window.navDragState.isDragging) return;
-        const p = canvasXY(e);
-        window.navDragState.currentX = p.x;
-        window.navDragState.currentY = p.y;
-        const dx = p.x - window.navDragState.startX;
-        const dy = p.y - window.navDragState.startY;
-        if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
-            window.navDragState.yaw = Math.atan2(-dy, dx);
-            console.debug('[NAVTOOL] yaw updated:', window.navDragState.yaw, 'rad =', (window.navDragState.yaw * 180 / Math.PI).toFixed(1), 'deg');
+        if (!toolPending || !toolPositionSet) return;
+
+        // Calculate yaw from direction from click position to current mouse position
+        const dx = e.clientX - toolPendingMouseX;
+        const dy = e.clientY - toolPendingMouseY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        // Only update yaw if moved enough (threshold: 5px)
+        if (dist > 5) {
+            // Top-down view: negate dy for intuitive direction
+            toolPendingYaw = Math.atan2(-dy, dx);
+            window.toolPendingYaw = toolPendingYaw;
         }
         if (typeof window.renderMap === 'function') window.renderMap();
     }
 
     function onPointerUp(e) {
-        console.debug('[NAVTOOL] onPointerUp:', { isDragging: window.navDragState.isDragging, tool: window.navDragState.tool });
-        if (!window.navDragState.isDragging) return;
-        window.navDragState.isDragging = false;
-        try { navViewport?.releasePointerCapture(e.pointerId); } catch (_) {}
+        console.debug('[NAVTOOL] onPointerUp:', { toolPending, toolPositionSet });
+        if (!toolPending || !toolPositionSet) return;
 
+        // Second click: confirm and send
+        const tool = toolPending;
         const pose = {
-            x: window.navDragState.startMapX,
-            y: window.navDragState.startMapY,
-            yaw: window.navDragState.yaw
+            x: toolPendingX,
+            y: toolPendingY,
+            yaw: toolPendingYaw
         };
-        const tool = window.navDragState.tool;
         console.debug('[NAVTOOL] Sending:', tool, pose);
+
+        // Reset state
+        toolPending = null;
+        toolPositionSet = false;
+        toolPendingX = 0;
+        toolPendingY = 0;
+        toolPendingYaw = 0;
+        window.toolPending = null;
+        window.toolPendingX = 0;
+        window.toolPendingY = 0;
+        window.toolPendingYaw = 0;
+        showNavOverlayMsg('');
+
+        // Turn off tool
         setActiveTool(null);
 
+        // Send command
         if (tool === 'pose') {
             if (typeof sendCommand === 'function') sendCommand({ command: 'set_initial_pose', pose });
         } else if (tool === 'goal') {
             sendNavGoal(pose);
         }
-        if (typeof window.renderMap === 'function') window.renderMap();
     }
 
     function cancelDrag() {
@@ -1118,6 +1185,36 @@
         toolSetGoal?.addEventListener('click', () => selectTool('goal'));
         toolToggleRoute?.addEventListener('click', toggleRouteVisibility);
         toolCenterMap?.addEventListener('click', centerMapOnRobot);
+
+        // Keyboard: ESC to cancel, Enter to confirm tool
+        document.addEventListener('keydown', (e) => {
+            if (!toolPending) return;
+            if (e.key === 'Escape') {
+                cancelToolPending();
+            } else if (e.key === 'Enter' && toolPositionSet) {
+                const tool = toolPending;
+                const pose = { x: toolPendingX, y: toolPendingY, yaw: toolPendingYaw };
+                // Reset state
+                toolPending = null;
+                toolPositionSet = false;
+                toolPendingX = 0;
+                toolPendingY = 0;
+                toolPendingYaw = 0;
+                window.toolPending = null;
+                window.toolPendingX = 0;
+                window.toolPendingY = 0;
+                window.toolPendingYaw = 0;
+                showNavOverlayMsg('');
+                // Turn off tool
+                setActiveTool(null);
+                // Send
+                if (tool === 'pose') {
+                    if (typeof sendCommand === 'function') sendCommand({ command: 'set_initial_pose', pose });
+                } else if (tool === 'goal') {
+                    sendNavGoal(pose);
+                }
+            }
+        });
 
         // Pointer events on nav viewport (Phase 4 Fix)
         navViewport?.addEventListener('pointerdown', onPointerDown);

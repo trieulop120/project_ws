@@ -721,21 +721,29 @@ class NavBridge:
             msg.pose.pose.position.y = float(pose.get('y', 0.0))
             msg.pose.pose.position.z = 0.0
 
-            yaw = float(pose.get('yaw', 0.0))
+            # Ensure yaw is a valid float
+            yaw_raw = pose.get('yaw', 0.0)
+            try:
+                yaw = float(yaw_raw)
+                if not (-3.14159 <= yaw <= 3.14159):
+                    yaw = 0.0  # Clamp invalid yaw
+            except (ValueError, TypeError):
+                yaw = 0.0
             q = self._yaw_to_quaternion(yaw)
             msg.pose.pose.orientation.x = q[0]
             msg.pose.pose.orientation.y = q[1]
             msg.pose.pose.orientation.z = q[2]
             msg.pose.pose.orientation.w = q[3]
 
-            msg.pose.covariance = [
-                0.25, 0, 0, 0, 0, 0,
-                0, 0.25, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0.130
-            ]
+            # Covariance as tuple for ROS2 compatibility
+            msg.pose.covariance = tuple([
+                0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.130
+            ])
 
             self._init_pose_pub.publish(msg)
             self._logger.info(f'Initial pose set: ({pose.get("x", 0):.2f}, {pose.get("y", 0):.2f})') if self._logger else None

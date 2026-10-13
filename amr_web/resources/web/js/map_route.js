@@ -62,6 +62,10 @@
     let edgeStartNodeIdx = null;
     let pendingMousePos = null;
 
+    // Add node state (RVIZ-style: click to place, move to aim, click to confirm, ESC to cancel)
+    let addNodePending = null;     // { x, y } world position when placing
+    let addNodeMouseYaw = 0;      // yaw calculated from mouse direction
+
     // Map data
     let currentMapImage = null;
     let currentMapInfo = null;
@@ -202,7 +206,21 @@
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top;
 
+            // Calculate yaw from mouse direction when adding node (aiming)
+            if (addNodePending !== null) {
+                const rect = routeCanvas.getBoundingClientRect();
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+                const dx = e.clientX - centerX;
+                const dy = e.clientY - centerY;
+                // Yaw follows mouse direction from center of canvas
+                addNodeMouseYaw = Math.atan2(-dy, dx);
+                renderCanvas();
+                return;  // Don't pan canvas while aiming
+            }
+
             if (isDragging) {
+                // Canvas pan
                 const dx = e.clientX - lastMouseX;
                 const dy = e.clientY - lastMouseY;
                 canvasOffsetX += dx;
@@ -231,15 +249,47 @@
 
         routeCanvas.addEventListener('click', (e) => {
             if (currentTool !== 'addNode' || !selectedRouteId) return;
-            if (isDragging) return;
 
             const rect = routeCanvas.getBoundingClientRect();
             const clickX = e.clientX - rect.left;
             const clickY = e.clientY - rect.top;
 
             const clickedNodeIdx = getNodeAtScreenPosition(clickX, clickY);
-            if (clickedNodeIdx === null) {
-                addNodeAtPosition(clickX, clickY);
+
+            if (addNodePending !== null) {
+                // Second click: confirm node with current yaw
+                if (clickedNodeIdx === null) {
+                    addNodeAtPosition(addNodePending.x, addNodePending.y, addNodeMouseYaw);
+                }
+                addNodePending = null;
+                addNodeMouseYaw = 0;
+                routeCanvas.style.cursor = 'crosshair';
+                return;
+            }
+
+            if (isDragging || clickedNodeIdx !== null) return;  // Skip if dragging or clicked on node
+
+            // First click: set position and start aiming
+            const worldPos = screenToWorld(clickX, clickY);
+            addNodePending = { x: worldPos.x, y: worldPos.y };
+            addNodeMouseYaw = 0;
+            routeCanvas.style.cursor = 'crosshair';
+        });
+
+        // ESC to cancel add node, Enter to confirm
+        document.addEventListener('keydown', (e) => {
+            if (addNodePending !== null) {
+                if (e.key === 'Escape') {
+                    addNodePending = null;
+                    addNodeMouseYaw = 0;
+                    routeCanvas.style.cursor = 'crosshair';
+                    renderCanvas();
+                } else if (e.key === 'Enter') {
+                    addNodeAtPosition(addNodePending.x, addNodePending.y, addNodeMouseYaw);
+                    addNodePending = null;
+                    addNodeMouseYaw = 0;
+                    routeCanvas.style.cursor = 'crosshair';
+                }
             }
         });
 
@@ -344,8 +394,8 @@
         return null;
     }
 
-    function addNodeAtPosition(screenX, screenY) {
-        const world = screenToWorld(screenX, screenY);
+    function addNodeAtPosition(worldX, worldY, yaw = 0) {
+        // worldX, worldY are already in world coordinates
 
         let maxJIndex = 0;
         currentRoute.nodes.forEach(node => {
@@ -360,8 +410,8 @@
 
         const newNode = {
             name: nextJName,
-            position: { x: parseFloat(world.x.toFixed(2)), y: parseFloat(world.y.toFixed(2)), z: 0 },
-            orientation: { yaw: 0 },
+            position: { x: parseFloat(worldX.toFixed(2)), y: parseFloat(worldY.toFixed(2)), z: 0 },
+            orientation: { yaw: yaw },  // RVIZ-style yaw from drag direction
             type: 'transit',
             floor: 1,
             description: '',
@@ -554,7 +604,7 @@
                      data-node-idx="${idx}">
                     <span class="node-id">${idx}</span>
                     <span class="node-name">${node.name}</span>
-                    <span class="node-pos">${node.position.x.toFixed(1)}, ${node.position.y.toFixed(1)},${(node.orientation.yaw * 180 / Math.PI).toFixed(1)}°</span>
+                    <span class="node-pos">${node.position.x.toFixed(2)}, ${node.position.y.toFixed(2)}, ${(node.orientation.yaw * 180 / Math.PI).toFixed(2)}°</span>
                     <span class="node-type">${node.type.replace('_', ' ')}</span>
                 </div>
             `).join('')}
@@ -604,15 +654,15 @@
                 <div class="edit-row">
                     <div class="edit-col">
                         <label>X</label>
-                        <input type="number" class="edit-input edit-center" id="editNodeX" value="${node.position.x.toFixed(1)}" step="0.1">
+                        <input type="number" class="edit-input edit-center" id="editNodeX" value="${node.position.x.toFixed(2)}" step="0.01">
                     </div>
                     <div class="edit-col">
                         <label>Y</label>
-                        <input type="number" class="edit-input edit-center" id="editNodeY" value="${node.position.y.toFixed(1)}" step="0.1">
+                        <input type="number" class="edit-input edit-center" id="editNodeY" value="${node.position.y.toFixed(2)}" step="0.01">
                     </div>
                     <div class="edit-col">
                         <label>YAW</label>
-                        <input type="number" class="edit-input edit-center" id="editNodeYaw" value="${(node.orientation.yaw * 180 / Math.PI).toFixed(1)}" step="0.1">
+                        <input type="number" class="edit-input edit-center" id="editNodeYaw" value="${(node.orientation.yaw * 180 / Math.PI).toFixed(2)}" step="0.01">
                     </div>
                 </div>
             </div>
@@ -1011,6 +1061,53 @@
                     ctx.stroke();
                     ctx.setLineDash([]);
                 }
+            }
+
+            // Add Node preview (RVIZ-style: crosshair + yaw arrow)
+            if (addNodePending !== null && currentTool === 'addNode') {
+                const nodePos = worldToScreen(addNodePending.x, addNodePending.y);
+
+                // Crosshair at click position
+                ctx.strokeStyle = '#22c55e';
+                ctx.lineWidth = 1.5;
+                const crossSize = 12;
+                ctx.beginPath();
+                ctx.moveTo(nodePos.x - crossSize, nodePos.y);
+                ctx.lineTo(nodePos.x + crossSize, nodePos.y);
+                ctx.moveTo(nodePos.x, nodePos.y - crossSize);
+                ctx.lineTo(nodePos.x, nodePos.y + crossSize);
+                ctx.stroke();
+
+                // Arrow showing yaw direction
+                const arrowLen = 40;
+                const endX = nodePos.x + Math.cos(addNodeMouseYaw) * arrowLen;
+                const endY = nodePos.y - Math.sin(addNodeMouseYaw) * arrowLen;
+                ctx.strokeStyle = '#22c55e';
+                ctx.lineWidth = 2.5;
+                ctx.beginPath();
+                ctx.moveTo(nodePos.x, nodePos.y);
+                ctx.lineTo(endX, endY);
+                ctx.stroke();
+
+                // Arrowhead
+                const arrowHeadSize = 8;
+                const angle = Math.atan2(nodePos.y - endY, endX - nodePos.x);
+                ctx.beginPath();
+                ctx.moveTo(endX, endY);
+                ctx.lineTo(endX - arrowHeadSize * Math.cos(angle - Math.PI / 6),
+                          endY + arrowHeadSize * Math.sin(angle - Math.PI / 6));
+                ctx.lineTo(endX - arrowHeadSize * Math.cos(angle + Math.PI / 6),
+                          endY + arrowHeadSize * Math.sin(angle + Math.PI / 6));
+                ctx.closePath();
+                ctx.fillStyle = '#22c55e';
+                ctx.fill();
+
+                // Yaw label
+                const yawDeg = (addNodeMouseYaw * 180 / Math.PI).toFixed(1);
+                ctx.fillStyle = '#22c55e';
+                ctx.font = '12px sans-serif';
+                ctx.textAlign = 'left';
+                ctx.fillText(`Yaw: ${yawDeg}°`, nodePos.x + crossSize + 5, nodePos.y + 4);
             }
 
             // 3. Vẽ Nodes
