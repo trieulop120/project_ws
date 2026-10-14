@@ -10,6 +10,7 @@ ROS 2 Entry Point Node - Optimized for Overview Dashboard
 """
 
 import asyncio
+import copy
 import json
 import math
 import os
@@ -17,11 +18,12 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 from ament_index_python.packages import get_package_share_directory
 
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from nav_msgs.msg import Odometry, OccupancyGrid
 from sensor_msgs.msg import BatteryState, Image, LaserScan, JointState
@@ -29,9 +31,12 @@ from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 import uvicorn
 
+# Phase B05: tf2_ros for pose re-frame (odom -> map)
+from tf2_ros import Buffer, TransformListener
+
 from amr_web.websocket_manager import WebSocketManager
 from amr_web.state_bridge import StateBridge
-from amr_web.converters import odom_to_json, map_to_json, laser_to_json, image_to_json
+from amr_web.converters import odom_to_json, map_to_json, laser_to_json, image_to_json, quaternion_to_yaw
 from amr_web.web_server import create_app
 from amr_web.nav_bridge import NavBridge
 
@@ -66,6 +71,9 @@ class WebBridge(Node):
         self.declare_parameter('lidar_topic', '/scan_filtered')
         self.declare_parameter('joint_topic', '/joint_states')
         self.declare_parameter('pose_rate', 5.0)
+        # Phase B05: frames for tf lookup (map -> base)
+        self.declare_parameter('base_frame', 'base_footprint')
+        self.declare_parameter('map_frame', 'map')
         self.declare_parameter('battery_rate', 1.0)
         self.declare_parameter('system_status_rate', 1.0)
         self.declare_parameter('map_on_change', True)
@@ -81,6 +89,8 @@ class WebBridge(Node):
         self._lidar_topic = self.get_parameter('lidar_topic').value
         self._joint_topic = self.get_parameter('joint_topic').value
         self._pose_rate = self.get_parameter('pose_rate').value
+        self._base_frame = self.get_parameter('base_frame').value
+        self._map_frame = self.get_parameter('map_frame').value
         self._battery_rate = self.get_parameter('battery_rate').value
         self._system_status_rate = self.get_parameter('system_status_rate').value
         self._map_on_change = self.get_parameter('map_on_change').value
@@ -106,13 +116,35 @@ class WebBridge(Node):
         # Navigation Bridge (Nav2 Action Client)
         self._nav_bridge: Optional[NavBridge] = None
 
+        # Callback groups tach rieng: mac dinh moi callback cua node nam chung 1 nhom
+        # MutuallyExclusive -> chi chay tung cai mot, map/camera nang se lam doi
+        # pose/laser/heartbeat/timer. Tach nhom de 4 thread cua executor chay song song.
+        self._cb_sensor = MutuallyExclusiveCallbackGroup()
+        self._cb_map = MutuallyExclusiveCallbackGroup()
+        self._cb_cam = MutuallyExclusiveCallbackGroup()
+
+        # Phase B05: tf2_ros buffer + listener for pose re-frame
+        # spin_thread=True: /tf (tan so cao khi Nav2 chay) duoc xu ly o thread rieng,
+        # khong tranh voi callback cua node nay.
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=True)
+        self._last_map_pose_t = 0.0   # timestamp of last successful map-frame pose
+        self._map_pose_logged = False  # log once when first map pose acquired
+        # Bản pose odom THÔ (chưa đổi khung). Chỉ _on_pose được ghi vào đây,
+        # tuyệt đối không đọc lại từ state_bridge (vì state_bridge có thể đang chứa map pose).
+        self._last_odom_pose: Optional[dict] = None
+        # Timer cung nhip pose_rate (5 Hz), goi _tf_lookup_timer de lay TF map <- base
+        self._tf_lookup_timer_obj = self.create_timer(
+            1.0 / max(self._pose_rate, 0.1), self._tf_lookup_timer)
+
         # Publishers cho teleop và lift
         self._cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self._esp32_cmd_pub = self.create_publisher(String, '/esp32_cmd', 10)
 
         # Laser scan subscription
         self._laser_sub = self.create_subscription(
-            LaserScan, self._lidar_topic, self._on_laser, qos_profile=sensor_qos())
+            LaserScan, self._lidar_topic, self._on_laser, qos_profile=sensor_qos(),
+            callback_group=self._cb_sensor)
 
         # FastAPI Server Setup
         self._app = create_app(
@@ -124,9 +156,11 @@ class WebBridge(Node):
 
         # ROS Subscriptions
         self._pose_sub = self.create_subscription(
-            Odometry, self._pose_topic, self._on_pose, qos_profile=sensor_qos())
+            Odometry, self._pose_topic, self._on_pose, qos_profile=sensor_qos(),
+            callback_group=self._cb_sensor)
         self._battery_sub = self.create_subscription(
-            BatteryState, self._battery_topic, self._on_battery, qos_profile=sensor_qos())
+            BatteryState, self._battery_topic, self._on_battery, qos_profile=sensor_qos(),
+            callback_group=self._cb_sensor)
         # P0-5 Fix: Map QoS - TRANSIENT_LOCAL for reliable map delivery
         map_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -135,15 +169,20 @@ class WebBridge(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL
         )
         self._map_sub = self.create_subscription(
-            OccupancyGrid, self._map_topic, self._on_map, qos_profile=map_qos)
+            OccupancyGrid, self._map_topic, self._on_map, qos_profile=map_qos,
+            callback_group=self._cb_map)
         self._camera_sub = self.create_subscription(
-            Image, self._camera_topic, self._on_camera_rgb, qos_profile=sensor_qos())
+            Image, self._camera_topic, self._on_camera_rgb, qos_profile=sensor_qos(),
+            callback_group=self._cb_cam)
         self._depth_camera_sub = self.create_subscription(
-            Image, self._depth_camera_topic, self._on_camera_depth, qos_profile=sensor_qos())
+            Image, self._depth_camera_topic, self._on_camera_depth, qos_profile=sensor_qos(),
+            callback_group=self._cb_cam)
         self._lidar_sub = self.create_subscription(
-            LaserScan, self._lidar_topic, self._on_lidar, qos_profile=sensor_qos())
+            LaserScan, self._lidar_topic, self._on_lidar, qos_profile=sensor_qos(),
+            callback_group=self._cb_sensor)
         self._joint_sub = self.create_subscription(
-            JointState, self._joint_topic, self._on_joint, qos_profile=10)
+            JointState, self._joint_topic, self._on_joint, qos_profile=10,
+            callback_group=self._cb_sensor)
 
         # Threading
         self._running = True
@@ -161,6 +200,7 @@ class WebBridge(Node):
         self._last_battery_send = 0.0
         self._last_system_status_send = 0.0
         self._last_laser_send = 0.0
+        self._last_laser_convert = 0.0
         self._last_map_send = 0.0
         self._map_interval = 0.5  # 2 Hz for map broadcast
         self._map_pending = False
@@ -275,6 +315,8 @@ class WebBridge(Node):
             except Exception as e:
                 if self._verbose:
                     self.get_logger().error(f'Broadcast tick error: {e}')
+                # Tranh vong lap busy khong nhuong event loop khi loi lap lai
+                await asyncio.sleep(0.5)
 
     async def _broadcast_nav_state(self, message: str) -> None:
         """Callback để broadcast navigation state qua WebSocket (legacy compatibility)."""
@@ -307,13 +349,41 @@ class WebBridge(Node):
     def _on_camera_depth(self, msg: Image) -> None:
         self._process_and_broadcast_cam(msg, 'depth')
 
+    def _lookup_map_tf(self, frame_id: str) -> Optional[Tuple[float, float, float]]:
+        """Phase B05: tra TF map_frame -> frame_id. Tra ve (x, y, yaw) hoac None neu loi.
+
+        Voi frame_id = base_frame (base_footprint) ket qua CHINH LA pose cua robot
+        trong khung map (AMCL: map->odom, EKF: odom->base_footprint, tf2 tu noi chuoi).
+        Khong block callback (lookup_transform tra exception khi TF chua san sang).
+        """
+        if frame_id == self._map_frame:
+            return (0.0, 0.0, 0.0)
+        try:
+            t = self._tf_buffer.lookup_transform(
+                self._map_frame, frame_id, rclpy.time.Time())
+        except Exception:
+            return None
+        q = t.transform.rotation
+        p = t.transform.translation
+        tyaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
+        return (p.x, p.y, tyaw)
+
     def _on_pose(self, msg: Odometry) -> None:
         try:
             pose_data = odom_to_json(msg)
-            self._state_bridge.update_pose(pose_data)
+            # Luon luu ban odom tho de timer B05 dung lam "khuon" (giu nguyen
+            # cac field phu nhu van toc), khong doc lai tu state_bridge.
+            self._last_odom_pose = pose_data
         except Exception as e:
             if self._verbose:
                 self.get_logger().warn(f'Pose error: {e}')
+            return
+
+        # Phase B05: neu pose theo khung map vua duoc publish gan day
+        # (tu timer tf_lookup) thi khong ghi de bang pose odom.
+        if time.time() - self._last_map_pose_t < 1.0:
+            return
+        self._state_bridge.update_pose(pose_data)
 
     def _on_battery(self, msg: BatteryState) -> None:
         try:
@@ -348,6 +418,11 @@ class WebBridge(Node):
         self._state_bridge.update_heartbeat('lidar')
 
     def _on_laser(self, msg: LaserScan) -> None:
+        # Chi convert theo nhip broadcast (10 Hz), bo qua cac ban tin thua
+        now = time.time()
+        if now - self._last_laser_convert < self._laser_interval:
+            return
+        self._last_laser_convert = now
         try:
             laser_data = laser_to_json(msg)
             self._state_bridge.update_laser(laser_data)
@@ -375,6 +450,48 @@ class WebBridge(Node):
     def start_websocket_server(self) -> None:
         self._ws_thread = threading.Thread(target=self._run_server, daemon=True)
         self._ws_thread.start()
+
+    # Phase B05 (FIXED): Timer tra TF map <- base_frame theo pose_rate.
+    # Khi Nav2/AMCL dang chay va co TF, publish pose theo khung 'map' de frontend
+    # dung cho robot icon + lidar scan.
+    #
+    # QUAN TRONG: lookup_transform(map, base_footprint) DA LA pose robot trong khung map
+    # (tf2 tu noi chuoi map->odom (AMCL) va odom->base_footprint (EKF)).
+    # Vi vay KHONG nhan them voi pose odom (code cu nhan doi, va con tu doc lai
+    # chinh pose map do tick truoc ghi ra -> cong don -> troi vang).
+    def _tf_lookup_timer(self) -> None:
+        if not (self._nav_bridge and self._nav_bridge.is_nav_running()):
+            return
+
+        tf = self._lookup_map_tf(self._base_frame)
+        if tf is None:
+            # AMCL chua publish map->odom (vi du chua set initial pose) -> giu pose odom
+            return
+        mx, my, myaw = tf
+        myaw = math.atan2(math.sin(myaw), math.cos(myaw))  # chuan hoa [-pi, pi]
+
+        # Dung ban odom tho lam khuon de giu cac field phu (van toc...),
+        # roi ghi de position/orientation/frame_id bang gia tri trong khung map.
+        if self._last_odom_pose is not None:
+            map_pose = copy.deepcopy(self._last_odom_pose)
+        else:
+            map_pose = {}
+        map_pose["type"] = "pose"
+        map_pose["timestamp"] = time.time()
+        map_pose["frame_id"] = self._map_frame
+        map_pose["position"] = {"x": round(mx, 4), "y": round(my, 4), "z": 0.0}
+        map_pose["orientation"] = {"yaw": round(myaw, 4)}
+
+        self._state_bridge.update_pose(map_pose)
+        self._last_map_pose_t = time.time()
+
+        if not self._map_pose_logged:
+            self._map_pose_logged = True
+            if self._verbose:
+                self.get_logger().info(
+                    f'[B05] Map-frame pose active: frame={self._map_frame}, '
+                    f'base={self._base_frame}, pose=({mx:.3f},{my:.3f},{myaw:.3f})'
+                )
 
     def _run_server(self) -> None:
         config = uvicorn.Config(
@@ -527,7 +644,7 @@ class WebBridge(Node):
                                 created = time.strftime('%Y-%m-%d', time.localtime(os.path.getctime(full_path)))
                             except:
                                 created = time.strftime('%Y-%m-%d')
-                            
+
                             nodes = []
                             edges = []
                             try:
