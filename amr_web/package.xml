@@ -16,6 +16,7 @@
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <exec_depend>tf2_ros_py</exec_depend>
 
   <!-- Python dependencies (install via pip) -->
   <!-- pip install fastapi uvicorn pillow opencv-python -->

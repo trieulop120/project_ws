@@ -621,8 +621,18 @@
                             <button class="map-btn" data-tooltip="Set Nav Goal" id="toolSetGoal">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg>
                             </button>
-                            <button class="map-btn active" data-tooltip="Toggle Route" id="toolToggleRoute">
+                            <!-- Phase D: mac dinh TAT het 4 toggle de tranh lag (user yeu cau) -->
+                            <button class="map-btn" data-tooltip="Toggle Route" id="toolToggleRoute">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                            </button>
+                            <button class="map-btn" data-tooltip="Toggle Global Costmap" id="toolToggleGlobalCostmap">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>
+                            </button>
+                            <button class="map-btn" data-tooltip="Toggle Local Costmap" id="toolToggleLocalCostmap">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="1"/><rect x="8" y="8" width="8" height="8"/></svg>
+                            </button>
+                            <button class="map-btn" data-tooltip="Toggle Global Plan" id="toolTogglePlan">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 18l6-6 4 3 8-9"/><path d="M16 6h5v5"/></svg>
                             </button>
                             <button class="map-btn" data-tooltip="Center Robot" id="toolCenterMap">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/></svg>
@@ -830,10 +840,10 @@
 
 <script src="/js/overview.js?v=1.0.17"></script>
 <script src="/js/state.js?v=1.0.16"></script>
-<script src="/js/ros_connection.js?v=1.0.16"></script>
-<script src="/js/map.js?v=1.0.19"></script>
+<script src="/js/ros_connection.js?v=1.0.17"></script>
+<script src="/js/map.js?v=1.0.20"></script>
 <script src="/js/slam.js?v=1.0.16"></script>
-<script src="/js/navigation.js?v=1.0.17"></script>
+<script src="/js/navigation.js?v=1.0.18"></script>
 <script src="/js/map_route.js?v=1.0.16"></script>
 <script src="/js/app.js?v=1.0.16"></script>
 </body>

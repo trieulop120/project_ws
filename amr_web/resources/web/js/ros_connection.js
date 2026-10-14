@@ -221,6 +221,16 @@ function connect() {
                             handleCommandResponse(d);
                         }
                         break;
+
+                    // Phase D - nav layers (costmap + plan)
+                    case 'costmap':
+                        if (window.isSlamActive) break;
+                        if (window.mapRenderer && window.mapRenderer.setCostmap) window.mapRenderer.setCostmap(d);
+                        break;
+                    case 'plan':
+                        if (window.isSlamActive) break;
+                        if (window.mapRenderer && window.mapRenderer.setPlan) window.mapRenderer.setPlan(d);
+                        break;
                 }
             } catch (err) {
                 console.warn('WebSocket message error:', err.message);

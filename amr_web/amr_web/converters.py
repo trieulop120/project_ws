@@ -3,8 +3,9 @@
 import base64
 import math
 import time
-from typing import Dict, Optional, List
-from nav_msgs.msg import Odometry, OccupancyGrid
+from typing import Dict, Optional, List, Tuple
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
+from geometry_msgs.msg import Pose, PoseStamped, Point
 from sensor_msgs.msg import BatteryState, Image, LaserScan
 
 
@@ -243,4 +244,123 @@ def laser_to_json(msg: LaserScan) -> dict:
         "range_min": round(msg.range_min, 3),
         "range_max": round(msg.range_max, 3),
         "ranges": [clean_range(r) for r in msg.ranges],
+    }
+
+
+# ============================================================================
+# Phase C - Navigation Layers: costmap + plan
+# ============================================================================
+
+def compose_planar(tx: float, ty: float, tyaw: float,
+                   x: float, y: float, yaw: float) -> Tuple[float, float, float]:
+    """Compose planar transform: tra ve pose (x, y, yaw) cua diem (x,y,yaw)
+    trong khung dich sau khi apply T = (tx, ty, tyaw).
+    T_map_point = T_map_T . T_point (chinh xac theo Phase C docs 3.4).
+    """
+    c, s = math.cos(tyaw), math.sin(tyaw)
+    return (tx + c * x - s * y, ty + s * x + c * y, tyaw + yaw)
+
+
+def _costmap_bytes(msg: OccupancyGrid) -> bytes:
+    """Convert OccupancyGrid int8 -> uint8 bytes (dung numpy neu co, fallback generator)."""
+    try:
+        import numpy as np
+        return np.asarray(msg.data, dtype=np.int8).view(np.uint8).tobytes()
+    except Exception:
+        return bytes(v & 0xFF for v in msg.data)
+
+
+def costmap_to_json(msg: OccupancyGrid, layer: str,
+                    origin: Optional[Tuple[float, float, float]] = None) -> dict:
+    """Convert OccupancyGrid (costmap) sang JSON payload.
+
+    layer: 'global' hoac 'local'.
+    origin: tuple (x_map, y_map, yaw_map) da quy doi ve khung 'map'. Neu None
+            thi lay truc tiep tu msg.info.origin (gia su msg da o khung 'map').
+
+    Schema:
+        {"type":"costmap","layer":..,"timestamp":..,"frame_id":"map",
+         "info":{"resolution":..,"width":W,"height":H,
+                 "origin":{"x":..,"y":..},"yaw":..},
+         "data":"<base64 uint8>"}
+    """
+    if origin is not None:
+        ox, oy, oyaw = origin
+    else:
+        info = msg.info
+        ox = info.origin.position.x
+        oy = info.origin.position.y
+        oyaw = quaternion_to_yaw(
+            info.origin.orientation.x,
+            info.origin.orientation.y,
+            info.origin.orientation.z,
+            info.origin.orientation.w,
+        )
+
+    data_b64 = base64.b64encode(_costmap_bytes(msg)).decode('ascii')
+
+    return {
+        "type": "costmap",
+        "layer": layer,
+        "timestamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+        "frame_id": "map",  # Phase C: frontend chi lam viec voi khung 'map'
+        "info": {
+            "resolution": float(msg.info.resolution),
+            "width": int(msg.info.width),
+            "height": int(msg.info.height),
+            "origin": {
+                "x": round(float(ox), 4),
+                "y": round(float(oy), 4),
+            },
+            "yaw": round(float(oyaw), 6),
+        },
+        "data": data_b64,
+    }
+
+
+def plan_to_json(msg: Path,
+                 tf: Optional[Tuple[float, float, float]] = None) -> dict:
+    """Convert nav_msgs/Path sang JSON payload (da o khung 'map').
+
+    tf: neu plan o khung khac 'map', truyen (tx, ty, tyaw) = T_map_frame de
+        quy doi moi diem qua compose_planar. Neu None, gia su msg da o 'map'.
+
+    Giam mau: giu diem dau/cuoi + cac diem cach diem truoc >= 0.05 m,
+    toi da 2000 diem, lam tron 3 chu so. < 2 diem -> points = [].
+    """
+    if tf is not None:
+        tx, ty, tyaw = tf
+    else:
+        tx, ty, tyaw = (0.0, 0.0, 0.0)
+
+    raw_points: List[Tuple[float, float]] = []
+    for ps in msg.poses:
+        p: Pose = ps.pose
+        px, py = p.position.x, p.position.y
+        if tf is not None:
+            px, py, _ = compose_planar(tx, ty, tyaw, px, py, 0.0)
+        raw_points.append((px, py))
+
+    # Giam mau
+    sampled: List[List[float]] = []
+    if len(raw_points) >= 1:
+        sampled.append([round(raw_points[0][0], 3), round(raw_points[0][1], 3)])
+    for i in range(1, len(raw_points) - 1):
+        x, y = raw_points[i]
+        lx, ly = sampled[-1]
+        if (x - lx) ** 2 + (y - ly) ** 2 >= 0.05 ** 2:
+            sampled.append([round(x, 3), round(y, 3)])
+            if len(sampled) >= 2000:
+                break
+    if len(raw_points) >= 2:
+        lx, ly = raw_points[-1]
+        if not sampled or sampled[-1] != [round(lx, 3), round(ly, 3)]:
+            if len(sampled) < 2000:
+                sampled.append([round(lx, 3), round(ly, 3)])
+
+    return {
+        "type": "plan",
+        "timestamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+        "frame_id": "map",  # Phase C: frontend chi lam viec voi khung 'map'
+        "points": sampled if len(sampled) >= 2 else [],
     }

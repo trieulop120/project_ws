@@ -171,7 +171,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             if bridge_node:
                 if bridge_node.is_navigation_running():
                     result["status"] = "failed"
-                    result["message"] = "Navigation đang chạy – hãy dừng Navigation trước"
+                    result["message"] = "Navigation is running – stop it first"
                 else:
                     success = await asyncio.to_thread(bridge_node.start_slam)
                     result["status"] = "started" if success else "failed"
@@ -234,7 +234,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             if bridge_node:
                 if bridge_node.get_slam_state():
                     result["status"] = "failed"
-                    result["message"] = "SLAM đang chạy – hãy dừng SLAM trước"
+                    result["message"] = "SLAM is running – stop it first"
                 else:
                     success, msg = await asyncio.to_thread(bridge_node.start_navigation, map_id, route_id)
                     result["status"] = "started" if success else "failed"

@@ -25,7 +25,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from nav_msgs.msg import Odometry, OccupancyGrid
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import BatteryState, Image, LaserScan, JointState
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
@@ -36,7 +36,11 @@ from tf2_ros import Buffer, TransformListener
 
 from amr_web.websocket_manager import WebSocketManager
 from amr_web.state_bridge import StateBridge
-from amr_web.converters import odom_to_json, map_to_json, laser_to_json, image_to_json, quaternion_to_yaw
+from amr_web.converters import (
+    odom_to_json, map_to_json, laser_to_json, image_to_json,
+    quaternion_to_yaw,
+    costmap_to_json, plan_to_json, compose_planar,
+)
 from amr_web.web_server import create_app
 from amr_web.nav_bridge import NavBridge
 
@@ -47,6 +51,19 @@ def sensor_qos():
         reliability=ReliabilityPolicy.BEST_EFFORT,
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
+        durability=DurabilityPolicy.VOLATILE
+    )
+
+
+def plan_qos():
+    """QoS Profile cho /plan: RELIABLE + VOLATILE, KEEP_LAST depth=10.
+    Planner_server va route_server deu publish /plan, can RELIABLE.
+    Khong dung TRANSIENT_LOCAL vi plan chi ton tai khi co goal.
+    """
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=10,
         durability=DurabilityPolicy.VOLATILE
     )
 
@@ -74,6 +91,13 @@ class WebBridge(Node):
         # Phase B05: frames for tf lookup (map -> base)
         self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('map_frame', 'map')
+        # Phase C: costmap + plan topics + broadcast intervals
+        self.declare_parameter('global_costmap_topic', '/global_costmap/costmap')
+        self.declare_parameter('local_costmap_topic', '/local_costmap/costmap')
+        self.declare_parameter('plan_topic', '/plan')
+        self.declare_parameter('costmap_global_interval', 1.0)
+        self.declare_parameter('costmap_local_interval', 0.33)
+        self.declare_parameter('plan_interval', 0.25)
         self.declare_parameter('battery_rate', 1.0)
         self.declare_parameter('system_status_rate', 1.0)
         self.declare_parameter('map_on_change', True)
@@ -91,6 +115,13 @@ class WebBridge(Node):
         self._pose_rate = self.get_parameter('pose_rate').value
         self._base_frame = self.get_parameter('base_frame').value
         self._map_frame = self.get_parameter('map_frame').value
+        # Phase C: costmap + plan
+        self._global_costmap_topic = self.get_parameter('global_costmap_topic').value
+        self._local_costmap_topic = self.get_parameter('local_costmap_topic').value
+        self._plan_topic = self.get_parameter('plan_topic').value
+        self._costmap_global_interval = self.get_parameter('costmap_global_interval').value
+        self._costmap_local_interval = self.get_parameter('costmap_local_interval').value
+        self._plan_interval = self.get_parameter('plan_interval').value
         self._battery_rate = self.get_parameter('battery_rate').value
         self._system_status_rate = self.get_parameter('system_status_rate').value
         self._map_on_change = self.get_parameter('map_on_change').value
@@ -171,6 +202,17 @@ class WebBridge(Node):
         self._map_sub = self.create_subscription(
             OccupancyGrid, self._map_topic, self._on_map, qos_profile=map_qos,
             callback_group=self._cb_map)
+        # Phase C: 2 costmap (global/local) + plan. Dung _cb_map da co (B05).
+        # Local costmap phai quy doi odom -> map bang _lookup_map_tf.
+        self._global_costmap_sub = self.create_subscription(
+            OccupancyGrid, self._global_costmap_topic, self._on_global_costmap,
+            qos_profile=map_qos, callback_group=self._cb_map)
+        self._local_costmap_sub = self.create_subscription(
+            OccupancyGrid, self._local_costmap_topic, self._on_local_costmap,
+            qos_profile=map_qos, callback_group=self._cb_map)
+        self._plan_sub = self.create_subscription(
+            Path, self._plan_topic, self._on_plan,
+            qos_profile=plan_qos(), callback_group=self._cb_map)
         self._camera_sub = self.create_subscription(
             Image, self._camera_topic, self._on_camera_rgb, qos_profile=sensor_qos(),
             callback_group=self._cb_cam)
@@ -204,6 +246,18 @@ class WebBridge(Node):
         self._last_map_send = 0.0
         self._map_interval = 0.5  # 2 Hz for map broadcast
         self._map_pending = False
+
+        # Phase C: costmap + plan broadcast state
+        self._costmap_global_pending = False
+        self._costmap_local_pending = False
+        self._plan_pending = False
+        self._last_costmap_global_send = 0.0
+        self._last_costmap_local_send = 0.0
+        self._last_plan_send = 0.0
+        # Dedupe signatures: tranh emit lien tuc neu du lieu khong doi that su
+        self._costmap_global_sig = None
+        self._costmap_local_sig = None
+        self._plan_sig = None
 
         if self._verbose:
             self.get_logger().info(f'Web Bridge Running on {self._host}:{self._port}')
@@ -299,6 +353,77 @@ class WebBridge(Node):
                         await self._ws_manager.broadcast(json.dumps(map_data))
                         self._last_map_send = now
                         self._map_pending = False
+
+                # Phase C: costmap + plan broadcast (gate theo nav running)
+                nav_running = bool(self._nav_bridge and self._nav_bridge.is_nav_running())
+                goal_active = bool(self._nav_bridge and self._nav_bridge.is_goal_active())
+
+                if nav_running and self._costmap_global_pending and \
+                        (now - self._last_costmap_global_send) >= self._costmap_global_interval:
+                    cm = self._state_bridge.get_latest_costmap('global')
+                    if cm:
+                        await self._ws_manager.broadcast(json.dumps(cm))
+                        self._last_costmap_global_send = now
+                        self._costmap_global_pending = False
+
+                if nav_running and self._costmap_local_pending and \
+                        (now - self._last_costmap_local_send) >= self._costmap_local_interval:
+                    cm = self._state_bridge.get_latest_costmap('local')
+                    if cm:
+                        await self._ws_manager.broadcast(json.dumps(cm))
+                        self._last_costmap_local_send = now
+                        self._costmap_local_pending = False
+
+                if nav_running and goal_active and self._plan_pending and \
+                        (now - self._last_plan_send) >= self._plan_interval:
+                    plan = self._state_bridge.get_latest_plan()
+                    if plan:
+                        await self._ws_manager.broadcast(json.dumps(plan))
+                        self._last_plan_send = now
+                        self._plan_pending = False
+
+                # Phase C cleanup: xoa costmap/plan khi Nav2 tat hoac goal ket thuc
+                # (1 cho duy nhat theo spec, tranh phai sua cac diem gan _current_state)
+                if not nav_running:
+                    any_cached = (
+                        self._state_bridge.get_latest_costmap('global') is not None
+                        or self._state_bridge.get_latest_costmap('local') is not None
+                        or self._state_bridge.get_latest_plan() is not None
+                    )
+                    if any_cached:
+                        self._state_bridge.clear_layers()
+                        # Reset pending/sig de khong emit ban tin cu
+                        self._costmap_global_pending = False
+                        self._costmap_local_pending = False
+                        self._plan_pending = False
+                        self._costmap_global_sig = None
+                        self._costmap_local_sig = None
+                        self._plan_sig = None
+                        # Broadcast 3 ban tin rong de frontend xoa
+                        await self._ws_manager.broadcast(json.dumps(
+                            {"type": "costmap", "layer": "global",
+                             "frame_id": "map", "data": None}))
+                        await self._ws_manager.broadcast(json.dumps(
+                            {"type": "costmap", "layer": "local",
+                             "frame_id": "map", "data": None}))
+                        await self._ws_manager.broadcast(json.dumps(
+                            {"type": "plan", "frame_id": "map", "points": []}))
+                        if self._verbose:
+                            self.get_logger().info('[PhaseC] Cleared costmap/plan (Nav2 stopped)')
+                elif nav_running and not goal_active:
+                    # Goal vua ket thuc nhung Nav2 van chay -> chi xoa plan
+                    cached_plan = self._state_bridge.get_latest_plan()
+                    # PhaseC fix: chi broadcast neu plan cu CO noi dung; neu da rong
+                    # (broadcast o lan truoc da set diem = []) thi khong gui nua.
+                    if cached_plan is not None and cached_plan.get("points"):
+                        self._state_bridge.update_plan(
+                            {"type": "plan", "frame_id": "map", "points": []})
+                        self._plan_pending = False
+                        self._plan_sig = None
+                        await self._ws_manager.broadcast(json.dumps(
+                            {"type": "plan", "frame_id": "map", "points": []}))
+                        if self._verbose:
+                            self.get_logger().info('[PhaseC] Cleared plan (no active goal)')
 
                 # P1-13 Fix: Broadcast nav_state periodically (1 Hz)
                 if now - last_nav >= 1.0:
@@ -413,6 +538,93 @@ class WebBridge(Node):
         except Exception as e:
             if self._verbose:
                 self.get_logger().warn(f'Map error: {e}')
+
+    def _on_global_costmap(self, msg: OccupancyGrid) -> None:
+        """Phase C: nhan global costmap, convert + luu + dat co pending.
+        KHONG broadcast truc tiep tu callback (theo pattern cua _on_map).
+        """
+        if not (self._nav_bridge and self._nav_bridge.is_nav_running()):
+            return
+        try:
+            data = costmap_to_json(msg, 'global')  # frame_id='map', no TF needed
+            # Dedupe signature: hash data + origin
+            import zlib
+            sig = (zlib.crc32(data['data'].encode('ascii')),
+                   data['info']['origin']['x'], data['info']['origin']['y'],
+                   data['info']['yaw'], data['info']['width'], data['info']['height'])
+            if sig == self._costmap_global_sig:
+                return
+            self._costmap_global_sig = sig
+            self._state_bridge.update_costmap('global', data)
+            self._costmap_global_pending = True
+        except Exception as e:
+            if self._verbose:
+                self.get_logger().warn(f'Global costmap error: {e}')
+
+    def _on_local_costmap(self, msg: OccupancyGrid) -> None:
+        """Phase C: nhan local costmap (frame_id='odom'), quy doi odom -> map qua TF.
+        Neu TF lookup loi (AMCL chua san sang) -> bo qua ban tin.
+        """
+        if not (self._nav_bridge and self._nav_bridge.is_nav_running()):
+            return
+        try:
+            tf = self._lookup_map_tf(msg.header.frame_id)
+            if tf is None:
+                return  # giu ban tin cu trong cache
+            tx, ty, tyaw = tf
+            # Quy doi origin (lower-left) tu odom -> map bang compose_planar
+            ox, oy, oyaw = compose_planar(
+                tx, ty, tyaw,
+                msg.info.origin.position.x,
+                msg.info.origin.position.y,
+                quaternion_to_yaw(
+                    msg.info.origin.orientation.x,
+                    msg.info.origin.orientation.y,
+                    msg.info.origin.orientation.z,
+                    msg.info.origin.orientation.w,
+                ),
+            )
+            data = costmap_to_json(msg, 'local', origin=(ox, oy, oyaw))
+            # Dedupe signature: data goc + origin goc + TF da lam tron
+            import zlib
+            sig = (zlib.crc32(data['data'].encode('ascii')),
+                   msg.info.origin.position.x, msg.info.origin.position.y,
+                   msg.info.width, msg.info.height,
+                   round(tx, 2), round(ty, 2), round(tyaw, 3))
+            if sig == self._costmap_local_sig:
+                return
+            self._costmap_local_sig = sig
+            self._state_bridge.update_costmap('local', data)
+            self._costmap_local_pending = True
+        except Exception as e:
+            if self._verbose:
+                self.get_logger().warn(f'Local costmap error: {e}')
+
+    def _on_plan(self, msg: Path) -> None:
+        """Phase C: nhan /plan, quy doi odom -> map neu can, giam mau, luu + pending.
+        """
+        if not (self._nav_bridge and self._nav_bridge.is_nav_running()):
+            return
+        if not self._nav_bridge.is_goal_active():
+            return  # plan chi quan trong khi goal ACTIVE
+        try:
+            tf = None
+            if msg.header.frame_id != self._map_frame:
+                tf_lookup = self._lookup_map_tf(msg.header.frame_id)
+                if tf_lookup is None:
+                    return
+                tf = tf_lookup
+            data = plan_to_json(msg, tf=tf)
+            # Dedupe signature: hash tuple points
+            sig = tuple(tuple(p) for p in data['points'])
+            if sig == self._plan_sig:
+                return
+            self._plan_sig = sig
+            self._state_bridge.update_plan(data)
+            self._plan_pending = True
+        except Exception as e:
+            if self._verbose:
+                self.get_logger().warn(f'Plan error: {e}')
 
     def _on_lidar(self, msg: LaserScan) -> None:
         self._state_bridge.update_heartbeat('lidar')

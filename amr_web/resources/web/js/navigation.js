@@ -10,7 +10,11 @@
     window.selectedNavMap = null;
     window.selectedNavRoute = null;
     window.currentRoute = null;
-    window.showRouteOverlay = true;
+    window.showRouteOverlay = false;  // Phase D: mac dinh TAT het de tranh lag (user yeu cau)
+    // Phase D: nav layer toggles (docs 6.2) - mac dinh tat, user bat khi can
+    window.showGlobalCostmap = false;
+    window.showLocalCostmap = false;
+    window.showPlan = false;
 
     // Operating Mode: MANUAL | AUTO - exported for state.js
     window.currentOpMode = 'MANUAL';
@@ -321,6 +325,9 @@
 
         if (!window.selectedNavMap || !window.selectedNavRoute) return;
 
+        // Phase D 6.5: xoa lop nav cu truoc khi gui start_navigation (tranh rac tu phien truoc)
+        if (typeof window.clearNavLayers === 'function') window.clearNavLayers();
+
         // Clear old map data
         window.mapData = null;
         window.mapImageData = null;
@@ -411,6 +418,8 @@
         window.isNavigationActive = false;
         hideNavActiveUI();
         updateNavUI();
+        // Phase D 6.5: start that bai -> xoa lop
+        if (typeof window.clearNavLayers === 'function') window.clearNavLayers();
         if (typeof window.showToast === 'function') {
             window.showToast(`Cannot start Navigation: ${msg}`, 'error');
         }
@@ -441,6 +450,9 @@
 
         // Clear tool
         setActiveTool(null);
+
+        // Phase D 6.5: bam Stop -> xoa lop (an toan, backend cung se goi)
+        if (typeof window.clearNavLayers === 'function') window.clearNavLayers();
 
         // Send stop command
         if (typeof sendCommand === 'function') sendCommand({ command: 'stop_navigation' });
@@ -624,6 +636,53 @@
     function toggleRouteVisibility() {
         window.showRouteOverlay = !window.showRouteOverlay;
         toolToggleRoute?.classList.toggle('active', window.showRouteOverlay);
+        saveNavLayerToggles();
+        if (typeof window.renderMap === 'function') window.renderMap();
+    }
+
+    // Phase D: mot bang toggle cho ca 4 lop (route + 3 nav layer), docs 6.2
+    // Mac dinh TAT het de tranh lag (user yeu cau); trang thai luu localStorage.
+    const NAV_LAYER_TOGGLES = [
+      { id: 'toolToggleRoute',         flag: 'showRouteOverlay'  },
+      { id: 'toolToggleGlobalCostmap', flag: 'showGlobalCostmap' },
+      { id: 'toolToggleLocalCostmap',  flag: 'showLocalCostmap'  },
+      { id: 'toolTogglePlan',          flag: 'showPlan'          },
+    ];
+    const NAV_LAYERS_LS_KEY = 'amr.nav.layers';
+
+    function loadNavLayerToggles() {
+        try {
+            const raw = localStorage.getItem(NAV_LAYERS_LS_KEY);
+            if (!raw) return;
+            const obj = JSON.parse(raw);
+            for (const t of NAV_LAYER_TOGGLES) {
+                if (typeof obj[t.flag] === 'boolean') window[t.flag] = obj[t.flag];
+            }
+        } catch (_e) { /* Safari private mode */ }
+    }
+
+    function saveNavLayerToggles() {
+        try {
+            const obj = {};
+            for (const t of NAV_LAYER_TOGGLES) obj[t.flag] = window[t.flag];
+            localStorage.setItem(NAV_LAYERS_LS_KEY, JSON.stringify(obj));
+        } catch (_e) { /* Safari private mode */ }
+    }
+
+    function applyNavLayerTogglesToButtons() {
+        for (const t of NAV_LAYER_TOGGLES) {
+            const btn = document.getElementById(t.id);
+            if (btn) btn.classList.toggle('active', window[t.flag] === true);
+        }
+    }
+
+    function onNavLayerToggleClick(flag) {
+        window[flag] = !window[flag];
+        const btn = document.getElementById(
+            NAV_LAYER_TOGGLES.find(t => t.flag === flag)?.id || ''
+        );
+        if (btn) btn.classList.toggle('active', window[flag]);
+        saveNavLayerToggles();
         if (typeof window.renderMap === 'function') window.renderMap();
     }
 
@@ -770,7 +829,9 @@
             toolPendingMouseX = e.clientX;
             toolPendingMouseY = e.clientY;
             toolPositionSet = true;
-            showNavOverlayMsg(`${toolPending === 'pose' ? 'Initial Pose' : 'Nav Goal'}: Move mouse to aim, click to confirm, ESC to cancel`);
+            // Phase D 6.4: BO chu huong dan tool. Khi click Set Initial Pose / Set Nav Goal,
+            // KHONG hien "Move mouse to aim, click to confirm, ESC to cancel".
+            // Luong click-re-click giu nguyen, chi xoa dong showNavOverlayMsg o day.
         }
         // Export for map.js preview
         window.toolPending = toolPending;
@@ -933,16 +994,24 @@
         // B21 Fix: Không xử lý nav_state khi đang dừng
         if (navStopping) return;
 
+        const wasRunning = navState ? navState.nav2_running : false;
+        const nowRunning = data.nav2_running === true;
+
         navState = {
             state: data.state || 'IDLE',
             progress: data.progress || 0,
-            nav2_running: data.nav2_running || false,
+            nav2_running: nowRunning,
             nav2_ready: data.nav2_ready || false,
             waypoint_index: data.waypoint_index || 0,
             waypoint_total: data.waypoint_total || 0,
             map_id: data.map_id || null,
             route_id: data.route_id || null,
         };
+
+        // Phase D 6.5: Nav2 chet/Stop tu client khac -> xoa lop
+        if (wasRunning && !nowRunning && typeof window.clearNavLayers === 'function') {
+            window.clearNavLayers();
+        }
 
         // Fix: Luôn cập nhật selectedNavMap từ backend khi có map_id
         if (navState.map_id) {
@@ -1185,6 +1254,16 @@
         toolSetGoal?.addEventListener('click', () => selectTool('goal'));
         toolToggleRoute?.addEventListener('click', toggleRouteVisibility);
         toolCenterMap?.addEventListener('click', centerMapOnRobot);
+
+        // Phase D: 3 nav layer toggle (Global Costmap, Local Costmap, Plan)
+        for (const t of NAV_LAYER_TOGGLES) {
+            if (t.id === 'toolToggleRoute') continue;  // da co listener rieng
+            const btn = document.getElementById(t.id);
+            if (btn) btn.addEventListener('click', () => onNavLayerToggleClick(t.flag));
+        }
+        // Doc trang thai tu localStorage (an toan, try/catch ben trong)
+        loadNavLayerToggles();
+        applyNavLayerTogglesToButtons();
 
         // Keyboard: ESC to cancel, Enter to confirm tool
         document.addEventListener('keydown', (e) => {

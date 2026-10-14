@@ -56,6 +56,11 @@ class StateBridge:
         self._map: Optional[dict] = None
         self._laser: Optional[dict] = None
 
+        # === Phase C: Navigation Layers state ===
+        self._costmap_global: Optional[dict] = None
+        self._costmap_local: Optional[dict] = None
+        self._plan: Optional[dict] = None
+
     # === Device Heartbeat Methods ===
     def update_heartbeat(self, device_name: str) -> None:
         """Cập nhật heartbeat của thiết bị."""
@@ -194,6 +199,40 @@ class StateBridge:
         with self._lock:
             return self._laser
 
+    # === Phase C: Costmap + Plan ===
+    def update_costmap(self, layer: str, costmap_data: dict) -> None:
+        """Luu costmap moi nhat theo layer ('global' hoac 'local')."""
+        with self._lock:
+            if layer == 'global':
+                self._costmap_global = costmap_data
+            elif layer == 'local':
+                self._costmap_local = costmap_data
+            else:
+                raise ValueError(f"Unknown costmap layer: {layer}")
+
+    def get_latest_costmap(self, layer: str) -> Optional[dict]:
+        with self._lock:
+            if layer == 'global':
+                return self._costmap_global
+            if layer == 'local':
+                return self._costmap_local
+            return None
+
+    def update_plan(self, plan_data: dict) -> None:
+        with self._lock:
+            self._plan = plan_data
+
+    def get_latest_plan(self) -> Optional[dict]:
+        with self._lock:
+            return self._plan
+
+    def clear_layers(self) -> None:
+        """Xoa costmap + plan. Goi khi Nav2 tat hoac goal ket thuc."""
+        with self._lock:
+            self._costmap_global = None
+            self._costmap_local = None
+            self._plan = None
+
     def get_all_state(self) -> dict:
         with self._lock:
             result = {}
@@ -203,4 +242,10 @@ class StateBridge:
                 result["battery"] = self._battery
             if self._map:
                 result["map"] = self._map
+            if self._costmap_global:
+                result["costmap_global"] = self._costmap_global
+            if self._costmap_local:
+                result["costmap_local"] = self._costmap_local
+            if self._plan:
+                result["plan"] = self._plan
             return result

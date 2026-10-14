@@ -170,6 +170,13 @@ class NavBridge:
         """Kiểm tra navigation state."""
         return self._nav_active
 
+    def is_goal_active(self) -> bool:
+        """Phase C: True neu hien dang co goal ACTIVE (gui den Nav2 va chua ket thuc).
+        Doc duoi lock, KHONG dung de gan state.
+        """
+        with self._lock:
+            return self._current_state == self.STATE_ACTIVE
+
     def _nav_ready(self) -> bool:
         """Check if navigate_to_pose action server is ready."""
         if not self._action_client:
@@ -194,7 +201,7 @@ class NavBridge:
         with self._lock:
             # B21 Fix: Chặn start khi đang dừng
             if self._stopping:
-                return False, "Nav2 đang dừng, thử lại sau vài giây"
+                return False, "Nav2 is stopping, retry in a few seconds"
             if self.is_nav_running():
                 return False, "Nav2 process already running"
 
@@ -231,7 +238,7 @@ class NavBridge:
         # P1-5 Fix: Start monitoring thread instead of just sleep(1.5)
         threading.Thread(target=self._watch_process, args=(self._nav_process,), daemon=True).start()
         self._broadcast_state()
-        return True, "Nav2 đang khởi động"
+        return True, "Nav2 is starting"
 
     def _watch_process(self, proc) -> None:
         """Monitor Nav2 process and broadcast when it dies."""
@@ -248,7 +255,7 @@ class NavBridge:
         self._emit({
             'type': 'nav_result',
             'state': 'FAILED',
-            'message': f'Nav2 launch thoát bất ngờ (code {rc})',
+            'message': f'Nav2 exited unexpectedly (code {rc})',
             'timestamp': time.time()
         })
         self._broadcast_state()
@@ -354,16 +361,16 @@ class NavBridge:
         """Send navigation goal to Nav2."""
         with self._lock:
             if not self.is_nav_running():
-                return False, "Nav2 chưa chạy"
+                return False, "Nav2 is not running"
 
             if not self._nav_ready():
-                return False, "Nav2 chưa sẵn sàng"
+                return False, "Nav2 is not ready"
 
             if self._goal_pending or (self._goal_handle and
                     self._goal_handle.status in (GoalStatus.STATUS_ACCEPTED,
                                                  GoalStatus.STATUS_EXECUTING,
                                                  GoalStatus.STATUS_CANCELING)):
-                return False, "Đang có goal chạy – hãy huỷ trước"
+                return False, "A goal is running – cancel it first"
 
             self._initial_distance = None
             self._cancel_requested = False
@@ -501,12 +508,12 @@ class NavBridge:
                                             GoalStatus.STATUS_EXECUTING):
                 self._cancel_future = handle.cancel_goal_async()
                 self._cancel_future.add_done_callback(self._on_cancel_response)
-                msg = "Đã gửi yêu cầu huỷ"
+                msg = "Cancel request sent"
             elif self._goal_pending:
                 self._cancel_requested = True
-                msg = "Sẽ huỷ khi Nav2 nhận goal"
+                msg = "Will cancel when Nav2 accepts the goal"
             else:
-                msg = "Không có goal đang chạy"
+                msg = "No goal is running"
 
             self._current_state = self.STATE_CANCELED
             self._broadcast_state()
@@ -552,15 +559,15 @@ class NavBridge:
                 return False, "No waypoints provided"
 
             if not self.is_nav_running():
-                return False, "Nav2 chưa chạy"
+                return False, "Nav2 is not running"
 
             if not self._waypoint_ready():
-                return False, "Nav2 chưa sẵn sàng"
+                return False, "Nav2 is not ready"
 
             if self._goal_pending or (self._goal_handle and
                     self._goal_handle.status in (GoalStatus.STATUS_ACCEPTED,
                                                  GoalStatus.STATUS_EXECUTING)):
-                return False, "Đang có goal chạy – hãy huỷ trước"
+                return False, "A goal is running – cancel it first"
 
             # Build poses
             from geometry_msgs.msg import PoseStamped
@@ -712,7 +719,7 @@ class NavBridge:
                 waited += wait_interval
 
             if self._init_pose_pub.get_subscription_count() == 0:
-                return False, "AMCL chưa sẵn sàng"
+                return False, "AMCL is not ready"
 
             msg = PoseWithCovarianceStamped()
             msg.header.stamp = self._node.get_clock().now().to_msg()

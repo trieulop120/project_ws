@@ -11,6 +11,69 @@
         occupied: [0, 0, 0]       // black - for 2+
     };
 
+    // === Phase D: Navigation layers (costmap + plan) - color/alpha constants ===
+    // Dat o dau file de user chinh ve sau, khong hard-code rai rac (docs 3.6, 6.3)
+    const GLOBAL_COSTMAP_ALPHA = 0.5;
+    const LOCAL_COSTMAP_ALPHA = 0.5;
+    const PLAN_COLOR = 'rgb(78,154,6)';
+    const PLAN_ALPHA = 0.5;
+    const PLAN_WIDTH_M = 0.1;  // met (chuyen sang cell: PLAN_WIDTH_M / Rm)
+
+    // Two RViz-like palettes: MAP (global) and COSTMAP (local).
+    // Index = uint8 value (-1 -> 255). Each entry is RGBA.
+    function makeMapPalette() {
+        const p = new Uint8ClampedArray(256 * 4);
+        for (let i = 0; i <= 254; i++) {
+            let r, g, b;
+            if (i === 0) { r = 255; g = 255; b = 255; }
+            else if (i <= 98) {
+                const v = 255 - Math.round(255 * i / 100);
+                r = v; g = v; b = v;
+            }
+            else if (i === 99) { r = 255; g = 255; b = 255; }
+            else if (i === 100) { r = 0; g = 0; b = 0; }
+            else if (i <= 127) { r = 0; g = 255; b = 0; }
+            else { r = 255; g = Math.round(255 * (i - 128) / 126); b = 0; }
+            p[i * 4] = r; p[i * 4 + 1] = g; p[i * 4 + 2] = b; p[i * 4 + 3] = 255;
+        }
+        // 255 = unknown
+        p[255 * 4] = 0x70; p[255 * 4 + 1] = 0x89; p[255 * 4 + 2] = 0x86; p[255 * 4 + 3] = 255;
+        return p;
+    }
+    function makeCostmapPalette() {
+        const p = new Uint8ClampedArray(256 * 4);
+        for (let i = 0; i <= 254; i++) {
+            let r, g, b;
+            if (i === 0) { r = 0; g = 0; b = 0; p[i * 4 + 3] = 0; continue; }  // trong suot
+            if (i <= 98) {
+                const v = Math.round(255 * i / 100);
+                r = v; g = 0; b = 255 - v;
+            }
+            else if (i === 99) { r = 0; g = 255; b = 255; }
+            else if (i === 100) { r = 255; g = 0; b = 255; }
+            else if (i <= 127) { r = 0; g = 255; b = 0; }
+            else { r = 255; g = Math.round(255 * (i - 128) / 126); b = 0; }
+            p[i * 4] = r; p[i * 4 + 1] = g; p[i * 4 + 2] = b; p[i * 4 + 3] = 255;
+        }
+        p[255 * 4] = 0x70; p[255 * 4 + 1] = 0x89; p[255 * 4 + 2] = 0x86; p[255 * 4 + 3] = 255;
+        return p;
+    }
+    const MAP_PALETTE = makeMapPalette();
+    const COSTMAP_PALETTE = makeCostmapPalette();
+
+    // Two offscreen canvases (one per costmap layer), same pattern as mapOffscreen
+    let costmapGlobalOff = null;   // {info, yaw, off, alpha, palette}
+    let costmapLocalOff = null;
+    let planState = null;          // {points: [[x,y],...]} or null
+
+    // Helper: decode base64 -> Uint8Array (dung chung cho costmap)
+    function _b64ToBytes(b64) {
+        const decoded = atob(b64);
+        const out = new Uint8Array(decoded.length);
+        for (let i = 0; i < decoded.length; i++) out[i] = decoded.charCodeAt(i);
+        return out;
+    }
+
     // Shared view transforms for Overview / SLAM / Navigation
     window.overviewViewTransform = { x: 0, y: 0, scale: 1 };
     window.slamViewTransform = { x: 0, y: 0, scale: 1 };
@@ -175,6 +238,10 @@
             ctx.drawImage(tmp, 0, 0);
         }
 
+        // Phase D: costmap + plan phai ve TRUOC route (docs 6.3)
+        drawCostmapLayers();
+        drawPlan();
+
         // Draw route overlay for navigation
         drawRouteOverlay();
 
@@ -292,6 +359,113 @@
 
         ctx.restore();
     }
+
+    // === Phase D: costmap rendering ===
+    // Build an offscreen ImageData (W x H) for a costmap message using `palette` (Uint8ClampedArray 256*4).
+    // Docs 3.1: costmap hang 0 = duoi cung (nho nhat). Lat hang khi ve vao offscreen:
+    //   row r  <=  gridRow (H-1-r)
+    function buildCostmapImage(d, palette) {
+        const { info, data } = d;
+        const bytes = _b64ToBytes(data);
+        const W = info.width, H = info.height;
+        const img = new ImageData(W, H);
+        const pix = img.data;
+        for (let r = 0; r < H; r++) {
+            const gridRow = H - 1 - r;
+            for (let x = 0; x < W; x++) {
+                const srcIdx = gridRow * W + x;
+                const byte = bytes[srcIdx];
+                const palIdx = byte * 4;
+                const dstIdx = (r * W + x) * 4;
+                pix[dstIdx]     = palette[palIdx];
+                pix[dstIdx + 1] = palette[palIdx + 1];
+                pix[dstIdx + 2] = palette[palIdx + 2];
+                pix[dstIdx + 3] = palette[palIdx + 3];
+            }
+        }
+        return img;
+    }
+
+    function setCostmap(d) {
+        if (!d || !d.data || !d.info) {
+            if (d && d.layer === 'global') costmapGlobalOff = null;
+            else if (d && d.layer === 'local') costmapLocalOff = null;
+            requestRender();
+            return;
+        }
+        const palette = d.layer === 'global' ? MAP_PALETTE : COSTMAP_PALETTE;
+        const alpha = d.layer === 'global' ? GLOBAL_COSTMAP_ALPHA : LOCAL_COSTMAP_ALPHA;
+        const img = buildCostmapImage(d, palette);
+        const off = document.createElement('canvas');
+        off.width = d.info.width;
+        off.height = d.info.height;
+        const offCtx = off.getContext('2d');
+        offCtx.imageSmoothingEnabled = false;
+        offCtx.putImageData(img, 0, 0);
+        const state = { info: d.info, yaw: d.info.yaw || 0, off, alpha };
+        if (d.layer === 'global') costmapGlobalOff = state;
+        else if (d.layer === 'local') costmapLocalOff = state;
+        requestRender();
+    }
+
+    function setPlan(d) {
+        if (!d || !d.points || d.points.length < 2) {
+            planState = null;
+        } else {
+            planState = { points: d.points };
+        }
+        requestRender();
+    }
+
+    function drawCostmapLayers() {
+        if (window.currentViewport !== 'navigation' || !window.mapData || window.isSlamActive) return;
+        const Rm = window.mapData.info.resolution;
+        const layers = [];
+        if (window.showGlobalCostmap && costmapGlobalOff) layers.push(costmapGlobalOff);
+        if (window.showLocalCostmap && costmapLocalOff) layers.push(costmapLocalOff);
+        for (const layer of layers) {
+            const { info, yaw, off, alpha } = layer;
+            const p = worldToCanvas(info.origin.x, info.origin.y);  // goc duoi-trai
+            const s = info.resolution / Rm;
+            ctx.save();
+            ctx.translate(p.x, p.y);
+            ctx.rotate(-yaw);  // canvas y xuong => yaw duong = rotate(-yaw)
+            ctx.scale(s, s);
+            ctx.globalAlpha = alpha;
+            ctx.drawImage(off, 0, -info.height);  // offscreen da lat hang
+            ctx.restore();
+        }
+    }
+
+    function drawPlan() {
+        if (window.currentViewport !== 'navigation' || !window.mapData || window.isSlamActive) return;
+        if (!window.showPlan || !planState || !planState.points || planState.points.length < 2) return;
+        const Rm = window.mapData.info.resolution;
+        const vt = getActiveViewTransform();
+        ctx.save();
+        ctx.strokeStyle = PLAN_COLOR;
+        ctx.lineWidth = Math.max(PLAN_WIDTH_M / Rm, 2 / vt.scale);
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.globalAlpha = PLAN_ALPHA;
+        ctx.beginPath();
+        for (let i = 0; i < planState.points.length; i++) {
+            const p = planState.points[i];
+            const cp = worldToCanvas(p[0], p[1]);
+            if (i === 0) ctx.moveTo(cp.x, cp.y);
+            else ctx.lineTo(cp.x, cp.y);
+        }
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    function clearNavLayers() {
+        costmapGlobalOff = null;
+        costmapLocalOff = null;
+        planState = null;
+        requestRender();
+    }
+    window.clearNavLayers = clearNavLayers;
 
     // P0-6 Fix: Draw preview for nav tools (RVIZ-style)
     function drawDragPreview() {
@@ -649,6 +823,9 @@
         zoomOut: slamMapZoomOut,
         moveToViewport: moveCanvasToViewport,
         canvasToWorld: canvasToWorld,
+        // Phase D: nav layer renderers (docs 6.1)
+        setCostmap: setCostmap,
+        setPlan: setPlan,
     };
 
 })();
