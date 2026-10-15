@@ -2186,3 +2186,23 @@
 .mission-empty.hidden {
   display: none;
 }
+
+
+/* ========================================
+   Mobile / touch: map viewports (Overview, SLAM, Navigation)
+   - touch-action:none  => finger drag / pinch go to the map, not to page scroll
+   - hover:none         => toolbar must be visible without :hover (no hover on phones)
+   ======================================== */
+.map-viewport,
+.slam-map-viewport,
+#mapCanvas {
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+@media (hover: none) {
+    .map-toolbar { opacity: 1; }
+}

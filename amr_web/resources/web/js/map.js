@@ -684,13 +684,22 @@
     }
 
     function slamMapRecenter() {
-        if (!window.robotPose || !window.mapData || !canvas) return;
+        if (!window.mapData || !canvas || !canvas.parentElement) return;
         const rect = canvas.parentElement.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+
+        // No robot pose yet -> fall back to fitting the whole map instead of doing nothing
+        if (!window.robotPose || !window.robotPose.position) {
+            fitToView();
+            requestRender();
+            return;
+        }
+
         const pos = worldToCanvas(window.robotPose.position.x, window.robotPose.position.y);
         const vt = getActiveViewTransform();
         vt.x = (rect.width / 2) - pos.x * vt.scale;
         vt.y = (rect.height / 2) - pos.y * vt.scale;
-        render();
+        requestRender();
     }
 
     function slamMapZoomIn() {

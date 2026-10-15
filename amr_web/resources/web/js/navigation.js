@@ -813,14 +813,19 @@
     function onPointerDown(e) {
         console.debug('[NAVTOOL] onPointerDown:', { toolPending, toolPositionSet, isNavActive: window.isNavigationActive });
         if (!toolPending || !window.isNavigationActive || currentOpMode !== 'MANUAL') return;
+        if (!e.isPrimary) return;  // ignore 2nd finger
 
-        const w = window.canvasToWorld ? window.canvasToWorld(e.offsetX, e.offsetY) : null;
+        // Use canvas-relative coords (e.offsetX is relative to e.target, which may be an overlay on touch)
+        const cxy = canvasXY(e);
+        const w = window.canvasToWorld ? window.canvasToWorld(cxy.x, cxy.y) : null;
         if (!w) {
             if (typeof window.showToast === 'function') window.showToast('No map available', 'warn');
             return;
         }
         e.preventDefault();
         e.stopPropagation();
+        // keep receiving move/up even if the pointer leaves the viewport while aiming
+        try { navViewport?.setPointerCapture(e.pointerId); } catch (_e) { /* not critical */ }
 
         if (!toolPositionSet) {
             // First click: set position and start aiming
@@ -844,6 +849,7 @@
 
     function onPointerMove(e) {
         if (!toolPending || !toolPositionSet) return;
+        if (!e.isPrimary) return;
 
         // Calculate yaw from direction from click position to current mouse position
         const dx = e.clientX - toolPendingMouseX;
@@ -862,6 +868,7 @@
     function onPointerUp(e) {
         console.debug('[NAVTOOL] onPointerUp:', { toolPending, toolPositionSet });
         if (!toolPending || !toolPositionSet) return;
+        if (!e.isPrimary) return;
 
         // Second click: confirm and send
         const tool = toolPending;
@@ -1300,6 +1307,8 @@
         navViewport?.addEventListener('pointermove', onPointerMove);
         navViewport?.addEventListener('pointerup', onPointerUp);
         navViewport?.addEventListener('pointercancel', cancelDrag);
+        // Long-press on touch opens the browser context menu and cancels the gesture while aiming
+        navViewport?.addEventListener('contextmenu', (e) => { if (toolPending) e.preventDefault(); });
 
         // Quick goals
         setupQuickGoals();

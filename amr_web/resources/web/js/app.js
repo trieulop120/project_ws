@@ -166,10 +166,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }));
 
-    // Canvas drag events - Skip if navigation tool is active
-    let isDragging = false;
+    // Canvas pan / pinch-zoom - Pointer Events (mouse + touch + pen)
+    // Skip if a navigation tool (Set Pose / Set Goal) is active.
+    const activePointers = new Map();   // pointerId -> {x, y} (client coords)
+    let panPointerId = null;
     let dragStart = { x: 0, y: 0 };
     let transformStart = { x: 0, y: 0, scale: 1 };
+    let pinchStart = null;              // { dist, mid:{x,y} (viewport-relative), vt:{x,y,scale} }
 
     // Get correct viewTransform based on current viewport
     function getCurrentViewTransform() {
@@ -181,35 +184,97 @@ document.addEventListener('DOMContentLoaded', () => {
         return window.overviewViewTransform;
     }
 
-    document.addEventListener('mousedown', e => {
+    function getActiveMapViewport() {
+        return document.querySelector('.page.active .map-viewport, .page.active .slam-map-viewport, .page.active #navMapViewport');
+    }
+
+    function startPan(pointerId) {
+        const p = activePointers.get(pointerId);
+        if (!p) return;
+        panPointerId = pointerId;
+        dragStart = { x: p.x, y: p.y };
+        transformStart = { ...getCurrentViewTransform() };
+    }
+
+    function startPinch() {
+        const vp = getActiveMapViewport();
+        if (!vp) return;
+        const [a, b] = [...activePointers.values()];
+        const rect = vp.getBoundingClientRect();
+        panPointerId = null;
+        pinchStart = {
+            dist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+            mid: { x: (a.x + b.x) / 2 - rect.left, y: (a.y + b.y) / 2 - rect.top },
+            vt: { ...getCurrentViewTransform() }
+        };
+    }
+
+    document.addEventListener('pointerdown', e => {
         // Skip pan if navigation tool is active
-        if (typeof window.isCanvasToolActive !== 'undefined' && window.isCanvasToolActive) {
-            return;
-        }
+        if (typeof window.isCanvasToolActive !== 'undefined' && window.isCanvasToolActive) return;
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
 
-        const vp = document.querySelector('.page.active .map-viewport, .page.active .slam-map-viewport, .page.active #navMapViewport');
+        const vp = getActiveMapViewport();
         if (!vp || !vp.contains(e.target)) return;
-        if (e.target.closest('.map-toolbar') || e.target.closest('.map-empty')) return;
+        if (e.target.closest('.map-toolbar') || e.target.closest('.map-empty') || e.target.closest('button')) return;
 
-        isDragging = true;
-        dragStart = { x: e.clientX, y: e.clientY };
-        const vt = getCurrentViewTransform();
-        transformStart = { ...vt };
-        if (canvasEl) canvasEl.style.cursor = 'grabbing';
+        activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+        if (activePointers.size === 1) {
+            startPan(e.pointerId);
+            if (canvasEl) canvasEl.style.cursor = 'grabbing';
+        } else if (activePointers.size === 2) {
+            startPinch();
+        }
     });
 
-    document.addEventListener('mousemove', e => {
-        if (!isDragging) return;
+    document.addEventListener('pointermove', e => {
+        if (!activePointers.has(e.pointerId)) return;
+        activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
         const vt = getCurrentViewTransform();
-        vt.x = transformStart.x + (e.clientX - dragStart.x);
-        vt.y = transformStart.y + (e.clientY - dragStart.y);
+
+        if (activePointers.size >= 2 && pinchStart) {
+            const vp = getActiveMapViewport();
+            if (!vp) return;
+            const [a, b] = [...activePointers.values()];
+            const rect = vp.getBoundingClientRect();
+            const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+            const midX = (a.x + b.x) / 2 - rect.left;
+            const midY = (a.y + b.y) / 2 - rect.top;
+
+            const newScale = Math.max(0.1, Math.min(10, pinchStart.vt.scale * dist / pinchStart.dist));
+            // keep the map point that was under the initial midpoint under the current midpoint
+            const cellX = (pinchStart.mid.x - pinchStart.vt.x) / pinchStart.vt.scale;
+            const cellY = (pinchStart.mid.y - pinchStart.vt.y) / pinchStart.vt.scale;
+            vt.scale = newScale;
+            vt.x = midX - cellX * newScale;
+            vt.y = midY - cellY * newScale;
+        } else if (e.pointerId === panPointerId) {
+            vt.x = transformStart.x + (e.clientX - dragStart.x);
+            vt.y = transformStart.y + (e.clientY - dragStart.y);
+        } else {
+            return;
+        }
         if (typeof window.renderMap === 'function') window.renderMap();
     });
 
-    document.addEventListener('mouseup', () => {
-        isDragging = false;
-        if (canvasEl) canvasEl.style.cursor = 'grab';
-    });
+    function endPointer(e) {
+        if (!activePointers.has(e.pointerId)) return;
+        activePointers.delete(e.pointerId);
+
+        if (activePointers.size < 2) pinchStart = null;
+
+        if (activePointers.size === 1) {
+            // one finger left after a pinch: continue as pan from where it is now
+            startPan([...activePointers.keys()][0]);
+        } else if (activePointers.size === 0) {
+            panPointerId = null;
+            if (canvasEl) canvasEl.style.cursor = 'grab';
+        }
+    }
+    document.addEventListener('pointerup', endPointer);
+    document.addEventListener('pointercancel', endPointer);
 
     if (canvasEl) {
         canvasEl.addEventListener('wheel', e => {
@@ -219,7 +284,7 @@ document.addEventListener('DOMContentLoaded', () => {
             else { vt.scale *= 1.1; }
             vt.scale = Math.max(0.1, Math.min(10, vt.scale));
             if (typeof window.renderMap === 'function') window.renderMap();
-        });
+        }, { passive: false });
     }
 
     // Toolbar buttons (active page only)
@@ -231,12 +296,10 @@ document.addEventListener('DOMContentLoaded', () => {
         } else if (e.target.closest('#btnZoomOut') || e.target.closest('#slamBtnZoomOut')) {
             vt.scale *= 0.8;
             if (typeof window.renderMap === 'function') window.renderMap();
-        } else if (e.target.closest('#btnRecenter') || e.target.closest('#slamBtnRecenter')) {
-            if (window.isSlamActive && window.mapRenderer) {
-                window.mapRenderer.recenter();
-            } else if (typeof window.fitMapToView === 'function') {
-                window.fitMapToView();
-            }
+        } else if (e.target.closest('#btnRecenter')) {
+            // Overview recenter. (#slamBtnRecenter is handled in slam.js, #toolCenterMap in navigation.js)
+            // NOTE: window.fitMapToView belongs to map_route.js (route canvas), so it must not be used here.
+            if (window.mapRenderer) window.mapRenderer.recenter();
         }
     });
 
@@ -258,9 +321,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (typeof connect === 'function') connect();
 });
 
+// On phones 'resize' fires whenever the URL bar collapses/expands (page scroll), on rotation and when
+// the keyboard opens. It must NOT hard-code slam/overview, otherwise the canvas is moved out of the
+// Navigation viewport (grey map, robot missing, Center Robot acting on the wrong viewport).
 window.addEventListener('resize', () => {
     if (window.mapRenderer) {
-        window.mapRenderer.moveToViewport(document.querySelector('.page.active')?.id === 'page-slam' ? 'slam' : 'overview');
+        const pageId = document.querySelector('.page.active')?.id || 'page-overview';
+        window.mapRenderer.moveToViewport(pageId.replace('page-', ''));
     } else if (typeof window.resizeCanvas === 'function') {
         window.resizeCanvas();
     }

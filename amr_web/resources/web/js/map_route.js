@@ -128,12 +128,54 @@
         return Math.max(0.01, Math.min(rect.width / mapW, rect.height / mapH) * 0.1);
     }
 
+    // Zoom around a point (canvas-relative px). Shared by wheel and pinch. Does not render.
+    function zoomCanvasAt(mouseX, mouseY, zoomFactor) {
+        const rect = routeCanvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+
+        const minScale = getMinScale();
+        const maxScale = 500.0;
+
+        let newScale = canvasScale * zoomFactor;
+        newScale = Math.max(minScale, Math.min(maxScale, newScale));
+
+        if (newScale !== canvasScale && !isNaN(newScale)) {
+            const scaleRatio = newScale / canvasScale;
+            const centerWorldX = mouseX - rect.width / 2;
+            const centerWorldY = mouseY - rect.height / 2;
+            canvasOffsetX = centerWorldX - (centerWorldX - canvasOffsetX) * scaleRatio;
+            canvasOffsetY = centerWorldY - (centerWorldY - canvasOffsetY) * scaleRatio;
+            canvasScale = newScale;
+        }
+    }
+
+    // Touch pinch state (Pointer Events: mouse, touch and pen share one code path)
+    const routePointers = new Map();   // pointerId -> {x, y}
+    let routePinch = null;             // { dist, midX, midY }
+
+    function routePinchMetrics() {
+        const [a, b] = [...routePointers.values()];
+        return {
+            dist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+            midX: (a.x + b.x) / 2,
+            midY: (a.y + b.y) / 2
+        };
+    }
+
     function setupCanvasInteraction() {
         if (!routeCanvas || canvasInteractionsBound) return;
         canvasInteractionsBound = true;
 
-        routeCanvas.addEventListener('mousedown', (e) => {
-            if (e.button !== 0) return;
+        routeCanvas.addEventListener('pointerdown', (e) => {
+            routePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            if (routePointers.size === 2) {
+                // second finger -> pinch zoom, cancel any one-finger pan
+                isDragging = false;
+                routePinch = routePinchMetrics();
+                return;
+            }
+            if (routePointers.size > 2) return;
+            if (e.pointerType === 'mouse' && e.button !== 0) return;
 
             const rect = routeCanvas.getBoundingClientRect();
             const mouseX = e.clientX - rect.left;
@@ -201,7 +243,21 @@
             }
         });
 
-        routeCanvas.addEventListener('mousemove', (e) => {
+        routeCanvas.addEventListener('pointermove', (e) => {
+            if (routePointers.has(e.pointerId)) {
+                routePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            }
+            if (routePointers.size >= 2 && routePinch) {
+                const r = routeCanvas.getBoundingClientRect();
+                const m = routePinchMetrics();
+                canvasOffsetX += m.midX - routePinch.midX;       // two-finger pan
+                canvasOffsetY += m.midY - routePinch.midY;
+                zoomCanvasAt(m.midX - r.left, m.midY - r.top, m.dist / routePinch.dist);
+                routePinch = m;
+                renderCanvas();
+                return;
+            }
+
             const rect = routeCanvas.getBoundingClientRect();
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top;
@@ -234,14 +290,21 @@
             }
         });
 
-        routeCanvas.addEventListener('mouseup', () => {
+        const endRoutePointer = (e) => {
+            routePointers.delete(e.pointerId);
+            if (routePointers.size < 2) routePinch = null;
             if (isDragging) {
                 isDragging = false;
                 routeCanvas.style.cursor = 'default';
             }
-        });
+        };
+        routeCanvas.addEventListener('pointerup', endRoutePointer);
+        routeCanvas.addEventListener('pointercancel', endRoutePointer);
 
-        routeCanvas.addEventListener('mouseleave', () => {
+        routeCanvas.addEventListener('pointerleave', (e) => {
+            // touch pointers fire pointerleave right after pointerup; mouse fires it when leaving the canvas
+            routePointers.delete(e.pointerId);
+            if (routePointers.size < 2) routePinch = null;
             isDragging = false;
             pendingMousePos = null;
             routeCanvas.style.cursor = 'default';
@@ -299,28 +362,8 @@
             const rect = routeCanvas.getBoundingClientRect();
             if (!rect.width || !rect.height) return;
 
-            const mouseX = e.clientX - rect.left;
-            const mouseY = e.clientY - rect.top;
-
-            const zoomFactor = e.deltaY < 0 ? 1.15 : 0.85;
-            const minScale = getMinScale();
-            const maxScale = 500.0;
-
-            let newScale = canvasScale * zoomFactor;
-            newScale = Math.max(minScale, Math.min(maxScale, newScale));
-
-            if (newScale !== canvasScale && !isNaN(newScale)) {
-                const scaleRatio = newScale / canvasScale;
-
-                const centerWorldX = mouseX - rect.width / 2;
-                const centerWorldY = mouseY - rect.height / 2;
-
-                canvasOffsetX = centerWorldX - (centerWorldX - canvasOffsetX) * scaleRatio;
-                canvasOffsetY = centerWorldY - (centerWorldY - canvasOffsetY) * scaleRatio;
-                canvasScale = newScale;
-
-                renderCanvas();
-            }
+            zoomCanvasAt(e.clientX - rect.left, e.clientY - rect.top, e.deltaY < 0 ? 1.15 : 0.85);
+            renderCanvas();
         }, { passive: false });
     }
 
@@ -1280,8 +1323,15 @@
 
             document.getElementById('btnSaveRoute')?.addEventListener('click', saveRoute);
 
+            let lastRouteCanvasW = 0;
             window.addEventListener('resize', () => {
-                fitMapToView();
+                const w = routeCanvas ? routeCanvas.getBoundingClientRect().width : 0;
+                // Re-fit only when the width really changed (rotation / window resize).
+                // On phones the URL bar collapsing fires 'resize' too and must not reset pan/zoom.
+                if (w > 0 && Math.abs(w - lastRouteCanvasW) > 1) {
+                    lastRouteCanvasW = w;
+                    fitMapToView();
+                }
                 renderCanvas();
             });
         }
