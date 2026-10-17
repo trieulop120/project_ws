@@ -24,6 +24,13 @@ from typing import Optional, Dict, Any
 
 from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
 from action_msgs.msg import GoalStatus
+# History (HISTORY_RESULTS_PLAN.md §6, Phase 3): nav-run lifecycle.
+try:
+    from amr_web.history import events as _history_events
+    from amr_web.history import runs as _history_runs
+    _HISTORY_OK = True
+except Exception:
+    _HISTORY_OK = False
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 
@@ -155,6 +162,17 @@ class NavBridge:
         if self._current_goal_pose:
             payload['target'] = self._current_goal_pose.get('name', 'Goal')
         self._emit(payload)
+        # [history] Record nav_result event and close the active run. Soft-fail.
+        if _HISTORY_OK:
+            try:
+                sess = _history_runs.get_active()
+                _history_events.record_nav_result(
+                    state, message, run_id=(sess.run_id if sess is not None else None))
+                _history_runs.finish_active_run(
+                    state if state in ('SUCCEEDED', 'FAILED', 'CANCELED') else 'FAILED',
+                    message, self._capture_current_pose())
+            except Exception:
+                pass
 
     # ============================================
     # Process Management - Nav2 Launch
@@ -185,6 +203,28 @@ class NavBridge:
             return self._action_client.server_is_ready()
         except Exception:
             return False
+
+    def _capture_current_pose(self) -> Optional[dict]:
+        """Read the latest pose from the bridge's state_bridge (if any)."""
+        try:
+            node = getattr(self, "_node", None)
+            if node is None:
+                return None
+            state_bridge = getattr(node, "_state_bridge", None)
+            if state_bridge is None:
+                return None
+            pose = state_bridge.get_latest_pose()
+            if not pose:
+                return None
+            pos = pose.get("position") or {}
+            ori = pose.get("orientation") or {}
+            return {
+                "x": float(pos.get("x", 0.0)),
+                "y": float(pos.get("y", 0.0)),
+                "yaw": float(ori.get("yaw", 0.0)),
+            }
+        except Exception:
+            return None
 
     def _waypoint_ready(self) -> bool:
         """Check if navigate_through_poses action server is ready."""
@@ -258,6 +298,16 @@ class NavBridge:
             'message': f'Nav2 exited unexpectedly (code {rc})',
             'timestamp': time.time()
         })
+        # [history] This path bypasses _broadcast_nav_result: record it and close the run.
+        if _HISTORY_OK:
+            try:
+                _msg = f'Nav2 exited unexpectedly (code {rc})'
+                sess = _history_runs.get_active()
+                _history_events.record_nav_result(
+                    'FAILED', _msg, run_id=(sess.run_id if sess is not None else None))
+                _history_runs.finish_active_run('FAILED', _msg, self._capture_current_pose())
+            except Exception:
+                pass
         self._broadcast_state()
 
     def _terminate_process_group(self, proc) -> None:
@@ -322,6 +372,14 @@ class NavBridge:
             self._feedback = None
             self._current_goal_pose = None
             self._session = {'map_id': None, 'route_id': None}
+
+        # [history] Nav2 was stopped by the user: close a run that is still open (idempotent).
+        if _HISTORY_OK:
+            try:
+                _history_runs.finish_active_run(
+                    'CANCELED', 'Navigation stopped', self._capture_current_pose())
+            except Exception:
+                pass
 
         # B21 Fix: Tắt cờ dừng sau khi cleanup xong
         with self._lock:
@@ -401,6 +459,22 @@ class NavBridge:
             send_future.add_done_callback(self._on_goal_response)
 
             self._current_state = self.STATE_ACTIVE
+            # [history] Open a run for this navigation goal. Use the
+            # current pose as the start. Soft-fail; an exception here
+            # must not affect robot control.
+            if _HISTORY_OK:
+                try:
+                    _history_runs.begin_goal_run(
+                        goal_pose={"x": float(pose.get("x", 0.0)),
+                                   "y": float(pose.get("y", 0.0)),
+                                   "yaw": float(pose.get("yaw", 0.0))},
+                        start_pose=self._capture_current_pose(),
+                        map_id=(self._session.get("map_id")
+                                if isinstance(self._session, dict) else None),
+                        route_id=route_id,
+                    )
+                except Exception:
+                    pass
             self._broadcast_state()
             return True, "Goal accepted"
 
@@ -609,6 +683,23 @@ class NavBridge:
             send_future.add_done_callback(self._on_waypoint_goal_response)
 
             self._current_state = self.STATE_ACTIVE
+            # [history] Open a run for this waypoint/route mission (soft-fail).
+            if _HISTORY_OK:
+                try:
+                    _history_runs.begin_waypoint_run(
+                        waypoints=[{"x": float(wp.get("x", 0.0)),
+                                    "y": float(wp.get("y", 0.0)),
+                                    "yaw": float(wp.get("yaw", 0.0)),
+                                    "name": wp.get("name")} for wp in waypoints],
+                        start_pose=self._capture_current_pose(),
+                        map_id=(self._session.get("map_id")
+                                if isinstance(self._session, dict) else None),
+                        route_id=(self._session.get("route_id")
+                                  if isinstance(self._session, dict) else None),
+                        mission_type=mission_type,
+                    )
+                except Exception:
+                    pass
             self._broadcast_state()
             return True, f"Mission started: {len(waypoints)} waypoints"
 
@@ -624,6 +715,13 @@ class NavBridge:
                     'distance_remaining': float(getattr(fb, 'distance_remaining', 0.0)),
                     'time_remaining': getattr(getattr(fb, 'estimated_time_remaining', None), 'sec', 0),
                 }
+            # [history] waypoint_index increased => the previous waypoint(s) were reached.
+            if _HISTORY_OK:
+                try:
+                    _history_runs.on_waypoint_progress(
+                        self._current_waypoint_index, self._capture_current_pose())
+                except Exception:
+                    pass
             self._broadcast_state()
         except Exception as e:
             if self._logger:

@@ -126,6 +126,9 @@ function navigateToPage(p) {
     if (p === 'map' && typeof window.initMapRoutePage === 'function') {
         window.initMapRoutePage();
     }
+
+    // Trigger History page (data-page="system")
+    if (p === 'system' && typeof window.onNavigateToHistory === 'function') window.onNavigateToHistory();
 }
 
 function showSlamActiveUI() {

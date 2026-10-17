@@ -314,7 +314,7 @@ local_costmap:
       voxel_layer:
         plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
         enabled: True
-        voxel_decay: 15.0              # Giữ Voxel để xe trôi qua hẳn mới xóa
+        voxel_decay: 8.0              # Giữ Voxel để xe trôi qua hẳn mới xóa
         decay_model: 0                 # Linear Decay
         clear_after_reading: true     # FALSE: Giữ buffer để decay mượt mà
         transform_tolerance: 0.3       # Dung sai TF cho dữ liệu 15Hz
@@ -384,7 +384,7 @@ global_costmap:
       voxel_layer:
         plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
         enabled: True
-        voxel_decay: 15.0              # Giữ Voxel để xe trôi qua hẳn mới xóa
+        voxel_decay: 8.0              # Giữ Voxel để xe trôi qua hẳn mới xóa
         decay_model: 0                 # Linear Decay
         clear_after_reading: true     # FALSE: Giữ buffer để decay mượt mà
         transform_tolerance: 0.3       # Dung sai TF cho dữ liệu 15Hz

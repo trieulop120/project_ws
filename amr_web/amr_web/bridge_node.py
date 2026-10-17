@@ -43,6 +43,14 @@ from amr_web.converters import (
 )
 from amr_web.web_server import create_app
 from amr_web.nav_bridge import NavBridge
+# History (HISTORY_RESULTS_PLAN.md §6): edge-triggered system events.
+# Import is guarded so a broken history package cannot kill the bridge.
+try:
+    from amr_web.history import db as _history_db
+    from amr_web.history import system_hooks as _history_system_hooks
+    _HISTORY_OK = True
+except Exception:
+    _HISTORY_OK = False
 
 
 def sensor_qos():
@@ -168,6 +176,13 @@ class WebBridge(Node):
         self._tf_lookup_timer_obj = self.create_timer(
             1.0 / max(self._pose_rate, 0.1), self._tf_lookup_timer)
 
+        # [history] Pose sampler at 5 Hz. Pushes (t, x, y, yaw) into the
+        # active RunSession, if any. Non-blocking; never touches the
+        # network or DB directly.
+        if _HISTORY_OK:
+            self._history_pose_timer = self.create_timer(
+                0.2, self._history_sample_pose)
+
         # Publishers cho teleop và lift
         self._cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self._esp32_cmd_pub = self.create_publisher(String, '/esp32_cmd', 10)
@@ -266,6 +281,9 @@ class WebBridge(Node):
         # Initialize Navigation Bridge
         self._init_nav_bridge()
 
+        # Initialize History (HISTORY_RESULTS_PLAN.md §6). Soft-fail.
+        self._init_history()
+
     def set_camera_stream(self, enable: bool, mode: str = 'off') -> None:
         """Bật/tắt camera stream dynamic theo yêu cầu từ Web SCADA."""
         self._camera_streaming = enable
@@ -285,6 +303,28 @@ class WebBridge(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to init NavBridge: {e}')
             self._nav_bridge = None
+
+    def _init_history(self) -> None:
+        """Initialise the operation history subsystem (additive, soft-fail)."""
+        if not _HISTORY_OK:
+            return
+        try:
+            ok = _history_db.init()
+            if ok and self._verbose:
+                self.get_logger().info(
+                    f"History DB enabled at {_history_db.db_path()}")
+            elif not ok and self._verbose:
+                self.get_logger().warn(
+                    "History DB disabled (could not open DB). "
+                    "Robot operation is unaffected.")
+            # Mark any runs left open by a previous backend instance.
+            try:
+                _history_db.mark_open_runs_interrupted()
+            except Exception:
+                pass
+        except Exception as e:
+            if self._verbose:
+                self.get_logger().warn(f"History init failed (ignored): {e}")
 
     # ============================================
     # Event Loop Attachment (Phase 1 Fix)
@@ -339,6 +379,17 @@ class WebBridge(Node):
                 if now - self._last_system_status_send >= self._system_status_interval:
                     system_status = self._state_bridge.get_system_overview_state()
                     await self._ws_manager.broadcast(json.dumps(system_status))
+                    # [history] Feed the edge-trigger monitor (plan §6).
+                    if _HISTORY_OK:
+                        try:
+                            _history_system_hooks.tick(
+                                system_status=system_status,
+                                nav_state={"running": bool(self.is_navigation_running())},
+                                slam_active=self.get_slam_state(),
+                                battery=self._state_bridge.get_latest_battery(),
+                            )
+                        except Exception:
+                            pass
                     self._last_system_status_send = now
 
                 if now - self._last_laser_send >= self._laser_interval:
@@ -704,6 +755,32 @@ class WebBridge(Node):
                     f'[B05] Map-frame pose active: frame={self._map_frame}, '
                     f'base={self._base_frame}, pose=({mx:.3f},{my:.3f},{myaw:.3f})'
                 )
+
+    def _history_sample_pose(self) -> None:
+        """Timer callback (5 Hz). Pushes current pose into the active
+        RunSession, if any. Soft-fail: never raises."""
+        if not _HISTORY_OK:
+            return
+        try:
+            from amr_web.history import runs as _history_runs
+            session = _history_runs.get_active()
+            if session is None:
+                return
+            pose = self._state_bridge.get_latest_pose()
+            if not pose:
+                return
+            pos = pose.get("position") or {}
+            ori = pose.get("orientation") or {}
+            x = pos.get("x")
+            y = pos.get("y")
+            yaw = ori.get("yaw")
+            if x is None or y is None or yaw is None:
+                return
+            # Wall-clock time on purpose: the pose "timestamp" is ROS/odom time, which is
+            # not guaranteed to be on the same epoch as the run's start time.
+            session.sample_pose(time.time(), float(x), float(y), float(yaw))
+        except Exception:
+            pass
 
     def _run_server(self) -> None:
         config = uvicorn.Config(
@@ -1166,6 +1243,13 @@ class WebBridge(Node):
 
         try:
             self._nav_bridge._emergency_stop()
+            # [history] Flag the open run (if any) so its result reflects the E-stop.
+            if _HISTORY_OK:
+                try:
+                    from amr_web.history import runs as _history_runs
+                    _history_runs.mark_estop()
+                except Exception:
+                    pass
             return True, "Emergency stop applied"
         except Exception as e:
             self.get_logger().error(f'Emergency stop failed: {e}')
@@ -1194,6 +1278,12 @@ def main(args=None):
             bridge._nav_bridge.stop_nav2()
         executor.remove_node(bridge)
         bridge.destroy_node()
+        # [history] Flush writer thread + mark open runs INTERRUPTED.
+        if _HISTORY_OK:
+            try:
+                _history_db.shutdown()
+            except Exception:
+                pass
         rclpy.shutdown()
 
 

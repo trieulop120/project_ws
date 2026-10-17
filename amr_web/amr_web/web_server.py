@@ -16,12 +16,34 @@ from contextlib import asynccontextmanager
 from ament_index_python.packages import get_package_share_directory
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-
+from typing import Optional
 from amr_web.websocket_manager import WebSocketManager
 from amr_web.state_bridge import StateBridge
+# History (HISTORY_RESULTS_PLAN.md §6): log every WS command and connection
+# edge. Imports are guarded by try/except at the use site so a missing
+# history package (e.g. older install) cannot break the server.
+try:
+    from amr_web.history import events as _history_events
+    from amr_web.history import runs as _history_runs
+    _HISTORY_OK = True
+except Exception:
+    _HISTORY_OK = False
 
 mimetypes.add_type('text/css', '.css')
 mimetypes.add_type('application/javascript', '.js')
+
+
+def _client_ip(websocket: WebSocket) -> Optional[str]:
+    """Best-effort client IP for history logging. Never raises."""
+    try:
+        client = getattr(websocket, "client", None)
+        if client is not None:
+            host = getattr(client, "host", None)
+            if host:
+                return str(host)
+    except Exception:
+        pass
+    return None
 
 
 def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_logger=None, bridge_node=None) -> FastAPI:
@@ -148,6 +170,22 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             return {"status": "error", "message": "Missing map_id or route payload"}
 
         success, msg = bridge_node.save_route(map_id, route_data)
+        # [history] Record route save (plan §6).
+        if _HISTORY_OK:
+            try:
+                route_name = (route_data.get("graph_name")
+                              or route_data.get("name") or "")
+                _history_events.record_system_event(
+                    category="ROUTE",
+                    action="route_saved" if success else "route_save_failed",
+                    level="info" if success else "warn",
+                    detail=f"map={map_id} name={route_name}",
+                    params={"map_id": map_id, "route_name": route_name,
+                            "result": "success" if success else "failed"},
+                    result="success" if success else "failed",
+                )
+            except Exception:
+                pass
         if success:
             return {"status": "ok", "message": msg}
         return {"status": "error", "message": msg}
@@ -158,6 +196,20 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             return {"status": "error", "message": "Bridge node not available"}
 
         success, msg = bridge_node.delete_map_and_routes(map_id)
+        # [history] Record map delete (plan §6).
+        if _HISTORY_OK:
+            try:
+                _history_events.record_system_event(
+                    category="MAP",
+                    action="map_deleted" if success else "map_delete_failed",
+                    level="info" if success else "warn",
+                    detail=f"map={map_id}",
+                    params={"map_id": map_id,
+                            "result": "success" if success else "failed"},
+                    result="success" if success else "failed",
+                )
+            except Exception:
+                pass
         if success:
             return {"status": "ok", "message": msg}
         return {"status": "error", "message": msg}
@@ -165,6 +217,29 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
     async def handle_command(cmd: dict, websocket: WebSocket) -> dict:
         command = cmd.get('command', '')
         result = {"type": "command_response", "command": command}
+
+        # [history] Record incoming command (plan §6). Soft-fail: any error
+        # is swallowed inside the helper; we never raise from here.
+        client_ip = _client_ip(websocket) if _HISTORY_OK else None
+        history_event_id = (
+            _history_events.record_command(cmd, client_ip=client_ip)
+            if _HISTORY_OK else None
+        )
+        # [history] Hand the client IP to the run that nav_bridge is about to open.
+        if command in ("nav_goal", "waypoint_mission") and _HISTORY_OK:
+            try:
+                _history_runs.set_pending_client(client_ip)
+            except Exception:
+                pass
+        if command == "teleop" and _HISTORY_OK:
+            try:
+                _history_events.record_teleop_tick(
+                    client_ip,
+                    float(cmd.get("linear", 0.0)),
+                    float(cmd.get("angular", 0.0)),
+                )
+            except Exception:
+                pass
 
         # P1-1 Fix: Run blocking commands in thread pool
         if command == "start_slam":
@@ -375,12 +450,39 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             result["status"] = "unknown"
             result["message"] = f"Unknown command: {command}"
 
+        # [history] The command has been handled: drop an unused pending client IP.
+        if command in ("nav_goal", "waypoint_mission") and _HISTORY_OK:
+            try:
+                _history_runs.set_pending_client(None)
+            except Exception:
+                pass
+
+        # [history] Update the recorded 'requested' row with the final
+        # success/failed status. Non-blocking; ignored on any error.
+        if _HISTORY_OK and history_event_id is not None:
+            try:
+                _history_events.update_command_result(
+                    history_event_id,
+                    success=str(result.get("status", "")) in (
+                        "ok", "success", "started", "sent", "canceled", "stopped", "found"),
+                    message=result.get("message"),
+                )
+            except Exception:
+                pass
+
         return result
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         await websocket.accept()
         ws_manager.add(websocket)
+
+        # [history] Record WS connect (plan §6).
+        if _HISTORY_OK:
+            try:
+                _history_events.record_ws_connect(_client_ip(websocket))
+            except Exception:
+                pass
 
         if node_logger:
             node_logger.info(f'Client connected. Total: {ws_manager.connection_count}')
@@ -425,8 +527,26 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                 node_logger.error(f'WS endpoint error: {e}')
         finally:
             ws_manager.remove(websocket)
+            # [history] Record WS disconnect + close any open teleop session.
+            if _HISTORY_OK:
+                try:
+                    ip = _client_ip(websocket)
+                    _history_events.end_teleop_session(ip)
+                    _history_events.record_ws_disconnect(ip)
+                except Exception:
+                    pass
             if node_logger:
                 node_logger.info('Client disconnected')
+
+    # [history] REST API for the History page. Must be included BEFORE the "/" static
+    # mount below, otherwise the mount would swallow /api/history/*. Soft-fail.
+    if _HISTORY_OK:
+        try:
+            from amr_web.history import api as _history_api
+            app.include_router(_history_api.router)
+        except Exception as e:
+            if node_logger:
+                node_logger.warn(f'History API disabled: {e}')
 
     if os.path.exists(web_dir):
         app.mount("/", StaticFiles(directory=web_dir, html=True), name="static")

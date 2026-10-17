@@ -12,6 +12,7 @@
     <link rel="stylesheet" href="/css/variables.css?v=1.0.17">
     <link rel="stylesheet" href="/css/layout.css?v=1.0.17">
     <link rel="stylesheet" href="/css/components.css?v=1.0.17">
+    <link rel="stylesheet" href="/css/history.css?v=1.0.1">
 </head>
 <body>
 <div class="app">
@@ -57,9 +58,9 @@
                 <div class="nav-section-title">System</div>
                 <a class="nav-item" data-page="system">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <circle cx="12" cy="12" r="3"/>
-                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-                    </svg>System
+                        <circle cx="12" cy="12" r="10"/>
+                        <polyline points="12 6 12 12 16 14"/>
+                    </svg>History
                 </a>
             </div>
         </nav>
@@ -794,16 +795,122 @@
             </div>
         </div>
 
-        <!-- System Page -->
+        <!-- History Page (replaces the System placeholder; data-page="system" is kept on purpose) -->
         <div class="page" id="page-system">
-            <div class="placeholder-page">
-                <svg class="placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="3"/>
-                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-                </svg>
-                <div class="placeholder-title">System Settings</div>
-                <div class="placeholder-desc">System configuration will be available in a future update.</div>
+            <div class="hist-page" id="histPage">
+                <div class="hist-topbar">
+                    <div class="hist-tabs" role="tablist" aria-label="History views">
+                        <button class="hist-tab active" role="tab" id="histTabEvents" data-tab="events" aria-selected="true" aria-controls="histPanel">Operation History</button>
+                        <button class="hist-tab" role="tab" id="histTabRuns" data-tab="runs" aria-selected="false" aria-controls="histPanel">Navigation Results</button>
+                    </div>
+                    <div class="hist-topbar-actions">
+                        <button class="btn btn-secondary hist-filter-toggle" id="histFilterToggle" type="button" aria-expanded="false" aria-controls="histFilters">Filters <span class="hist-count" id="histFilterCount" hidden>0</span></button>
+                        <button class="btn btn-secondary" id="histRefresh" type="button">Refresh</button>
+                    </div>
+                </div>
+
+                <section class="hist-filters" id="histFilters" aria-label="Filters">
+                    <div class="hist-range">
+                        <label class="hist-field"><span>From</span><input type="datetime-local" class="hist-input" id="histFrom"></label>
+                        <label class="hist-field"><span>To</span><input type="datetime-local" class="hist-input" id="histTo"></label>
+                        <div class="hist-presets" role="group" aria-label="Quick range">
+                            <button class="btn btn-secondary" type="button" data-preset="today">Today</button>
+                            <button class="btn btn-secondary" type="button" data-preset="7d">7 days</button>
+                            <button class="btn btn-secondary" type="button" data-preset="all">All</button>
+                        </div>
+                    </div>
+
+                    <div class="hist-fields" data-for="events">
+                        <label class="hist-field"><span>Category</span><select class="hist-input" id="histEvCategory"><option value="">Any</option></select></label>
+                        <label class="hist-field"><span>Level</span><select class="hist-input" id="histEvLevel"><option value="">Any</option></select></label>
+                        <label class="hist-field"><span>Result</span><select class="hist-input" id="histEvResult"><option value="">Any</option></select></label>
+                        <label class="hist-field"><span>Client</span><input type="text" class="hist-input" id="histEvClient" placeholder="IP address" autocomplete="off"></label>
+                        <label class="hist-field hist-field-wide"><span>Search</span><input type="text" class="hist-input" id="histEvQ" placeholder="Action or detail" autocomplete="off"></label>
+                    </div>
+
+                    <div class="hist-fields" data-for="runs" hidden>
+                        <label class="hist-field"><span>Type</span><select class="hist-input" id="histRunType"><option value="">Any</option></select></label>
+                        <label class="hist-field"><span>Result</span><select class="hist-input" id="histRunResult"><option value="">Any</option></select></label>
+                        <label class="hist-field"><span>Map</span><select class="hist-input" id="histRunMap"><option value="">Any</option></select></label>
+                        <label class="hist-field"><span>Scenario</span><input type="text" class="hist-input" id="histRunScenario" placeholder="Contains..." autocomplete="off"></label>
+                        <label class="hist-field"><span>Client</span><input type="text" class="hist-input" id="histRunClient" placeholder="IP address" autocomplete="off"></label>
+                        <label class="hist-field"><span>Search</span><input type="text" class="hist-input" id="histRunQ" placeholder="Message or notes" autocomplete="off"></label>
+                    </div>
+
+                    <div class="hist-actions">
+                        <button class="btn btn-accent" type="button" id="histApply">Apply</button>
+                        <button class="btn btn-secondary" type="button" id="histClear">Clear</button>
+                        <button class="btn btn-secondary" type="button" id="histDownload">Download Excel</button>
+                    </div>
+                </section>
+
+                <section class="hist-card" id="histPanel" role="tabpanel" aria-labelledby="histTabEvents">
+                    <div class="hist-state" id="histState" hidden></div>
+                    <div class="hist-scroll" id="histScroll">
+                        <table class="hist-table" id="histTable">
+                            <thead id="histHead"></thead>
+                            <tbody id="histBody"></tbody>
+                        </table>
+                    </div>
+                    <div class="hist-pager" id="histPager">
+                        <span class="hist-range-text" id="histRangeText" aria-live="polite"></span>
+                        <label class="hist-rows"><span>Rows per page</span>
+                            <select class="hist-input" id="histPageSize">
+                                <option value="25">25</option>
+                                <option value="50">50</option>
+                                <option value="100">100</option>
+                            </select>
+                        </label>
+                        <button class="btn btn-secondary" type="button" id="histSort">Newest first</button>
+                        <nav class="hist-pages" id="histPages" aria-label="Pages"></nav>
+                    </div>
+                </section>
             </div>
+        </div>
+    </div>
+</div>
+
+<!-- History: run detail -->
+<div id="histRunModal" class="modal-overlay hist-overlay" role="dialog" aria-modal="true" aria-labelledby="histRunTitle">
+    <div class="modal-content hist-modal">
+        <div class="modal-header">
+            <h3 id="histRunTitle">Run</h3>
+            <button class="modal-close" id="histRunClose" type="button" aria-label="Close">&times;</button>
+        </div>
+        <div class="hist-modal-body" id="histRunBody">
+            <div class="hist-run-head" id="histRunHead"></div>
+            <div class="hist-run-grid">
+                <div class="hist-run-plot">
+                    <div class="hist-plot-box">
+                        <canvas id="histTrajCanvas" aria-label="Trajectory plot"></canvas>
+                        <div class="hist-plot-empty" id="histTrajEmpty" hidden></div>
+                    </div>
+                    <div class="hist-legend" id="histLegend">
+                        <span><i class="lg lg-start"></i>Start</span>
+                        <span><i class="lg lg-goal"></i>Goal</span>
+                        <span><i class="lg lg-end"></i>End</span>
+                        <span><i class="lg lg-path"></i>Path</span>
+                    </div>
+                </div>
+                <div class="hist-run-summary" id="histRunSummary"></div>
+            </div>
+            <div id="histRunWaypoints"></div>
+            <div class="hist-edit">
+                <h4>Test notes</h4>
+                <div class="hist-edit-grid">
+                    <label class="hist-field"><span>Scenario</span><input type="text" class="hist-input" id="histEditScenario" maxlength="200" autocomplete="off" placeholder="e.g. Straight 5 m, empty"></label>
+                    <label class="hist-field"><span>Measured error (cm)</span><input type="number" class="hist-input" id="histEditMeasured" step="0.1" inputmode="decimal" placeholder="Tape measure"></label>
+                    <label class="hist-field hist-edit-notes"><span>Notes</span><textarea class="hist-input" id="histEditNotes" rows="3" maxlength="2000" placeholder="Anything worth remembering about this run"></textarea></label>
+                </div>
+                <div class="hist-edit-actions">
+                    <button class="btn btn-accent" type="button" id="histRunSave">Save changes</button>
+                    <span class="hist-save-msg" id="histSaveMsg" role="status"></span>
+                </div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" type="button" id="histRunDownload">Download this run</button>
+            <button class="btn btn-secondary" type="button" id="histRunCloseBtn">Close</button>
         </div>
     </div>
 </div>
@@ -843,6 +950,7 @@
 <script src="/js/slam.js?v=1.0.16"></script>
 <script src="/js/navigation.js?v=1.0.18"></script>
 <script src="/js/map_route.js?v=1.0.16"></script>
-<script src="/js/app.js?v=1.0.16"></script>
+<script src="/js/app.js?v=1.0.17"></script>
+<script src="/js/history.js?v=1.0.1"></script>
 </body>
 </html>
