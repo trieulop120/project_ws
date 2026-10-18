@@ -18,7 +18,7 @@
   <joint name="base_footprint_joint" type="fixed">
     <parent link="base_footprint"/>
     <child link="base_link"/>
-    <origin xyz="0 0 0.0926" rpy="0 0 0"/>
+    <origin xyz="0 0 0.113" rpy="0 0 0"/>
   </joint>
 
   <!-- PHYSICAL PROPERTIES -->
@@ -196,8 +196,8 @@
       <right_joint>front_encoder_wheel_right_joint</right_joint>
 
       <!-- Kinematics  -->
-      <wheel_separation>0.4722</wheel_separation>
-      <wheel_diameter>0.065</wheel_diameter>
+      <wheel_separation>0.49</wheel_separation>
+      <wheel_diameter>0.100</wheel_diameter>
 
       <!-- Limits -->
       <max_wheel_torque>0.863</max_wheel_torque>

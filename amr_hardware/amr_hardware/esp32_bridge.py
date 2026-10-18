@@ -21,8 +21,8 @@ class ESP32Bridge(Node):
         # --- PARAMETERS ---
         self.declare_parameter('port', '/dev/esp32')
         self.declare_parameter('baudrate', 115200)
-        self.declare_parameter('wheel_radius', 0.0325)    # Bán kính 32.5mm
-        self.declare_parameter('wheelbase', 0.4722)         # Khoảng cách 2 bánh 472mm
+        self.declare_parameter('wheel_radius', 0.05)    # Bán kính 32.5mm
+        self.declare_parameter('wheelbase', 0.49)         # Khoảng cách 2 bánh 472mm
         self.declare_parameter('counts_per_rev', 3960.0)  # 3960 xung/vòng
         self.declare_parameter('max_rpm', 110.0)           # Tốc độ tối đa 110 RPM
         self.declare_parameter('publish_tf', False)

@@ -723,22 +723,27 @@ class WebBridge(Node):
     # Vi vay KHONG nhan them voi pose odom (code cu nhan doi, va con tu doc lai
     # chinh pose map do tick truoc ghi ra -> cong don -> troi vang).
     def _tf_lookup_timer(self) -> None:
-        if not (self._nav_bridge and self._nav_bridge.is_nav_running()):
+        # Cho phép cập nhật Pose từ TF Map khi Nav2 chạy HOẶC khi đang mở SLAM
+        nav_is_running = self._nav_bridge and self._nav_bridge.is_nav_running()
+        slam_is_running = self.get_slam_state()
+
+        if not (nav_is_running or slam_is_running):
             return
 
         tf = self._lookup_map_tf(self._base_frame)
         if tf is None:
-            # AMCL chua publish map->odom (vi du chua set initial pose) -> giu pose odom
+            # Chưa lấy được TF map->base (ví dụ SLAM/AMCL chưa phát TF)
             return
-        mx, my, myaw = tf
-        myaw = math.atan2(math.sin(myaw), math.cos(myaw))  # chuan hoa [-pi, pi]
 
-        # Dung ban odom tho lam khuon de giu cac field phu (van toc...),
-        # roi ghi de position/orientation/frame_id bang gia tri trong khung map.
+        mx, my, myaw = tf
+        myaw = math.atan2(math.sin(myaw), math.cos(myaw))  # Chuẩn hóa góc [-pi, pi]
+
+        # Dùng bản odom thô làm khuôn giữ các thông số phụ
         if self._last_odom_pose is not None:
             map_pose = copy.deepcopy(self._last_odom_pose)
         else:
             map_pose = {}
+
         map_pose["type"] = "pose"
         map_pose["timestamp"] = time.time()
         map_pose["frame_id"] = self._map_frame

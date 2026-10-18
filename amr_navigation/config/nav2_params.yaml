@@ -292,8 +292,7 @@ local_costmap:
       width: 4
       height: 4
       resolution: 0.05
-      # Footprint 4 góc dạng Polygon bao trọn 0.66m x 0.48m
-      footprint: "[[0.3391,0.2398],[0.3391,-0.2402],[-0.3209,-0.2402],[-0.3209,0.2398]]"
+      footprint: "[ [0.42, 0.275], [0.42, -0.275], [-0.35, -0.275], [-0.35, 0.275] ]"
       always_send_full_costmap: True
       footprint_padding: 0.01
       plugins: ["obstacle_layer", "voxel_layer", "inflation_layer"]
@@ -363,8 +362,7 @@ global_costmap:
       transform_tolerance: 1.0
       resolution: 0.1
       track_unknown_space: true
-      # Footprint 4 góc dạng Polygon bao trọn 0.66m x 0.48m
-      footprint: "[[0.3391,0.2398],[0.3391,-0.2402],[-0.3209,-0.2402],[-0.3209,0.2398]]"
+      footprint: "[ [0.42, 0.275], [0.42, -0.275], [-0.35, -0.275], [-0.35, 0.275] ]"
       always_send_full_costmap: True
       plugins: ["static_layer", "obstacle_layer", "voxel_layer", "inflation_layer"]
       obstacle_layer:
@@ -424,28 +422,39 @@ global_costmap:
 
 planner_server:
   ros__parameters:
-    use_sim_time: true
-    expected_planner_frequency: 2.0
-    planner_plugins: [GridBased]
+    expected_planner_frequency: 20.0
+    use_sim_time: False
+    planner_plugins: ["GridBased"]
     GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.1
+      use_astar: true
+      allow_unknown: true
+      
+#planner_server:
+  #ros__parameters:
+    #use_sim_time: true
+    #expected_planner_frequency: 2.0
+    #planner_plugins: [GridBased]
+    #GridBased:
       # Cost-aware grid A* matches the holonomic mecanum base. Hybrid-A* and
       # state-lattice planners add non-holonomic turning constraints that this
       # robot does not have.
-      plugin: nav2_smac_planner/SmacPlanner2D
-      tolerance: 0.15
-      downsample_costmap: false
-      downsampling_factor: 1
-      allow_unknown: false
-      max_iterations: 100000
-      max_on_approach_iterations: 1000
-      max_planning_time: 0.5
-      cost_travel_multiplier: 2.0
-      smoother:
-        max_iterations: 1000
-        w_smooth: 0.3
-        w_data: 0.2
-        tolerance: 1.0e-10
-        do_refinement: true
+      #plugin: nav2_smac_planner/SmacPlanner2D
+      #tolerance: 0.15
+      #downsample_costmap: false
+      #downsampling_factor: 1
+      #allow_unknown: false
+      #max_iterations: 100000
+      #max_on_approach_iterations: 1000
+      #max_planning_time: 0.5
+      #cost_travel_multiplier: 2.0
+      #smoother:
+        #max_iterations: 1000
+        #w_smooth: 0.3
+        #w_data: 0.2
+        #tolerance: 1.0e-10
+        #do_refinement: true
 
 smoother_server:
   ros__parameters:

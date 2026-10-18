@@ -28,9 +28,10 @@ class StaticTransformsPublisher(Node):
         t1.header.stamp = self.get_clock().now().to_msg()
         t1.header.frame_id = 'base_link'
         t1.child_frame_id = 'rear_caster_steer_left_link'
-        t1.transform.translation.x = -0.274101521928339
-        t1.transform.translation.y = 0.19290456578464
-        t1.transform.translation.z = -0.0275984780718609
+        # Đã cập nhật xyz theo file URDF mới
+        t1.transform.translation.x = -0.2757
+        t1.transform.translation.y = 0.1931
+        t1.transform.translation.z = -0.047753
         t1.transform.rotation.x = 0.0
         t1.transform.rotation.y = 0.0
         t1.transform.rotation.z = 0.0
@@ -42,6 +43,7 @@ class StaticTransformsPublisher(Node):
         t2.header.stamp = self.get_clock().now().to_msg()
         t2.header.frame_id = 'rear_caster_steer_left_link'
         t2.child_frame_id = 'rear_caster_wheel_left_link'
+        # Thông số này không đổi so với cũ
         t2.transform.translation.x = 0.017
         t2.transform.translation.y = 0.0
         t2.transform.translation.z = -0.0405
@@ -60,9 +62,10 @@ class StaticTransformsPublisher(Node):
         t3.header.stamp = self.get_clock().now().to_msg()
         t3.header.frame_id = 'base_link'
         t3.child_frame_id = 'rear_caster_steer_right_link'
-        t3.transform.translation.x = -0.274101521928339
-        t3.transform.translation.y = -0.193298478072035
-        t3.transform.translation.z = -0.0275984780718622
+        # Đã cập nhật xyz theo file URDF mới
+        t3.transform.translation.x = -0.2757
+        t3.transform.translation.y = -0.1931
+        t3.transform.translation.z = -0.047753
         t3.transform.rotation.x = 0.0
         t3.transform.rotation.y = 0.0
         t3.transform.rotation.z = 0.0
@@ -74,6 +77,7 @@ class StaticTransformsPublisher(Node):
         t4.header.stamp = self.get_clock().now().to_msg()
         t4.header.frame_id = 'rear_caster_steer_right_link'
         t4.child_frame_id = 'rear_caster_wheel_right_link'
+        # Thông số này không đổi so với cũ
         t4.transform.translation.x = 0.017
         t4.transform.translation.y = 0.0
         t4.transform.translation.z = -0.0405
@@ -86,7 +90,7 @@ class StaticTransformsPublisher(Node):
         # Publish all at once
         self._tf_broadcaster.sendTransform(transforms)
         self.get_logger().info(
-            f'Published {len(transforms)} static transforms: 4 caster TFs'
+            f'Published {len(transforms)} static transforms: 4 caster TFs updated'
         )
 
 

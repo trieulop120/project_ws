@@ -43,5 +43,10 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
   RENAME cmd_vel_splitter
 )
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/calib_check.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME calib_check
+)
 
 ament_package()

@@ -246,20 +246,40 @@
         drawRouteOverlay();
 
         // Draw robot
-        if (window.robotPose && window.robotPose.position && window.robotPose.orientation) {
+        if (window.robotPose && window.robotPose.position && window.robotPose.orientation && window.mapData) {
             const pos = window.robotPose.position;
             const yaw = window.robotPose.orientation.yaw;
             const cp = worldToCanvas(pos.x, pos.y);
+            const Rm = window.mapData.info.resolution; // Độ phân giải map (m/pixel)
+
+            // Kích thước thực tế AMR tính từ tâm base_footprint (Đơn vị: Mét)
+            const frontM = 0.42; // Từ tâm ra mũi trước
+            const rearM = 0.25;  // Từ tâm ra đuôi sau
+            const widthM = 0.29; // Từ tâm ra 2 bên mép bánh (Rộng tổng 58cm)
+
+            // Quy đổi từ Mét sang Pixels của ô lưới
+            const fPx = frontM / Rm;
+            const rPx = rearM / Rm;
+            const wPx = widthM / Rm;
+
             ctx.save();
             ctx.translate(cp.x, cp.y);
-            ctx.rotate(-yaw);
+            ctx.rotate(-yaw); // Xoay đúng hướng Yaw của ROS 2
+
+            // 1. Vẽ khung chữ nhật Footprint thực tế của AMR (Màu viền xanh nhạt)
+            ctx.strokeStyle = 'rgba(16, 185, 129, 0.8)';
+            ctx.lineWidth = 1.5 / vt.scale;
+            ctx.strokeRect(-rPx, -wPx, fPx + rPx, wPx * 2);
+
+            // 2. Vẽ hình tam giác định hướng bên trong (Màu xanh đậm)
             ctx.fillStyle = '#10B981';
             ctx.beginPath();
-            ctx.moveTo(6.5, 0);
-            ctx.lineTo(-6.5, -5);
-            ctx.lineTo(-6.5, 5);
+            ctx.moveTo(fPx, 0);         // Đỉnh mũi tên (Phía trước)
+            ctx.lineTo(-rPx, -wPx);     // Góc sau bên trái
+            ctx.lineTo(-rPx, wPx);      // Góc sau bên phải
             ctx.closePath();
             ctx.fill();
+
             ctx.restore();
         }
 
@@ -284,6 +304,14 @@
         const robotY = window.robotPose.position.y;
         const vt = getActiveViewTransform();
 
+        // Vị trí lắp đặt Lidar so với base_footprint (từ file URDF)
+        const LIDAR_OFFSET_X = -0.0987; // Lùi sau 9.87 cm
+        const LIDAR_OFFSET_Y = -0.00075;
+
+        // Tính vị trí thực tế của mắt đọc Lidar trong hệ tọa độ Map
+        const lidarWorldX = robotX + LIDAR_OFFSET_X * Math.cos(robotYaw) - LIDAR_OFFSET_Y * Math.sin(robotYaw);
+        const lidarWorldY = robotY + LIDAR_OFFSET_X * Math.sin(robotYaw) + LIDAR_OFFSET_Y * Math.cos(robotYaw);
+
         ctx.fillStyle = 'rgba(0, 230, 200, 0.7)';
 
         for (let i = 0; i < ranges.length; i++) {
@@ -292,8 +320,10 @@
             if (r < range_min || r > range_max) continue;
 
             const angle = angle_min + i * angle_increment;
-            const worldX = robotX + r * Math.cos(angle + robotYaw);
-            const worldY = robotY + r * Math.sin(angle + robotYaw);
+        
+            // Cộng tọa độ tia Laser xuất phát từ tâm LIDAR (thay vì tâm robot)
+            const worldX = lidarWorldX + r * Math.cos(angle + robotYaw);
+            const worldY = lidarWorldY + r * Math.sin(angle + robotYaw);
             const cp = worldToCanvas(worldX, worldY);
 
             ctx.beginPath();

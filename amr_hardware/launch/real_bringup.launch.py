@@ -112,8 +112,8 @@ def generate_launch_description():
             'use_sim_time': False,
             'port': esp32_port,
             'baudrate': 115200,
-            'wheel_radius': 0.0325,
-            'wheelbase': 0.472,
+            'wheel_radius': 0.05,
+            'wheelbase': 0.49,
             'publish_tf': False,
         }],
     )
@@ -203,8 +203,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'leaf_size': 0.05,
-            'min_height': 0.15,
-            'max_height': 1.20,
+            'z_min': 0.15,
+            'z_max': 1.20,
         }],
         condition=IfCondition(camera_enable)
     )
