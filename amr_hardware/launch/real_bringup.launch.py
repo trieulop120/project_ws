@@ -113,7 +113,7 @@ def generate_launch_description():
             'port': esp32_port,
             'baudrate': 115200,
             'wheel_radius': 0.05,
-            'wheelbase': 0.49,
+            'wheelbase': 0.477,
             'publish_tf': False,
         }],
     )
