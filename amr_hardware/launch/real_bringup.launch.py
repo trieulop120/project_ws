@@ -8,8 +8,8 @@ import os
 import xacro
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, LogInfo, TimerAction
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -53,6 +53,22 @@ def generate_launch_description():
     )
     camera_enable = LaunchConfiguration('camera_enable')
 
+    use_rf2o_arg = DeclareLaunchArgument(
+        'use_rf2o',
+        default_value='false',
+        description='Fuse the rf2o laser odometry (vx only) into the EKF '
+                    'as a secondary odometry source (true/false)'
+    )
+    use_rf2o = LaunchConfiguration('use_rf2o')
+
+    rf2o_delay_arg = DeclareLaunchArgument(
+        'rf2o_startup_delay',
+        default_value='5.0',
+        description='Delay [s] before starting rf2o, so that the TF '
+                    'base_footprint -> lidar_link is available'
+    )
+    rf2o_delay = LaunchConfiguration('rf2o_startup_delay')
+
     # ============================================
     # Package paths & Configs
     # ============================================
@@ -61,6 +77,7 @@ def generate_launch_description():
 
     xacro_file = os.path.join(pkg_amr_desc, 'urdf', 'amr.gazebo.xacro')
     ekf_config = os.path.join(pkg_amr_localization, 'config', 'ekf_real_robot.yaml')
+    rf2o_config = os.path.join(pkg_amr_localization, 'config', 'rf2o_params.yaml')
 
     # Process xacro
     with open(xacro_file) as f:
@@ -186,6 +203,7 @@ def generate_launch_description():
             # [FIXED]: Disable hardware registration to fix Device.setProperty(5) error
             'enable_depth_to_color_registration': False,
             'depth_registration': False,
+            'color_depth_synchronization': True,
         }],
         remappings=[
             # Remap PointCloud2 output from Astra to /points
@@ -203,16 +221,85 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'leaf_size': 0.05,
-            'z_min': 0.15,
+            'z_min': 0.05,
             'z_max': 1.20,
         }],
         condition=IfCondition(camera_enable)
     )
 
     # ============================================
+    # RF2O Laser Odometry (optional, vx source)
+    # ============================================
+    # Delayed so that the TF base_footprint -> base_link -> lidar_link is
+    # already published by robot_state_publisher when rf2o performs its first
+    # lookupTransform. Without the delay rf2o logs
+    # "lookupTransform base_footprint -> lidar_link" failures and never
+    # initialises.
+    rf2o_node = TimerAction(
+        period=rf2o_delay,
+        actions=[
+            Node(
+                package='rf2o_laser_odometry',
+                executable='rf2o_laser_odometry_node',
+                name='rf2o_laser_odometry',
+                output='screen',
+                parameters=[
+                    rf2o_config,
+                    {'use_sim_time': False}
+                ],
+                arguments=['--ros-args', '--log-level', 'FATAL'],
+                condition=IfCondition(use_rf2o),
+            )
+        ],
+    )
+
+    # ============================================
+    # RF2O Covariance Relay (optional)
+    # ============================================
+    # Sets the covariance of the lidar vx measurement, rejects samples that
+    # are inconsistent with the wheel encoders, and republishes the result
+    # on /odom_rf2o_fused for the EKF.
+    rf2o_relay_node = Node(
+        package='amr_localization',
+        executable='rf2o_cov_relay',
+        name='rf2o_cov_relay',
+        output='screen',
+        parameters=[{'use_sim_time': False}],
+        condition=IfCondition(use_rf2o),
+    )
+
+    # ============================================
     # EKF Localization Node
     # ============================================
+    # The odom1 block (rf2o, vx only) lives in ekf_real_robot.yaml. When
+    # use_rf2o is false, odom1_config is overridden with an all-false vector:
+    # robot_localization then creates no subscription to /odom_rf2o_fused at
+    # all, so the EKF behaves exactly as it did before rf2o was integrated.
     ekf_node = Node(
+        package='robot_localization',
+        executable='ekf_node',
+        name='ekf_filter_node',
+        output='screen',
+        parameters=[
+            ekf_config,
+            {
+                'use_sim_time': False,
+                'odom1_config': [
+                    False, False, False,
+                    False, False, False,
+                    False, False, False,
+                    False, False, False,
+                    False, False, False,
+                ],
+            }
+        ],
+        remappings=[
+            ('/odometry/filtered', '/odometry/filtered')
+        ],
+        condition=UnlessCondition(use_rf2o),
+    )
+
+    ekf_node_rf2o = Node(
         package='robot_localization',
         executable='ekf_node',
         name='ekf_filter_node',
@@ -224,6 +311,7 @@ def generate_launch_description():
         remappings=[
             ('/odometry/filtered', '/odometry/filtered')
         ],
+        condition=IfCondition(use_rf2o),
     )
 
     # ============================================
@@ -235,6 +323,8 @@ def generate_launch_description():
         serial_baudrate_arg,
         scan_mode_arg,
         camera_enable_arg,
+        use_rf2o_arg,
+        rf2o_delay_arg,
 
         bringup_info,
         lidar_info,
@@ -249,5 +339,8 @@ def generate_launch_description():
         scan_filter_node,
         camera_driver,
         pointcloud_filter_node,
+        rf2o_node,
+        rf2o_relay_node,
         ekf_node,
+        ekf_node_rf2o,
     ])

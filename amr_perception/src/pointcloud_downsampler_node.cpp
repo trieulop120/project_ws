@@ -24,7 +24,7 @@ public:
   {
     // Declare parameters (use_sim_time is auto-declared by rclcpp)
     this->declare_parameter("leaf_size", 0.05);
-    this->declare_parameter("z_min", 0.15);
+    this->declare_parameter("z_min", 0.05);
     this->declare_parameter("z_max", 1.20);
 
     leaf_size_ = this->get_parameter("leaf_size").as_double();

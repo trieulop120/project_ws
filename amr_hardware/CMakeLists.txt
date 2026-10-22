@@ -48,5 +48,10 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
   RENAME calib_check
 )
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/tf_snap.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME tf_snap
+)
 
 ament_package()

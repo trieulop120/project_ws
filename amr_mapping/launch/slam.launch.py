@@ -38,19 +38,19 @@ def generate_launch_description():
     # ============================================
     # OctoMap Server
     # ============================================
-    octomap_server = Node(
-        package='octomap_server',
-        executable='octomap_server_node',
-        name='octomap_server',
-        output='screen',
-        parameters=[
-            {'use_sim_time': False},
-            octomap_params
-        ],
-        remappings=[
-            ('cloud_in', '/points'),
-        ],
-    )
+    #octomap_server = Node(
+        #package='octomap_server',
+        #executable='octomap_server_node',
+        #name='octomap_server',
+        #output='screen',
+        #parameters=[
+            #{'use_sim_time': False},
+            #octomap_params
+        #],
+        #remappings=[
+            #('cloud_in', '/points'),
+        #],
+    #)
 
     # ============================================
     # RViz2
@@ -73,7 +73,7 @@ def generate_launch_description():
         slam_node,         # <-- Nhận /scan_filtered để dựng bản đồ
 
         # OctoMap Server
-        octomap_server,
+        #octomap_server,
 
         # Visualization
         rviz,

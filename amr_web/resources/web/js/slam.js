@@ -177,8 +177,8 @@
     // ========================================
 
     function sendTeleopVelocity() {
-        const linearSpeed = parseFloat(slamLinearSpeed?.value) || 0.25;
-        const angularSpeed = parseFloat(slamAngularSpeed?.value) || 0.8;
+        const linearSpeed = parseFloat(slamLinearSpeed?.value) || 0.1;
+        const angularSpeed = parseFloat(slamAngularSpeed?.value) || 0.3;
         const vx = linearSpeed * teleopVelocity.linear;
         const wz = angularSpeed * teleopVelocity.angular;
         sendCommand({ command: 'teleop', linear: vx, angular: wz });

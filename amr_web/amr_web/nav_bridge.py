@@ -34,6 +34,10 @@ except Exception:
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 
+# Tự đặt initial pose AMCL theo node HOME của route khi Nav2 sẵn sàng.
+# Đặt False để quay về hành vi cũ (initial pose do cấu hình Nav2 hoặc nút Set Pose trên web quyết định).
+AUTO_HOME_INITIAL_POSE = True
+
 # Nav2 action message
 try:
     from nav2_msgs.action import NavigateToPose, NavigateThroughPoses
@@ -277,6 +281,9 @@ class NavBridge:
 
         # P1-5 Fix: Start monitoring thread instead of just sleep(1.5)
         threading.Thread(target=self._watch_process, args=(self._nav_process,), daemon=True).start()
+        if AUTO_HOME_INITIAL_POSE:
+            threading.Thread(target=self._apply_home_initial_pose,
+                             args=(self._nav_process, map_id, route_id), daemon=True).start()
         self._broadcast_state()
         return True, "Nav2 is starting"
 
@@ -859,6 +866,85 @@ class NavBridge:
             if self._logger:
                 self._logger.error(error_msg)
             return False, error_msg
+
+    # ============================================
+    # Initial pose tự động theo node HOME của route
+    # ============================================
+
+    def _load_home_pose(self, map_id: Optional[str], route_id: Optional[str]) -> Optional[Dict[str, float]]:
+        """Đọc node HOME (tên chứa 'HOME') từ ~/project_ws/maps/<map_id>/routes/<route_id>.yaml.
+        Trả về {'x','y','yaw'} trong khung map, hoặc None nếu không có."""
+        if not map_id or not route_id:
+            return None
+        try:
+            import yaml
+            path = os.path.expanduser(f'~/project_ws/maps/{map_id}/routes/{route_id}.yaml')
+            with open(path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+            raw = data.get('nodes', {})
+            if isinstance(raw, dict):
+                items = [(str(k), v) for k, v in raw.items() if isinstance(v, dict)]
+            elif isinstance(raw, list):
+                items = [(str(n.get('name', '')), n) for n in raw if isinstance(n, dict)]
+            else:
+                items = []
+            homes = [(name, n) for name, n in items
+                     if 'HOME' in str(n.get('name', name)).upper()]
+            if not homes:
+                return None
+            # Ưu tiên node tên đúng NODE_HOME, nếu không thì node HOME đầu tiên
+            chosen = next((h for h in homes if h[0].upper() == 'NODE_HOME'), homes[0])
+            if len(homes) > 1 and self._logger:
+                self._logger.warning(f'Route {route_id} có {len(homes)} node HOME, dùng "{chosen[0]}"')
+            node = chosen[1]
+            pos = node.get('position') or {}
+            ori = node.get('orientation') or {}
+            return {'x': float(pos.get('x', 0.0)),
+                    'y': float(pos.get('y', 0.0)),
+                    'yaw': float(ori.get('yaw', 0.0))}
+        except Exception as e:
+            if self._logger:
+                self._logger.warning(f'Không đọc được node HOME ({map_id}/{route_id}): {e}')
+            return None
+
+    def _apply_home_initial_pose(self, proc, map_id: Optional[str], route_id: Optional[str],
+                                 timeout: float = 120.0) -> None:
+        """Chờ Nav2 sẵn sàng rồi publish /initialpose tại node HOME (chạy trong thread riêng)."""
+        home = self._load_home_pose(map_id, route_id)
+        if home is None:
+            if self._logger:
+                self._logger.info('Không có node HOME: giữ initial pose mặc định của Nav2')
+            return
+
+        def _still_current() -> bool:
+            with self._lock:
+                return self._nav_process is proc and not self._stopping
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not _still_current() or proc.poll() is not None:
+                return
+            if self._nav_ready():
+                break
+            time.sleep(0.5)
+        else:
+            if self._logger:
+                self._logger.warning('Nav2 chưa sẵn sàng sau %.0fs: bỏ qua initial pose theo HOME' % timeout)
+            return
+
+        time.sleep(1.0)  # để AMCL kịp nhận
+        ok, msg = False, ''
+        for _ in range(3):
+            if not _still_current():
+                return
+            ok, msg = self.set_initial_pose(home)
+            if ok:
+                break
+            time.sleep(1.0)
+        if self._logger:
+            log = self._logger.info if ok else self._logger.warning
+            log(f'Initial pose theo HOME x={home["x"]:.3f} y={home["y"]:.3f} '
+                f'yaw={home["yaw"]:.3f}: {"OK" if ok else msg}')
 
     # ============================================
     # State Access

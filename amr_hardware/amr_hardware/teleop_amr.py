@@ -75,8 +75,8 @@ class TeleopAMR(Node):
         )
 
         # Tốc độ lái
-        self.speed = 0.25         # m/s
-        self.turn = 0.8           # rad/s
+        self.speed = 0.1         # m/s
+        self.turn = 0.3           # rad/s
 
         self.MAX_SPEED = 0.37
         self.MAX_TURN = 1.5

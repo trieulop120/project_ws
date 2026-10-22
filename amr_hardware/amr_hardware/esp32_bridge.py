@@ -25,6 +25,7 @@ class ESP32Bridge(Node):
         self.declare_parameter('wheelbase', 0.477)         
         self.declare_parameter('counts_per_rev', 3960.0)  # 3960 xung/vòng
         self.declare_parameter('max_rpm', 110.0)           # Tốc độ tối đa 110 RPM
+        self.declare_parameter('gyro_scale_z', 0.977)
         self.declare_parameter('publish_tf', False)
         self.declare_parameter('joint_names', ['front_encoder_wheel_left_joint', 'front_encoder_wheel_right_joint', 'encoder_lift_joint'])
 
@@ -34,6 +35,7 @@ class ESP32Bridge(Node):
         self.wheelbase = self.get_parameter('wheelbase').value
         self.cpr = self.get_parameter('counts_per_rev').value
         self.max_rpm = float(self.get_parameter('max_rpm').value)
+        self.gyro_scale_z = float(self.get_parameter('gyro_scale_z').value)
         self.publish_tf = self.get_parameter('publish_tf').value
         self.joint_names = self.get_parameter('joint_names').value
 
@@ -307,11 +309,11 @@ class ESP32Bridge(Node):
             # Covariance[0] = -1 báo sensor_msgs/Imu rằng angular velocity không khả dụng.
             imu.angular_velocity_covariance[0] = -1.0
         else:
-            imu.angular_velocity.z = gz
+            imu.angular_velocity.z = gz * self.gyro_scale_z
             imu.angular_velocity_covariance = [
                 0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0,
-                0.0, 0.0, 0.02
+                0.0, 0.0, 0.001
             ]
 
         self.pub_imu.publish(imu)
@@ -367,7 +369,7 @@ class ESP32Bridge(Node):
             0.0,   0.0,   99.0,  0.0,   0.0,   0.0,
             0.0,   0.0,   0.0,   99.0,  0.0,   0.0,
             0.0,   0.0,   0.0,   0.0,   99.0,   0.0,
-            0.0,   0.0,   0.0,   0.0,   0.0,   0.01
+            0.0,   0.0,   0.0,   0.0,   0.0,   0.005
         ]
         self.pub_odom.publish(odom)
 

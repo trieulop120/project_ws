@@ -15,9 +15,38 @@ Usage:
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, TimerAction, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, TimerAction, ExecuteProcess, OpaqueFunction, LogInfo
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+
+def _load_home_pose(route_geojson_path):
+    """Đọc node HOME từ file route .yaml nằm cạnh file .geojson (cùng tên, đuôi .yaml).
+    Node nào có tên chứa 'HOME' (ưu tiên NODE_HOME). Trả về (x, y, yaw) trong khung map, hoặc None."""
+    try:
+        import yaml
+        if not route_geojson_path:
+            return None
+        yaml_path = os.path.splitext(route_geojson_path)[0] + '.yaml'
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+        raw = data.get('nodes', {})
+        if isinstance(raw, dict):
+            items = [(str(k), v) for k, v in raw.items() if isinstance(v, dict)]
+        elif isinstance(raw, list):
+            items = [(str(n.get('name', '')), n) for n in raw if isinstance(n, dict)]
+        else:
+            items = []
+        homes = [(name, n) for name, n in items if 'HOME' in str(n.get('name', name)).upper()]
+        if not homes:
+            return None
+        chosen = next((h for h in homes if h[0].upper() == 'NODE_HOME'), homes[0])
+        node = chosen[1]
+        pos = node.get('position') or {}
+        ori = node.get('orientation') or {}
+        return (float(pos.get('x', 0.0)), float(pos.get('y', 0.0)), float(ori.get('yaw', 0.0)))
+    except Exception:
+        return None
 
 
 def generate_launch_description():
@@ -65,17 +94,40 @@ def generate_launch_description():
     # ============================================
     # AMCL Localization (Nạp nav2_params_real.yaml)
     # ============================================
-    amcl_node = Node(
-        package='nav2_amcl',
-        executable='amcl',
-        name='amcl',
-        output='screen',
-        parameters=[params_file],
-        remappings=[
-            ('/scan', '/scan_filtered'),
-            ('/initialpose', '/initialpose'),
-        ]
-    )
+    def _make_amcl(context):
+        amcl_params = [params_file]
+        actions = []
+        # Initial pose lấy từ node HOME của route đã chọn (thay cho (0,0,0) cố định trong params).
+        # Không có route hoặc route không có node HOME thì giữ nguyên initial_pose trong params.
+        home = _load_home_pose(context.perform_substitution(LaunchConfiguration('route')))
+        if home is not None:
+            hx, hy, hyaw = home
+            amcl_params.append({   # đặt sau params_file nên ghi đè
+                'set_initial_pose': True,
+                'initial_pose.x': hx,
+                'initial_pose.y': hy,
+                'initial_pose.z': 0.0,
+                'initial_pose.yaw': hyaw,
+            })
+            actions.append(LogInfo(msg=f'[nav_web] AMCL initial pose theo HOME: '
+                                       f'x={hx:.3f} y={hy:.3f} yaw={hyaw:.3f}'))
+        else:
+            actions.append(LogInfo(msg='[nav_web] Không có node HOME trong route: '
+                                       'dùng initial_pose trong nav2_params_real.yaml'))
+        actions.append(Node(
+            package='nav2_amcl',
+            executable='amcl',
+            name='amcl',
+            output='screen',
+            parameters=amcl_params,
+            remappings=[
+                ('/scan', '/scan_filtered'),
+                ('/initialpose', '/initialpose'),
+            ]
+        ))
+        return actions
+
+    amcl_node = OpaqueFunction(function=_make_amcl)
 
     # ============================================
     # Lifecycle Manager - Localization

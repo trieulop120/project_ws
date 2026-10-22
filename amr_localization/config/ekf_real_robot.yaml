@@ -4,8 +4,8 @@
     use_sim_time: false
 
     # Frequency & Timeouts
-    frequency: 50.0
-    sensor_timeout: 0.1
+    frequency: 30.0
+    sensor_timeout: 0.2
 
     two_d_mode: true # Robot di chuyển trên mặt phẳng 2D
     publish_tf: true
@@ -24,12 +24,37 @@
     odom0: /odom_raw
     odom0_config: [false, false, false,    # x, y, z position
                    false, false, false,    # roll, pitch, yaw orientation
-                   true,  false, false,    # vx, vy, vz (Chỉ lấy vận tốc tuyến tính X)
-                   false, false, false,    # vroll, vpitch, vyaw (Nhường đo quay cho IMU)
+                   true,  false, false,    # vx, vy, vz 
+                   false, false, true,    # vroll, vpitch, vyaw 
                    false, false, false]    # ax, ay, az acceleration
     odom0_differential: false
     odom0_relative: false
     odom0_queue_size: 10
+
+    # ----------------------------------------------------
+    # SENSOR INPUT 3: RF2O Laser Odometry (vx only, optional)
+    # ----------------------------------------------------
+    # Secondary source: vx estimated from the lidar scans. It is less
+    # trustworthy than the wheel encoders (sparse ~8.2 Hz scans, drifts when
+    # standing still), so its covariance is set much larger than the encoder
+    # covariance in rf2o_cov_relay (var_vx = 0.02 vs 0.001).
+    #
+    # NOTE: this block is only *active* when the launch argument
+    # `use_rf2o:=true` is passed. With `use_rf2o:=false` the launch file
+    # overrides odom1_config with an all-false vector, which makes
+    # robot_localization skip the topic entirely (verified: no subscription
+    # to /odom_rf2o_fused is created in that case).
+    odom1: /odom_rf2o_fused
+    odom1_config: [false, false, false,
+                   false, false, false,
+                   true,  false, false,
+                   false, false, false,
+                   false, false, false]
+    odom1_differential: false
+    odom1_relative: false
+    odom1_queue_size: 10
+    odom1_nodelay: false
+    odom1_twist_rejection_threshold: 2.0
 
     # ----------------------------------------------------
     # SENSOR INPUT 2: IMU Gyroscope (ESP32 / BNO055)

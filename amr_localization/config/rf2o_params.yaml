@@ -1,0 +1,26 @@
+# Parameters for the rf2o_laser_odometry node (CLaserOdometry2DNode).
+#
+# The node is launched from amr_hardware/launch/real_bringup.launch.py with
+# `use_rf2o:=true|false`. This file is installed via
+# `install(DIRECTORY config ...)` in amr_localization/CMakeLists.txt.
+#
+# NOTE: the rf2o node name is hard-coded in the C++ source as
+# "CLaserOdometry2DNode", so the wildcard key "/**:" is used to make the
+# parameters apply regardless of the node name given in the launch file.
+/**:
+  ros__parameters:
+    # Read the filtered scan (the robot body has already been masked out).
+    laser_scan_topic: /scan_filtered
+    # Raw rf2o output, consumed by rf2o_cov_relay.
+    odom_topic: /odom_rf2o
+    # The EKF already publishes odom -> base_footprint, so rf2o must not
+    # broadcast a competing transform.
+    publish_tf: false
+    # Odometry is expressed in the robot base frame.
+    base_frame_id: base_footprint
+    odom_frame_id: odom
+    # No ground-truth topic available on the real robot.
+    init_pose_from_topic: ""
+    # Processing rate. The RPLIDAR A1 delivers ~8.2 Hz, so this is not the
+    # limiting factor; 10 Hz keeps up with the scan rate.
+    freq: 10.0

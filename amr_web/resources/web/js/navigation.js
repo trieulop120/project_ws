@@ -441,6 +441,9 @@
         // B21 Fix: Bật cờ dừng để ngăn handleNavStateUpdate nạp lại map
         navStopping = true;
 
+        // Dừng ngay teleop bàn phím nếu đang giữ phím
+        stopManualTeleop();
+
         // B11: Tăng seq để huỷ các pending load
         navMapLoadSeq++;
         navMapLoading = false;
@@ -574,6 +577,7 @@
         if (mode === currentOpMode) return;
         currentOpMode = mode;
         window.currentOpMode = mode;  // Export for state.js
+        if (mode !== 'MANUAL') stopManualTeleop();  // rời MANUAL thì dừng teleop bàn phím
         console.log('[Nav] Mode changed to:', mode);
         // Vấn đề 3 Fix: Gửi lệnh set_op_mode qua WebSocket để đồng bộ giữa các client
         if (typeof sendCommand === 'function') {
@@ -1051,6 +1055,7 @@
             if (newOpMode !== currentOpMode) {
                 currentOpMode = newOpMode;
                 window.currentOpMode = newOpMode;  // Export for state.js
+                if (newOpMode !== 'MANUAL') stopManualTeleop();
             }
         }
         // B21 Fix: Gọi updateNavUI vô điều kiện để sync nút AUTO/MANUAL
@@ -1314,8 +1319,87 @@
         setupQuickGoals();
     }
 
+    // ============================================
+    // Manual Keyboard Teleop (giữ phím để chạy, thả phím để dừng)
+    // Chỉ hoạt động khi: Navigation đang chạy + op mode MANUAL + trang Nav đang hiển thị.
+    // Dùng e.code (vị trí phím vật lý) để không bị ảnh hưởng bởi Shift/CapsLock/bộ gõ tiếng Việt.
+    // ============================================
+    const MANUAL_KEY_MAP = {
+        'KeyU':   { linear: 1,  angular: 1 },  'KeyI':   { linear: 1,  angular: 0 },  'KeyO':   { linear: 1,  angular: -1 },
+        'KeyJ':   { linear: 0,  angular: 1 },  'KeyK':   { linear: 0,  angular: 0 },  'KeyL':   { linear: 0,  angular: -1 },
+        'KeyM':   { linear: -1, angular: 1 },  'Comma':  { linear: -1, angular: 0 },  'Period': { linear: -1, angular: -1 }
+    };
+    const MANUAL_LINEAR_SPEED = 0.15;   // m/s
+    const MANUAL_ANGULAR_SPEED = 0.3;   // rad/s
+    const MANUAL_SEND_MS = 100;
+    let manualTeleopTimer = null;
+    let manualTeleopKey = null;
+    let manualVel = { linear: 0, angular: 0 };
+
+    function manualDriveAllowed() {
+        if (!window.isNavigationActive || currentOpMode !== 'MANUAL' || isMissionActive) return false;
+        if (!navViewport || navViewport.getClientRects().length === 0) return false;  // trang Nav đang ẩn
+        if (navSetupModal?.classList.contains('active')) return false;
+        return true;
+    }
+
+    function sendManualVelocity() {
+        if (typeof sendCommand !== 'function') return;
+        if (!manualDriveAllowed()) { stopManualTeleop(); return; }
+        sendCommand({
+            command: 'teleop',
+            linear: MANUAL_LINEAR_SPEED * manualVel.linear,
+            angular: MANUAL_ANGULAR_SPEED * manualVel.angular
+        });
+    }
+
+    function startManualTeleop(code) {
+        const v = MANUAL_KEY_MAP[code];
+        if (!v) return;
+        if (v.linear === 0 && v.angular === 0) { stopManualTeleop(true); return; }  // K = dừng
+        manualTeleopKey = code;
+        manualVel = v;
+        sendManualVelocity();
+        if (!manualTeleopTimer) manualTeleopTimer = setInterval(sendManualVelocity, MANUAL_SEND_MS);
+    }
+
+    // force=true: luôn gửi lệnh dừng; mặc định chỉ gửi khi đang chạy (không đụng Nav2 lúc rảnh)
+    function stopManualTeleop(force) {
+        const wasDriving = manualTeleopTimer !== null;
+        if (manualTeleopTimer) { clearInterval(manualTeleopTimer); manualTeleopTimer = null; }
+        manualTeleopKey = null;
+        manualVel = { linear: 0, angular: 0 };
+        if ((wasDriving || force === true) && typeof sendCommand === 'function') {
+            sendCommand({ command: 'teleop', linear: 0, angular: 0 });
+        }
+    }
+
+    function onManualKeyDown(e) {
+        if (!MANUAL_KEY_MAP[e.code]) return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        const t = e.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+        if (!manualDriveAllowed()) return;
+        e.preventDefault();
+        if (e.repeat) return;  // giữ phím: timer đã gửi liên tục
+        startManualTeleop(e.code);
+    }
+
+    function onManualKeyUp(e) {
+        if (e.code === manualTeleopKey) stopManualTeleop();
+    }
+
+    function initManualKeyboard() {
+        document.addEventListener('keydown', onManualKeyDown);
+        document.addEventListener('keyup', onManualKeyUp);
+        // Mất focus hoặc chuyển tab khi đang giữ phím: keyup sẽ không đến, phải tự dừng
+        window.addEventListener('blur', () => stopManualTeleop());
+        document.addEventListener('visibilitychange', () => { if (document.hidden) stopManualTeleop(); });
+    }
+
     function initNavPage() {
         initEventListeners();
+        initManualKeyboard();
         // B21 Fix: Gọi updateNavUI để sync nút AUTO/MANUAL sau reload
         updateNavUI();
     }

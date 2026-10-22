@@ -2,13 +2,14 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>amr_perception</name>
-  <version>1.0.0</version>
-  <description>AMR Perception - PointCloud processing with PCL VoxelGrid downsampling</description>
+  <version>1.1.0</version>
+  <description>AMR Perception - PointCloud processing, Scan filtering, and YOLO OBB Pallet Detection</description>
   <maintainer email="trieu@example.com">Trieu</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
+  <!-- C++ dependencies -->
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
@@ -16,6 +17,18 @@
   <depend>pcl_ros</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
+  <depend>cv_bridge</depend>
+  <depend>geometry_msgs</depend>
+  <depend>vision_msgs</depend>
+  <depend>image_transport</depend>
+  <depend>message_filters</depend>
+
+  <!-- Python runtime dependencies -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
