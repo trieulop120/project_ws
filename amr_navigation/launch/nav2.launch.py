@@ -32,8 +32,8 @@ def generate_launch_description():
     # PATHS - Chỉnh sửa ở đây
     # ============================================
     params_file = os.path.join(pkg_nav, 'config', 'nav2_params_real.yaml')
-    map_file = os.path.join(pkg_mapping, 'maps', 'real_amr_map.yaml')
-    graph_file = os.path.join(pkg_nav, 'config', 'graphs', 'real_route_graph.geojson')
+    map_file = os.path.join(pkg_mapping, 'maps', '1_D203B.yaml')
+    graph_file = os.path.join(pkg_nav, 'config', 'graphs', '1_D203B Route.geojson')
     rviz_config = os.path.join(pkg_nav, 'rviz', 'navigation_real.rviz')
 
     # ============================================

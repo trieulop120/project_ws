@@ -24,5 +24,15 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
   RENAME mission_gui
 )
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_mission_manager/pallet_mission_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME pallet_mission_node
+)
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_mission_manager/pallet_gui.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME pallet_gui
+  )
 
 ament_package()

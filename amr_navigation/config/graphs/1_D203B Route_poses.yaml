@@ -1,0 +1,47 @@
+frame_id: map
+poses:
+  NODE_HOME:
+    id: 0
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 0
+          y: 0
+          z: 0
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          w: 1.0
+  P_1:
+    id: 1
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 5.39
+          y: 0.66
+          z: 0
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: -0.707106811297735
+          w: 0.7071067510753588
+  P_2:
+    id: 2
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 6.57
+          y: 3.03
+          z: 0
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: 0.9999999920551688
+          w: 0.00012605420445784942

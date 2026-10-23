@@ -9,7 +9,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu, JointState, BatteryState
+from sensor_msgs.msg import Imu, JointState, BatteryState, Range
 from std_msgs.msg import String
 import tf2_ros
 
@@ -27,6 +27,11 @@ class ESP32Bridge(Node):
         self.declare_parameter('max_rpm', 110.0)           # Tốc độ tối đa 110 RPM
         self.declare_parameter('gyro_scale_z', 0.977)
         self.declare_parameter('publish_tf', False)
+        # HC-SR04 (firmware gui cm, -1.0 khi khong co echo; timeout 6000us ~ 1.0 m)
+        self.declare_parameter('ultrasonic_frame', 'ultrasonic_link')
+        self.declare_parameter('ultrasonic_min_range', 0.02)
+        self.declare_parameter('ultrasonic_max_range', 1.0)
+        self.declare_parameter('ultrasonic_fov', 0.26)
         self.declare_parameter('joint_names', ['front_encoder_wheel_left_joint', 'front_encoder_wheel_right_joint', 'encoder_lift_joint'])
 
         self.port = self.get_parameter('port').value
@@ -38,6 +43,11 @@ class ESP32Bridge(Node):
         self.gyro_scale_z = float(self.get_parameter('gyro_scale_z').value)
         self.publish_tf = self.get_parameter('publish_tf').value
         self.joint_names = self.get_parameter('joint_names').value
+        self.us_frame = self.get_parameter('ultrasonic_frame').value
+        self.us_min = float(self.get_parameter('ultrasonic_min_range').value)
+        self.us_max = float(self.get_parameter('ultrasonic_max_range').value)
+        self.us_fov = float(self.get_parameter('ultrasonic_fov').value)
+        self._warned_pkt_len = False
 
         # Biến lưu trữ dữ liệu phần cứng từ ESP32
         self.curr_el = 0
@@ -45,6 +55,7 @@ class ESP32Bridge(Node):
         self.curr_em3 = 0
         self.curr_gz = 0.0
         self.curr_battery_percent = 0.0
+        self.curr_dist_cm = -1.0   # -1.0 = khong co du lieu / khong co echo
         self.data_lock = threading.Lock()
 
         self.ser = None
@@ -57,6 +68,7 @@ class ESP32Bridge(Node):
         self.pub_js = self.create_publisher(JointState, '/joint_states', 10)
         self.pub_odom = self.create_publisher(Odometry, '/odom_raw', 10)
         self.pub_battery = self.create_publisher(BatteryState, '/battery_state', 10)
+        self.pub_ultrasonic = self.create_publisher(Range, '/ultrasonic/range', 10)
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self) if self.publish_tf else None
 
@@ -265,12 +277,27 @@ class ESP32Bridge(Node):
 
                     battery_percent = float(p[6])
 
+                    # Goi PKT mac dinh co dung 8 truong:
+                    # PKT,el,er,em3,gz,dist_cm,batt,timestamp
+                    # Neu firmware bat tog_yaw/tog_acc hoac tat tog_dist thi so truong
+                    # doi va p[5] KHONG con la khoang cach -> coi nhu khong co du lieu.
+                    if len(p) == 8:
+                        dist_cm = float(p[5])
+                    else:
+                        dist_cm = -1.0
+                        if not self._warned_pkt_len:
+                            self._warned_pkt_len = True
+                            self.get_logger().warn(
+                                f'PKT co {len(p)} truong (mong doi 8): bo qua khoang cach '
+                                'sieu am. Kiem tra tog_yaw/tog_acc/tog_dist tren firmware.')
+
                     with self.data_lock:
                         self.curr_el = el
                         self.curr_er = er
                         self.curr_em3 = em3
                         self.curr_gz = gz
                         self.curr_battery_percent = battery_percent
+                        self.curr_dist_cm = dist_cm
                 except Exception:
                     pass
 
@@ -292,6 +319,7 @@ class ESP32Bridge(Node):
             em3 = self.curr_em3
             gz = self.curr_gz
             battery_percent = self.curr_battery_percent
+            dist_cm = self.curr_dist_cm
 
         if self.first_run:
             self.last_el = el
@@ -379,6 +407,21 @@ class ESP32Bridge(Node):
         battery.header.frame_id = 'base_link'
         battery.percentage = battery_percent
         self.pub_battery.publish(battery)
+
+        # 4b. Publish Ultrasonic Range (HC-SR04)
+        # REP-117: khong co echo trong tam do -> +inf (GUI hien 'khong co echo')
+        rng = Range()
+        rng.header.stamp = now
+        rng.header.frame_id = self.us_frame
+        rng.radiation_type = Range.ULTRASOUND
+        rng.field_of_view = self.us_fov
+        rng.min_range = self.us_min
+        rng.max_range = self.us_max
+        if math.isnan(dist_cm) or dist_cm < 0.0:
+            rng.range = math.inf
+        else:
+            rng.range = dist_cm / 100.0   # cm -> m
+        self.pub_ultrasonic.publish(rng)
 
         # 5. TF Broadcaster
         if self.publish_tf and self.tf_broadcaster:

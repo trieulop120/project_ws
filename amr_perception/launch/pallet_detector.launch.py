@@ -40,7 +40,7 @@ def generate_launch_description():
         remappings=[
             ('/color/image_raw', '/color/image_raw'),
             ('/depth/image_raw', '/depth/image_raw'),
-            ('/camera/color/camera_info', '/camera/color/camera_info'),
+            ('/camera/color/camera_info', '/color/camera_info'),
         ],
     )
 

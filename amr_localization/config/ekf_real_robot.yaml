@@ -4,8 +4,8 @@
     use_sim_time: false
 
     # Frequency & Timeouts
-    frequency: 30.0
-    sensor_timeout: 0.2
+    frequency: 50.0
+    sensor_timeout: 0.3
 
     two_d_mode: true # Robot di chuyển trên mặt phẳng 2D
     publish_tf: true
@@ -24,7 +24,7 @@
     odom0: /odom_raw
     odom0_config: [false, false, false,    # x, y, z position
                    false, false, false,    # roll, pitch, yaw orientation
-                   true,  false, false,    # vx, vy, vz 
+                   true,  true, false,    # vx, vy, vz 
                    false, false, true,    # vroll, vpitch, vyaw 
                    false, false, false]    # ax, ay, az acceleration
     odom0_differential: false
@@ -71,6 +71,20 @@
     imu0_remove_gravitational_acceleration: false
 
     # ----------------------------------------------------
+    # SENSOR INPUT 4: Visual Odometry (Astra VO qua Relay)
+    # ----------------------------------------------------
+    odom2: /rtabmap/odom_fused
+    odom2_config: [false, false, false,
+                   false, false, false,
+                   true,  false, false,    # vx (Chỉ lấy vận tốc tiến bù trượt)
+                   false, false, false,    # vyaw (Tắt vyaw, nhường góc xoay cho IMU)
+                   false, false, false]
+    odom2_differential: false
+    odom2_relative: false
+    odom2_queue_size: 10
+    odom2_twist_rejection_threshold: 2.0
+
+    # ----------------------------------------------------
     # Covariance Matrices (15x15)
     # ----------------------------------------------------
     process_noise_covariance: [0.05, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
@@ -80,7 +94,7 @@
                                0.0,  0.0,  0.0,  0.0,  0.03, 0.0,  0.0,   0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,  0.0,  0.0,  0.0,  0.06, 0.0,   0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.025, 0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
-                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.025, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.005, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.04, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,  0.01, 0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,  0.0,  0.01, 0.0,  0.0,  0.0,  0.0,

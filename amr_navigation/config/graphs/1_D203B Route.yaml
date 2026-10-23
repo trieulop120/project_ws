@@ -1,0 +1,42 @@
+graph_name: 1_D203B Route
+version: '1.0'
+nodes:
+  NODE_HOME:
+    name: NODE_HOME
+    position:
+      x: 0
+      y: 0
+      z: 0
+    orientation:
+      yaw: 0
+    type: home
+    floor: 1
+    description: Home position
+    properties:
+      is_home: true
+      is_parking: true
+  P_1:
+    name: P_1
+    position:
+      x: 5.39
+      y: 0.66
+      z: 0
+    orientation:
+      yaw: -1.5707964119621978
+    type: pickup_approach
+    floor: 1
+    description: ''
+    properties: {}
+  P_2:
+    name: P_2
+    position:
+      x: 6.57
+      y: 3.03
+      z: 0
+    orientation:
+      yaw: 3.14134054518021
+    type: pickup_approach
+    floor: 1
+    description: ''
+    properties: {}
+edges: []

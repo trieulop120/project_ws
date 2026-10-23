@@ -39,15 +39,20 @@ Frame conventions
       yaw = 0      -> robot is facing the pallet squarely
       yaw > 0      -> pallet is rotated counter-clockwise (left) vs robot heading
       yaw < 0      -> pallet is rotated clockwise (right) vs robot heading
-  The yaw is estimated from the 3D edges of the OBB using depth. If depth at
-  the corners is not usable, it falls back to the line-of-sight direction
-  (pallet assumed perpendicular to the ray robot -> pallet).
+  The yaw is estimated by fitting a line (RANSAC + least squares) to ALL the
+  valid depth pixels of the pallet front face inside the OBB, then smoothed over
+  the last frames (median + dead-band) so the value stays steady. If the face
+  cannot be fitted, the last steady yaw is kept for up to 1 s, otherwise it
+  falls back to the line-of-sight direction (pallet assumed perpendicular to the
+  ray robot -> pallet).
 """
 
 import math
 import os
 import traceback
+import time
 import threading
+from collections import deque
 from typing import Optional, List, Tuple
 
 import cv2
@@ -134,6 +139,21 @@ def yaw_to_rot(yaw: float) -> np.ndarray:
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
+_YAW_RNG = np.random.default_rng()
+
+
+def _fit_line_2d(Q: np.ndarray):
+    """Total-least-squares line through 2D points: (n, c, d, m).
+
+    n unit normal, c offset (n . p = c), d unit direction, m centroid.
+    """
+    m = Q.mean(axis=0)
+    _, _, vt = np.linalg.svd(Q - m, full_matrices=False)
+    d = vt[0]
+    n = np.array([-d[1], d[0]])
+    return n, float(n @ m), d, m
+
+
 def yaw_to_quaternion(yaw: float) -> Quaternion:
     q = Quaternion()
     q.x = 0.0
@@ -177,7 +197,11 @@ class PalletDetectorNode(Node):
         # NOT in the URDF/TF (camera_joint rpy = 0 0 0). Default 15 deg.
         # Set to 0.0 once camera_joint rpy="0 <pitch_rad> 0" is fixed in the URDF,
         # otherwise the tilt would be applied twice.
-        self.declare_parameter('camera_pitch_deg', 5.3)
+        self.declare_parameter('camera_pitch_deg', 7.0)
+        # Yaw smoothing: median over the last N frames, output only changes when the
+        # smoothed value moves by more than the dead-band (steady number on screen)
+        self.declare_parameter('yaw_filter_window', 15)
+        self.declare_parameter('yaw_deadband_deg', 0.3)
 
         self.model_path = self.get_parameter('model_path').value
         self.conf_threshold = self.get_parameter('conf_threshold').value
@@ -191,6 +215,11 @@ class PalletDetectorNode(Node):
         self.depth_percentile = self.get_parameter('depth_percentile').value
         self.use_depth_yaw = self.get_parameter('use_depth_yaw').value
         self.camera_pitch_deg = self.get_parameter('camera_pitch_deg').value
+        self.yaw_filter_window = max(1, int(self.get_parameter('yaw_filter_window').value))
+        self.yaw_deadband = math.radians(float(self.get_parameter('yaw_deadband_deg').value))
+        self.yaw_hist = deque(maxlen=self.yaw_filter_window)
+        self.yaw_out = None
+        self.yaw_last_t = 0.0
 
         # Rotation correcting the tilt missing from TF, expressed in the optical frame.
         # camera_link pitched down by theta about its own Y axis:
@@ -430,51 +459,121 @@ class PalletDetectorNode(Node):
                                 depth_encoding: str, center_depth: float,
                                 camera_frame: str,
                                 p_base: np.ndarray) -> Optional[float]:
-        """Pallet yaw in base frame from the 3D OBB edges.
+        """Pallet yaw in base frame from the depth of the whole front face.
+
+        All valid depth pixels inside the OBB are back-projected, moved to the base
+        frame and a line is fitted to them in the horizontal plane (RANSAC, then
+        total least squares). Thousands of pixels average the depth noise, and
+        pixels of openings / background are rejected as outliers.
 
         Returns yaw (rad, in [-pi, pi]) of the pallet +X axis: the normal of
         the long face pointing INTO the pallet (away from the robot).
         0 means the robot faces the pallet squarely.
-        Returns None if corner depths are unusable.
+        Returns None if the face cannot be fitted reliably.
         """
         rt = self.lookup_rt(self.base_frame, camera_frame, cam_corr=True)
         if rt is None:
             return None
         R_bc, t_bc = rt
 
+        h, w = depth_img.shape[:2]
         box = det['box']
         center = box.mean(axis=0)
-        pts_base = []
-        for c in box:
-            # Move the sample point a bit toward the centre (stay on the pallet),
-            # the edge direction is preserved because the quad stays similar.
-            p = center + (c - center) * 0.85
-            d = self.extract_depth_at_point(
-                depth_img, int(round(p[0])), int(round(p[1])), depth_encoding, window=4)
-            if d <= 0.0 or abs(d - center_depth) > 0.5:  # background / invalid
-                return None
-            p_cam = self.pixel_to_3d(float(p[0]), float(p[1]), d)
-            pts_base.append(R_bc @ p_cam + t_bc)
+        shr = center + (box - center) * 0.92          # stay off the noisy OBB edge
 
-        c0, c1, c2, c3 = pts_base
-        e1 = np.linalg.norm((c1 - c0)[:2])
-        e2 = np.linalg.norm((c2 - c1)[:2])
-        if e1 >= e2:
-            d_long = (c1 - c0) + (c2 - c3)
-        else:
-            d_long = (c2 - c1) + (c3 - c0)
-
-        dx, dy = float(d_long[0]), float(d_long[1])
-        norm = math.hypot(dx, dy)
-        if norm < 1e-3:
+        x0 = max(0, int(np.floor(shr[:, 0].min())))
+        x1 = min(w, int(np.ceil(shr[:, 0].max())) + 1)
+        y0 = max(0, int(np.floor(shr[:, 1].min())))
+        y1 = min(h, int(np.ceil(shr[:, 1].max())) + 1)
+        if x1 <= x0 or y1 <= y0:
             return None
 
-        # Normal to the long edge, pointing AWAY from the robot (robot at base origin),
+        sub = depth_img[y0:y1, x0:x1]
+        mask = np.zeros(sub.shape[:2], dtype=np.uint8)
+        poly = (shr - np.array([x0, y0])).astype(np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(mask, [poly], 1)
+        vv, uu = np.nonzero(mask)
+
+        z = sub[vv, uu].astype(np.float32)
+        if depth_encoding in ('16UC1', 'mono16'):     # millimeters -> meters
+            z = z / 1000.0
+        valid = np.isfinite(z) & (z > self.MIN_DEPTH_M) & (z < self.MAX_DEPTH_M)
+        z = z[valid].astype(np.float64)
+        u = (uu[valid] + x0).astype(np.float64)
+        v = (vv[valid] + y0).astype(np.float64)
+        if z.size < 150:
+            return None
+
+        # Drop pixels clearly behind the face (pallet openings, floor / wall in gaps)
+        near = np.abs(z - np.percentile(z, 30)) < 0.35
+        if int(near.sum()) < 150:
+            return None
+        z, u, v = z[near], u[near], v[near]
+
+        P_cam = np.stack([(u - self.cx) * z / self.fx,
+                          (v - self.cy) * z / self.fy, z], axis=1)
+        Q = (P_cam @ R_bc.T + t_bc)[:, :2]            # horizontal plane of base frame
+
+        # RANSAC line, then refine with all inliers (least squares)
+        inlier_m = 0.015
+        idx = _YAW_RNG.integers(0, Q.shape[0], size=(150, 2))
+        a, b = Q[idx[:, 0]], Q[idx[:, 1]]
+        dvec = b - a
+        L = np.linalg.norm(dvec, axis=1)
+        ok = L > 0.25                                  # sample points far apart
+        nrm = np.stack([-dvec[:, 1], dvec[:, 0]], axis=1) / np.where(ok, L, 1.0)[:, None]
+        c = np.einsum('ij,ij->i', nrm, a)
+        inl = np.abs(nrm @ Q.T - c[:, None]) < inlier_m
+        counts = inl.sum(axis=1)
+        counts[~ok] = 0
+        best = int(np.argmax(counts))
+        if counts[best] < 150:
+            return None
+
+        n, c_f = nrm[best], float(c[best])
+        inl_mask = inl[best]
+        for _ in range(3):
+            if int(inl_mask.sum()) < 150:
+                return None
+            n, c_f, _, _ = _fit_line_2d(Q[inl_mask])
+            inl_mask = np.abs(Q @ n - c_f) < inlier_m
+        if int(inl_mask.sum()) < 150:
+            return None
+        Qm = Q[inl_mask]
+        n, c_f, d, _ = _fit_line_2d(Qm)
+
+        # The visible part of the face must be wide enough to give a good angle
+        proj = Qm @ d
+        if float(np.percentile(proj, 98) - np.percentile(proj, 2)) < 0.3:
+            return None
+
+        # Normal pointing AWAY from the robot (robot at base origin),
         # i.e. same side as the pallet position vector.
-        nx, ny = -dy / norm, dx / norm
+        nx, ny = float(n[0]), float(n[1])
         if nx * p_base[0] + ny * p_base[1] < 0.0:
             nx, ny = -nx, -ny
         return normalize_angle(math.atan2(ny, nx))
+
+    def _filter_yaw(self, yaw_raw: float) -> float:
+        """Median over the last frames + dead-band: a steady yaw value."""
+        now = time.monotonic()
+        if self.yaw_hist and (now - self.yaw_last_t) > 1.0:   # target was lost
+            self.yaw_hist.clear()
+            self.yaw_out = None
+        self.yaw_last_t = now
+        self.yaw_hist.append(yaw_raw)
+
+        ys = np.array(self.yaw_hist)
+        ref = math.atan2(float(np.median(np.sin(ys))), float(np.median(np.cos(ys))))
+        d = np.array([normalize_angle(y - ref) for y in ys])
+        med = float(np.median(d))
+        mad = 1.4826 * float(np.median(np.abs(d - med)))
+        keep = np.abs(d - med) <= max(2.0 * mad, math.radians(0.3))
+        yaw_f = normalize_angle(ref + float(d[keep].mean()))
+
+        if self.yaw_out is None or abs(normalize_angle(yaw_f - self.yaw_out)) > self.yaw_deadband:
+            self.yaw_out = yaw_f
+        return self.yaw_out
 
     # ==================================================================
     # Detection
@@ -577,11 +676,15 @@ class PalletDetectorNode(Node):
         p_base = R_bc @ p_cam + t_bc
 
         # --- 3. Yaw around vertical axis (base frame) ---------------------
-        yaw_base = None
+        yaw_raw = None
         if self.use_depth_yaw:
-            yaw_base = self.estimate_yaw_from_depth(
+            yaw_raw = self.estimate_yaw_from_depth(
                 depth_img, det, depth_encoding, depth_m, camera_frame, p_base)
-        if yaw_base is None:
+        if yaw_raw is not None:
+            yaw_base = self._filter_yaw(yaw_raw)
+        elif self.yaw_out is not None and (time.monotonic() - self.yaw_last_t) < 1.0:
+            yaw_base = self.yaw_out        # keep the last steady yaw instead of jumping
+        else:
             # Fallback: pallet perpendicular to the line of sight robot -> pallet
             yaw_base = math.atan2(p_base[1], p_base[0])
         yaw_base = normalize_angle(yaw_base)

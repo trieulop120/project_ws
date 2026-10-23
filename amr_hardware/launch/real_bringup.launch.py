@@ -12,6 +12,7 @@ from launch.actions import DeclareLaunchArgument, LogInfo, TimerAction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -24,6 +25,13 @@ def generate_launch_description():
         description='ESP32 serial port'
     )
     esp32_port = LaunchConfiguration('esp32_port')
+
+    esp32_baudrate_arg = DeclareLaunchArgument(
+        'esp32_baudrate',
+        default_value='115200',
+        description='ESP32 serial baudrate'
+    )
+    esp32_baudrate = LaunchConfiguration('esp32_baudrate')
 
     lidar_port_arg = DeclareLaunchArgument(
         'lidar_port',
@@ -53,6 +61,13 @@ def generate_launch_description():
     )
     camera_enable = LaunchConfiguration('camera_enable')
 
+    use_vo_arg = DeclareLaunchArgument(
+        'use_vo',
+        default_value='true',
+        description='Enable RTAB-Map Visual Odometry & Relay nodes (true/false)'
+    )
+    use_vo = LaunchConfiguration('use_vo')
+
     use_rf2o_arg = DeclareLaunchArgument(
         'use_rf2o',
         default_value='false',
@@ -68,6 +83,13 @@ def generate_launch_description():
                     'base_footprint -> lidar_link is available'
     )
     rf2o_delay = LaunchConfiguration('rf2o_startup_delay')
+
+    rf2o_log_level_arg = DeclareLaunchArgument(
+        'rf2o_log_level',
+        default_value='warn',
+        description='Log level of the rf2o node (debug/info/warn/error/fatal)'
+    )
+    rf2o_log_level = LaunchConfiguration('rf2o_log_level')
 
     # ============================================
     # Package paths & Configs
@@ -90,7 +112,10 @@ def generate_launch_description():
     # ============================================
     bringup_info = LogInfo(msg='[real_bringup] Starting REAL HARDWARE bringup')
     lidar_info = LogInfo(msg='[real_bringup] LiDAR: sllidar_ros2')
-    ekf_info = LogInfo(msg='[real_bringup] Localization: EKF -> /odom')
+    ekf_info = LogInfo(
+        msg='[real_bringup] Localization: EKF -> /odometry/filtered '
+            '(TF odom -> base_footprint)'
+    )
 
     # ============================================
     # Robot State Publisher
@@ -128,7 +153,7 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': False,
             'port': esp32_port,
-            'baudrate': 115200,
+            'baudrate': ParameterValue(esp32_baudrate, value_type=int),
             'wheel_radius': 0.05,
             'wheelbase': 0.477,
             'publish_tf': False,
@@ -159,15 +184,12 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': False,
             'serial_port': lidar_port,
-            'serial_baudrate': serial_baudrate,
+            'serial_baudrate': ParameterValue(serial_baudrate, value_type=int),
             'frame_id': 'lidar_link',
             'inverted': False,
             'angle_compensate': True,
-            'scan_mode': scan_mode,
+            'scan_mode': ParameterValue(scan_mode, value_type=str),
         }],
-        remappings=[
-            ('/scan', '/scan'),
-        ],
     )
 
     # ============================================
@@ -182,7 +204,7 @@ def generate_launch_description():
     )
 
     # ============================================
-    # Camera Driver
+    # Camera Driver (Astra Camera)
     # ============================================
     camera_driver = Node(
         package='astra_camera',
@@ -193,33 +215,36 @@ def generate_launch_description():
             'use_sim_time': False,
             'color_width': 640,
             'color_height': 480,
+            'color_fps': 15,           # Khóa 15fps tránh quá tải CPU
             'depth_width': 640,
             'depth_height': 480,
-            # [FIXED]: Explicitly enable depth & color streams
+            'depth_fps': 15,
             'enable_depth': True,
             'enable_color': True,
-            # [CHANGED]: Try UVC mode for color stream
             'use_uvc_camera': True,
-            # [FIXED]: Disable hardware registration to fix Device.setProperty(5) error
             'enable_depth_to_color_registration': False,
-            'depth_registration': False,
+            'use_software_d2c': True,  # Bật Software D2C để dóng hàng Depth/Color
             'color_depth_synchronization': True,
         }],
         remappings=[
-            # Remap PointCloud2 output from Astra to /points
             ('/depth/points', '/points'),
             ('/camera/depth/image_raw', '/depth/image_raw'),
             ('/camera/color/image_raw', '/color/image_raw'),
+            ('/camera/color/camera_info', '/color/camera_info'),
         ],
         condition=IfCondition(camera_enable)
     )
 
+    # ============================================
+    # PointCloud Downsampler Node
+    # ============================================
     pointcloud_filter_node = Node(
         package='amr_perception',
         executable='pointcloud_downsampler',
         name='pointcloud_filter',
         output='screen',
         parameters=[{
+            'use_sim_time': False,
             'leaf_size': 0.05,
             'z_min': 0.05,
             'z_max': 1.20,
@@ -228,13 +253,62 @@ def generate_launch_description():
     )
 
     # ============================================
+    # Visual Odometry Node (RTAB-Map RGB-D)
+    # ============================================
+    vo_node = Node(
+        package='rtabmap_odom',
+        executable='rgbd_odometry',
+        name='rgbd_odometry',
+        output='screen',
+        parameters=[{
+            'use_sim_time': False,
+            'frame_id': 'base_footprint',        # Khung gốc robot
+            'odom_frame_id': 'odom_vo',          # Khung ảo của VO
+            'publish_tf': False,                 # Nhường xuất TF cho EKF
+            
+            # --- CÁC THAM SỐ CHỦ CHỐT ĐỂ KHÔI PHỤC KHI MẤT TRACK ---
+            'guess_frame_id': 'odom',            # Dùng Odom của EKF làm vị trí đoán khi VO bị mù
+            'always_process_most_recent_frame': True, # Luôn lấy frame mới nhất, chống dồn hàng đợi
+            'approx_sync': True,                 # Bật đồng bộ xấp xỉ nhãn thời gian RGB & Depth
+            'queue_size': 10,
+            
+            # Param thuật toán RTAB-Map
+            'Reg/Force3DoF': 'true',             # Ép chạy trên mặt phẳng 2D
+            'Odom/Strategy': '0',                # 0=Frame-to-Map (rất ổn định)
+            'Odom/ResetCountdown': '1',          # Tự reset keyframe sau 1 frame mất track
+            'Odom/Holonomic': 'false',           # Robot xe nâng không đi ngang
+            'Vis/MinInliers': '12',              # Số điểm đặc trưng tối thiểu để chấp nhận Odom
+        }],
+        remappings=[
+            ('rgb/image', '/color/image_raw'),
+            ('depth/image', '/depth/image_raw'),
+            ('rgb/camera_info', '/color/camera_info'),
+            ('odom', '/rtabmap/odom'),
+        ],
+        condition=IfCondition(use_vo)
+    )
+
+    # ============================================
+    # Visual Odometry Covariance Relay Node
+    # ============================================
+    vo_relay_node = Node(
+        package='amr_localization',
+        executable='vo_cov_relay',
+        name='vo_cov_relay',
+        output='screen',
+        parameters=[{
+            'use_sim_time': False,
+            'vx_covariance': 0.015,       # Mơ hồ hơn Wheel (0.001) để không đè Wheel
+            'vyaw_covariance': 0.05,
+            'max_valid_covariance': 1.0,  # Ngưỡng vứt bỏ frame mất track
+            'reset_skip_frames': 5,
+        }],
+        condition=IfCondition(use_vo)
+    )
+
+    # ============================================
     # RF2O Laser Odometry (optional, vx source)
     # ============================================
-    # Delayed so that the TF base_footprint -> base_link -> lidar_link is
-    # already published by robot_state_publisher when rf2o performs its first
-    # lookupTransform. Without the delay rf2o logs
-    # "lookupTransform base_footprint -> lidar_link" failures and never
-    # initialises.
     rf2o_node = TimerAction(
         period=rf2o_delay,
         actions=[
@@ -247,7 +321,7 @@ def generate_launch_description():
                     rf2o_config,
                     {'use_sim_time': False}
                 ],
-                arguments=['--ros-args', '--log-level', 'FATAL'],
+                ros_arguments=['--log-level', rf2o_log_level],
                 condition=IfCondition(use_rf2o),
             )
         ],
@@ -256,9 +330,6 @@ def generate_launch_description():
     # ============================================
     # RF2O Covariance Relay (optional)
     # ============================================
-    # Sets the covariance of the lidar vx measurement, rejects samples that
-    # are inconsistent with the wheel encoders, and republishes the result
-    # on /odom_rf2o_fused for the EKF.
     rf2o_relay_node = Node(
         package='amr_localization',
         executable='rf2o_cov_relay',
@@ -271,10 +342,6 @@ def generate_launch_description():
     # ============================================
     # EKF Localization Node
     # ============================================
-    # The odom1 block (rf2o, vx only) lives in ekf_real_robot.yaml. When
-    # use_rf2o is false, odom1_config is overridden with an all-false vector:
-    # robot_localization then creates no subscription to /odom_rf2o_fused at
-    # all, so the EKF behaves exactly as it did before rf2o was integrated.
     ekf_node = Node(
         package='robot_localization',
         executable='ekf_node',
@@ -319,12 +386,15 @@ def generate_launch_description():
     # ============================================
     return LaunchDescription([
         esp32_port_arg,
+        esp32_baudrate_arg,
         lidar_port_arg,
         serial_baudrate_arg,
         scan_mode_arg,
         camera_enable_arg,
+        use_vo_arg,
         use_rf2o_arg,
         rf2o_delay_arg,
+        rf2o_log_level_arg,
 
         bringup_info,
         lidar_info,
@@ -339,6 +409,8 @@ def generate_launch_description():
         scan_filter_node,
         camera_driver,
         pointcloud_filter_node,
+        vo_node,
+        vo_relay_node,
         rf2o_node,
         rf2o_relay_node,
         ekf_node,

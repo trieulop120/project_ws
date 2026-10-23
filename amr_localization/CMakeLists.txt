@@ -22,4 +22,10 @@ install(PROGRAMS
   RENAME rf2o_cov_relay
 )
 
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_localization/vo_cov_relay.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME vo_cov_relay
+)
+
 ament_package()
