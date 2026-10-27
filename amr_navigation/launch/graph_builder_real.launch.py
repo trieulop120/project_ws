@@ -25,10 +25,10 @@ def generate_launch_description():
     # ============================================
     # PATHS - Chỉnh sửa ở đây
     # ============================================
-    input_yaml = os.path.join(pkg_nav, 'config', 'graphs', '1_D203B Route.yaml')
-    output_geojson = os.path.join(pkg_nav, 'config', 'graphs', '1_D203B Route.geojson')
-    output_poses = os.path.join(pkg_nav, 'config', 'graphs', '1_D203B Route_poses.yaml')
-    map_yaml = os.path.join(pkg_mapping, 'maps', 'real_amr_map.yaml')
+    input_yaml = os.path.join(pkg_nav, 'config', 'graphs', 'D203B Route.yaml')
+    output_geojson = os.path.join(pkg_nav, 'config', 'graphs', 'D203B Route.geojson')
+    output_poses = os.path.join(pkg_nav, 'config', 'graphs', 'D203B Route_poses.yaml')
+    map_yaml = os.path.join(pkg_mapping, 'maps', 'D203B.yaml')
     rviz_config = os.path.join(pkg_nav, 'rviz', 'route_builder.rviz')
 
     # ============================================

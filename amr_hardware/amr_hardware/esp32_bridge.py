@@ -20,12 +20,16 @@ class ESP32Bridge(Node):
 
         # --- PARAMETERS ---
         self.declare_parameter('port', '/dev/esp32')
-        self.declare_parameter('baudrate', 115200)
-        self.declare_parameter('wheel_radius', 0.05)    
-        self.declare_parameter('wheelbase', 0.477)         
+        self.declare_parameter('baudrate', 921600)
+        self.declare_parameter('wheel_radius', 0.0509)    
+        self.declare_parameter('wheelbase', 0.4813)         
         self.declare_parameter('counts_per_rev', 3960.0)  # 3960 xung/vòng
         self.declare_parameter('max_rpm', 110.0)           # Tốc độ tối đa 110 RPM
         self.declare_parameter('gyro_scale_z', 0.977)
+        # He so hieu chinh quang duong cho ODOMETRY (thuc/do, trung binh 11 lan chay = 1.054).
+        # Chi ap len dc (tinh tien); KHONG dung cho lenh cmd_vel->RPM va KHONG dung cho yaw
+        # (chua co bai test xoay de hieu chinh wheelbase).
+        self.declare_parameter('odom_scale', 1.054)
         self.declare_parameter('publish_tf', False)
         # HC-SR04 (firmware gui cm, -1.0 khi khong co echo; timeout 6000us ~ 1.0 m)
         self.declare_parameter('ultrasonic_frame', 'ultrasonic_link')
@@ -41,6 +45,7 @@ class ESP32Bridge(Node):
         self.cpr = self.get_parameter('counts_per_rev').value
         self.max_rpm = float(self.get_parameter('max_rpm').value)
         self.gyro_scale_z = float(self.get_parameter('gyro_scale_z').value)
+        self.odom_scale = float(self.get_parameter('odom_scale').value)
         self.publish_tf = self.get_parameter('publish_tf').value
         self.joint_names = self.get_parameter('joint_names').value
         self.us_frame = self.get_parameter('ultrasonic_frame').value
@@ -94,7 +99,7 @@ class ESP32Bridge(Node):
         threading.Thread(target=self.read_loop, daemon=True).start()
 
         # Timer cố định 30Hz
-        self.timer = self.create_timer(1.0 / 30.0, self.publish_loop_30hz)
+        self.timer = self.create_timer(1.0 / 100.0, self.publish_loop_100hz)
         self.get_logger().info(f'ESP32 Bridge Started (Port: {self.port}, Publish TF: {self.publish_tf}) - 30Hz Active')
 
     def check_symlink_conflict(self):
@@ -164,7 +169,7 @@ class ESP32Bridge(Node):
                         self.get_logger().error(
                             '[FATAL] ESP32 không phản hồi sau 2 retries (20s total). '
                             'Kiểm tra: (1) ESP32 có đang chạy firmware đúng không, '
-                            '(2) baudrate có khớp không (115200), '
+                            '(2) baudrate có khớp không (921600), '
                             '(3) TX/RX wiring có đúng không.'
                         )
                         self.ser.close()
@@ -301,16 +306,16 @@ class ESP32Bridge(Node):
                 except Exception:
                     pass
 
-    def publish_loop_30hz(self):
+    def publish_loop_100hz(self):
         now_time = self.get_clock().now()
         now = now_time.to_msg()
 
         dt_sec = (now_time - self.last_time).nanoseconds / 1e9
         if dt_sec <= 0:
-            dt_sec = 0.033
+            dt_sec = 0.01  # <-- ĐÃ SỬA THÀNH 0.01s (tương ứng 100 Hz)
         self.last_time = now_time
 
-        # (5) Gửi lệnh drive liên tục mỗi 30Hz (kể cả khi cmd_vel không đổi)
+        # Gửi lệnh drive liên tục mỗi 100Hz
         self._send_drive_commands()
 
         with self.data_lock:
@@ -361,8 +366,8 @@ class ESP32Bridge(Node):
         wheel_circ = 2 * math.pi * self.wheel_radius
         dl = ((el - self.last_el) / self.cpr) * wheel_circ
         dr = ((er - self.last_er) / self.cpr) * wheel_circ
-        dc = (dl + dr) / 2.0
-        dt = (dr - dl) / self.wheelbase
+        dt = (dr - dl) / self.wheelbase           # yaw: giu nguyen, khong nhan odom_scale
+        dc = ((dl + dr) / 2.0) * self.odom_scale  # tinh tien: da hieu chinh
 
         self.x += dc * math.cos(self.theta + dt / 2.0)
         self.y += dc * math.sin(self.theta + dt / 2.0)

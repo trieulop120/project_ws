@@ -8,7 +8,7 @@ Publishes pallet pose in map / base_footprint / camera frames and dynamic TF.
 Subscribes:
   - /color/image_raw (Image)
   - /depth/image_raw (Image)
-  - /camera/color/camera_info (CameraInfo)
+  - /color/camera_info (CameraInfo)
 
 Publishes:
   - /pallet/pose (geometry_msgs/PoseStamped)        - absolute pose in `map` frame
@@ -45,6 +45,44 @@ Frame conventions
   cannot be fitted, the last steady yaw is kept for up to 1 s, otherwise it
   falls back to the line-of-sight direction (pallet assumed perpendicular to the
   ray robot -> pallet).
+
+Pallet geometry (params)
+------------------------
+- pallet_face_width (0.30 m): minimum visible span of the fitted front face
+  (min-span gate in estimate_yaw_from_depth).
+- pallet_side_width (0.30 m): width of the side face (no holes, has the edge).
+- pallet_height (0.05 m): pallet height; reference for the measured z in calib.
+
+Calibration correction
+----------------------
+By default the node applies the BUILT-IN correction given by the corr_* parameters
+(hand-fitted from 21 detect-vs-real points). The json file below is ignored unless
+`use_correction_file:=true`, in which case it REPLACES the built-in values (the two
+are never added together).
+
+The `correction_file` (default ~/cam_calib_logs/camera_correction.json) holds an
+affine base-frame correction. It is either written by camera_calib_node (station
+shots) or fitted by hand from a detect-vs-real table. Model (p = detected
+base-frame position BEFORE correction, r = |p| horizontal range):
+
+    x_corr   = x + gain_x*r + k_xy*y + dx_m
+    y_corr   = y + gain_y*r + k_yy*y + dy_m
+    yaw_corr = yaw + yaw_res_deg
+
+  gain_x / gain_y : bias per meter of range (residual camera tilt)
+  k_xy            : x error per meter of lateral offset y (x coupling with y)
+  k_yy            : lateral scale error (e.g. wrong fx); y_corr = (1+k_yy)*y + ...
+  dx_m, dy_m, yaw_res_deg : constant part
+
+Missing keys default to 0. The file is read at startup and hot-reloaded whenever
+its mtime changes (checked every 2 s), so a new calibration takes effect without a
+restart. The correction is applied in compute_pallet_poses() after p_base / yaw
+are computed, so the published base AND map poses (and the pallet TF) are all
+corrected.
+
+NOTE: the correction is only valid for the SAME camera_pitch_deg and camera
+intrinsics (camera_info) that were active when the detect-vs-real table was
+measured. Change either one and the table must be re-measured.
 """
 
 import math
@@ -193,15 +231,30 @@ class PalletDetectorNode(Node):
         # percentile of depth inside the OBB (low = nearest = pallet front face)
         self.declare_parameter('depth_percentile', 25.0)
         self.declare_parameter('use_depth_yaw', True)
+        # Pallet geometry (m). Front face = the face with the 2 holes/openings
+        # (0.40 m wide); side face = the face without holes, with the edge (0.30 m);
+        # pallet height 0.05 m. `pallet_face_width` drives the min-span gate in
+        # estimate_yaw_from_depth: the visible face must span at least this width
+        # along the fitted line, otherwise the angle cannot be estimated reliably.
+        self.declare_parameter('pallet_face_width', 0.30)
+        self.declare_parameter('pallet_side_width', 0.30)
+        self.declare_parameter('pallet_height', 0.05)
         # Real downward tilt of the camera (deg, positive = looking down) that is
-        # NOT in the URDF/TF (camera_joint rpy = 0 0 0). Default 15 deg.
-        # Set to 0.0 once camera_joint rpy="0 <pitch_rad> 0" is fixed in the URDF,
-        # otherwise the tilt would be applied twice.
-        self.declare_parameter('camera_pitch_deg', 7.0)
+        # NOT in the URDF/TF (camera_joint rpy = 0 0 0). Set to 0.0 when the URDF
+        # already carries the tilt, otherwise the tilt would be applied twice.
+        self.declare_parameter('camera_pitch_deg', 0.0)
         # Yaw smoothing: median over the last N frames, output only changes when the
         # smoothed value moves by more than the dead-band (steady number on screen)
         self.declare_parameter('yaw_filter_window', 15)
         self.declare_parameter('yaw_deadband_deg', 0.3)
+        # ROI for the YOLO inference: only run the model on the lower band of the
+        # image (pallets never appear in the sky / upper part of the FOV) with a
+        # side margin trimmed off. Detection results are offset back to full-
+        # frame pixel coordinates, so depth sampling and intrinsics are
+        # unchanged. ~60% less pixels -> less lag on CPU.
+        self.declare_parameter('use_roi', True)
+        self.declare_parameter('roi_bottom_frac', 0.5)
+        self.declare_parameter('roi_side_margin_px', 35)
 
         self.model_path = self.get_parameter('model_path').value
         self.conf_threshold = self.get_parameter('conf_threshold').value
@@ -214,9 +267,40 @@ class PalletDetectorNode(Node):
         self.publish_debug = self.get_parameter('debug_image').value
         self.depth_percentile = self.get_parameter('depth_percentile').value
         self.use_depth_yaw = self.get_parameter('use_depth_yaw').value
+        self.pallet_face_width = float(self.get_parameter('pallet_face_width').value)
+        self.pallet_side_width = float(self.get_parameter('pallet_side_width').value)
+        self.pallet_height = float(self.get_parameter('pallet_height').value)
         self.camera_pitch_deg = self.get_parameter('camera_pitch_deg').value
+        # Calibration correction file (written by camera_calib_node or fitted by
+        # hand, hot-reloaded when the file changes): an affine base-frame map
+        # (gain vs range + k_xy/k_yy vs lateral y + dx/dy/yaw_res).
+        self.declare_parameter('correction_file',
+                               os.path.join(os.path.expanduser('~'),
+                                            'cam_calib_logs',
+                                            'camera_correction.json'))
+        self.correction_file = os.path.expanduser(
+            str(self.get_parameter('correction_file').value))
+        # Built-in correction, hand-fitted from 21 detect-vs-real points
+        # (correction = real - detect; see module docstring for the model).
+        # Used by default. Override per run with `-p corr_k_xy:=...` etc.
+        self.declare_parameter('corr_gain_x', 0.0)       # m per m of range
+        self.declare_parameter('corr_gain_y', 0.0)       # m per m of range
+        self.declare_parameter('corr_k_xy', -0.1004)     # x err per m of lateral y
+        self.declare_parameter('corr_k_yy', -0.0499)     # lateral scale error
+        self.declare_parameter('corr_dx_m', -0.0157)
+        self.declare_parameter('corr_dy_m', 0.0086)
+        self.declare_parameter('corr_yaw_res_deg', 4.4)
+        # False = use the built-in values above. True = read `correction_file`
+        # instead (hot-reloaded; it replaces the built-in values, never adds).
+        self.declare_parameter('use_correction_file', False)
+        self.use_correction_file = bool(
+            self.get_parameter('use_correction_file').value)
         self.yaw_filter_window = max(1, int(self.get_parameter('yaw_filter_window').value))
         self.yaw_deadband = math.radians(float(self.get_parameter('yaw_deadband_deg').value))
+        self.use_roi = bool(self.get_parameter('use_roi').value)
+        self.roi_bottom_frac = min(1.0, max(0.1, float(
+            self.get_parameter('roi_bottom_frac').value)))
+        self.roi_side_margin_px = int(self.get_parameter('roi_side_margin_px').value)
         self.yaw_hist = deque(maxlen=self.yaw_filter_window)
         self.yaw_out = None
         self.yaw_last_t = 0.0
@@ -229,6 +313,26 @@ class PalletDetectorNode(Node):
         R_pitch = np.array([[ct, 0.0, st], [0.0, 1.0, 0.0], [-st, 0.0, ct]])
         R_co = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
         self.R_cam_corr = R_co.T @ R_pitch @ R_co
+
+        # Residual camera correction (see module docstring). None until a
+        # correction file has been read.
+        # Model (all in base frame, applied to the detected base pose; y below is
+        # the detected y BEFORE correction):
+        #   x_corr = x + gain_x*r + k_xy*y + dx
+        #   y_corr = y + gain_y*r + k_yy*y + dy
+        #   yaw_corr = yaw + yaw_res
+        # Initialised from the built-in corr_* parameters (hand-fitted values).
+        self._corr_gains = (float(self.get_parameter('corr_gain_x').value),
+                            float(self.get_parameter('corr_gain_y').value))
+        self._corr_k = (float(self.get_parameter('corr_k_xy').value),
+                        float(self.get_parameter('corr_k_yy').value))
+        self._corr_t_res = np.array([float(self.get_parameter('corr_dx_m').value),
+                                     float(self.get_parameter('corr_dy_m').value),
+                                     0.0])
+        self._corr_yaw_res = math.radians(
+            float(self.get_parameter('corr_yaw_res_deg').value))
+        self._corr_mtime = 0.0
+        self._corr_load_warned = False
 
         # Camera intrinsics
         self.fx = self.DEFAULT_FX
@@ -291,19 +395,117 @@ class PalletDetectorNode(Node):
 
         self.camera_info_sub = self.create_subscription(
             CameraInfo,
-            '/camera/color/camera_info',
+            '/color/camera_info',
             self.camera_info_callback,
             QoSProfile(depth=1)
         )
 
         self.timer = self.create_timer(0.1, self.timer_callback)  # 10 Hz
+        # Hot-reload the calibration correction file every 2 s
+        if self.use_correction_file:
+            self.create_timer(2.0, self._maybe_reload_correction)
+            self._load_correction(force=True)  # pick up an existing file at startup
+        else:
+            kxy, kyy = self._corr_k
+            self.get_logger().info(
+                f'Built-in correction: gain_x={self._corr_gains[0]:+.4f} '
+                f'gain_y={self._corr_gains[1]:+.4f} k_xy={kxy:+.4f} k_yy={kyy:+.4f} '
+                f'dx={self._corr_t_res[0] * 1000:+.1f} mm '
+                f'dy={self._corr_t_res[1] * 1000:+.1f} mm '
+                f'dyaw={math.degrees(self._corr_yaw_res):+.2f} deg '
+                f'(correction_file ignored; set use_correction_file:=true to use it)')
 
         self.get_logger().info('Pallet Detector Node initialized')
         self.get_logger().info(f'Model path: {self.model_path}')
         self.get_logger().info(f'Conf threshold: {self.conf_threshold}')
         self.get_logger().info(
+            f'camera_pitch_deg={self.camera_pitch_deg} (correction file is only '
+            f'valid for the pitch/intrinsics it was measured with)')
+        if self.use_roi:
+            self.get_logger().info(
+                f'ROI: bottom {self.roi_bottom_frac * 100:.0f}% of the frame, '
+                f'side margin {self.roi_side_margin_px}px (YOLO runs on the crop only)')
+        self.get_logger().info(
             f'Frames: camera={self.camera_frame_param}, base={self.base_frame}, '
             f'target={self.target_frame}')
+
+    # ==================================================================
+    # Calibration correction (camera_calib_node or hand-fitted)
+    # ==================================================================
+    def _apply_correction(self, doc: dict):
+        """Populate _corr_* from a parsed correction JSON document.
+
+        Fields (all optional, default 0): gain_x, gain_y (m per meter of range),
+        k_xy, k_yy (m per meter of lateral y), dx_m, dy_m (constant base-frame
+        offset), yaw_res_deg.
+        """
+        def f(key):
+            return float(doc.get(key, 0.0) or 0.0)
+
+        self._corr_gains = (f('gain_x'), f('gain_y'))
+        self._corr_k = (f('k_xy'), f('k_yy'))
+        self._corr_t_res = np.array([f('dx_m'), f('dy_m'), 0.0])
+        self._corr_yaw_res = math.radians(f('yaw_res_deg'))
+
+    def _correct_base_pose(self, p_base: np.ndarray, yaw_base: float):
+        """Apply the fitted correction to a base-frame pose.
+
+        x_corr = x + gain_x*r + k_xy*y + dx
+        y_corr = y + gain_y*r + k_yy*y + dy
+        yaw_corr = yaw + yaw_res
+        where r = horizontal range and x, y = the DETECTED base position (the
+        same inputs the correction was fitted on). No-op without a correction file.
+        """
+        if self._corr_t_res is None:
+            return p_base, yaw_base
+        x, y = float(p_base[0]), float(p_base[1])
+        r = math.hypot(x, y)
+        gx, gy = self._corr_gains
+        kxy, kyy = self._corr_k
+        p_base = p_base + np.array([gx * r + kxy * y + self._corr_t_res[0],
+                                    gy * r + kyy * y + self._corr_t_res[1],
+                                    0.0])
+        return p_base, normalize_angle(yaw_base + self._corr_yaw_res)
+
+    def _load_correction(self, force: bool = False):
+        """Read the correction file; reload when its mtime changes.
+
+        A missing / unreadable file is not an error: it just means no
+        correction has been fitted yet (or it was deleted).
+        """
+        try:
+            st = os.stat(self.correction_file)
+        except OSError:
+            return
+        if not force and st.st_mtime <= self._corr_mtime:
+            return
+        try:
+            import json
+            with open(self.correction_file, 'r') as f:
+                doc = json.load(f)
+        except Exception as e:
+            if not self._corr_load_warned:
+                self.get_logger().warn(
+                    f'Correction file unreadable ({self.correction_file}): {e}; '
+                    'keeping previous state')
+                self._corr_load_warned = True
+            return
+        self._apply_correction(doc)
+        self._corr_mtime = st.st_mtime
+        self._corr_load_warned = False
+        gx, gy = self._corr_gains or (0.0, 0.0)
+        kxy, kyy = self._corr_k
+        self.get_logger().info(
+            f"Correction loaded ({doc.get('mode', '?')}, "
+            f"{doc.get('n_shots', 0)} shots): "
+            f"gain_x={gx:+.4f} gain_y={gy:+.4f} (m/m), "
+            f"k_xy={kxy:+.4f} k_yy={kyy:+.4f} (m/m of y), "
+            f"dx={doc.get('dx_m', 0.0) * 1000:+.1f} mm, "
+            f"dy={doc.get('dy_m', 0.0) * 1000:+.1f} mm, "
+            f"dyaw={doc.get('yaw_res_deg', 0.0):+.2f} deg")
+
+    def _maybe_reload_correction(self):
+        self._load_correction()
 
     # ==================================================================
     # Model
@@ -344,7 +546,13 @@ class PalletDetectorNode(Node):
         try:
             self.get_logger().info(f'Loading model from: {self.model_path}')
             self.model = YOLO(self.model_path)
-            self.get_logger().info('YOLO model loaded successfully')
+            task = getattr(self.model, 'task', None)
+            if task == 'obb':
+                self.get_logger().info('YOLO model loaded successfully (OBB)')
+            else:
+                self.get_logger().info(
+                    f'YOLO model loaded successfully (task={task}) — detections '
+                    f'will be derived from mask contours via minAreaRect')
         except Exception as e:
             self.get_logger().error(f'Failed to load model: {e}')
             self.model = None
@@ -544,7 +752,7 @@ class PalletDetectorNode(Node):
 
         # The visible part of the face must be wide enough to give a good angle
         proj = Qm @ d
-        if float(np.percentile(proj, 98) - np.percentile(proj, 2)) < 0.3:
+        if float(np.percentile(proj, 98) - np.percentile(proj, 2)) < self.pallet_face_width:
             return None
 
         # Normal pointing AWAY from the robot (robot at base origin),
@@ -578,14 +786,39 @@ class PalletDetectorNode(Node):
     # ==================================================================
     # Detection
     # ==================================================================
+    def _roi_crop(self, h: int, w: int) -> Optional[Tuple[int, int, int, int]]:
+        """Return (x0, x1, y0, y1) of the YOLO ROI, or None (full frame)."""
+        if not self.use_roi:
+            return None
+        top = int(math.floor(h * (1.0 - self.roi_bottom_frac)))
+        side = self.roi_side_margin_px
+        x0, x1 = max(0, side), min(w, w - side)
+        y0, y1 = top, h
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, x1, y0, y1
+
     def detect_pallets(self, color_img: np.ndarray) -> List[dict]:
-        """Run YOLO OBB detection on color image."""
+        """Run YOLO OBB detection on the (optionally ROI-cropped) color image.
+
+        With use_roi the model only sees the lower band of the frame with a
+        side margin trimmed off; detection coordinates are shifted back to
+        full-frame pixels so depth sampling / intrinsics are unaffected.
+        """
         if self.model is None:
             return []
 
+        roi = self._roi_crop(*color_img.shape[:2])
+        if roi is not None:
+            x0, x1, y0, y1 = roi
+            roi_img = color_img[y0:y1, x0:x1]
+            off_x, off_y = x0, y0
+        else:
+            roi_img, off_x, off_y = color_img, 0, 0
+
         try:
             results = self.model.predict(
-                color_img,
+                roi_img,
                 conf=self.conf_threshold,
                 iou=self.iou_threshold,
                 device='cpu',
@@ -595,27 +828,67 @@ class PalletDetectorNode(Node):
             detections = []
             for result in results:
                 obb = result.obb
-                if obb is None or len(obb) == 0:
-                    continue
+                if obb is not None and len(obb) > 0:
+                    # OBB model: read result.obb directly.
+                    corners_arr = obb.xyxyxyxy.cpu().numpy()
+                    xywhr = obb.xywhr.cpu().numpy()
+                    confs = obb.conf.cpu().numpy()
+                    clss = obb.cls.cpu().numpy().astype(int)
+                    seg_xy = None
+                else:
+                    # Instance-segment model (task='segment'): no result.obb —
+                    # derive oriented boxes from the mask contours instead.
+                    corners_arr = None
+                    xywhr = None
+                    masks = result.masks
+                    if masks is None or len(masks) == 0:
+                        continue
+                    boxes = result.boxes
+                    confs = (boxes.conf.cpu().numpy()
+                              if boxes is not None and len(boxes) else np.zeros(0))
+                    clss = (boxes.cls.cpu().numpy().astype(int)
+                             if boxes is not None and len(boxes) else np.zeros(0, dtype=int))
+                    seg_xy = masks.xy  # per mask: (N, 2) pixel points, ROI coords
 
-                corners = obb.xyxyxyxy.cpu().numpy()       # (N, 4, 2)
-                xywhr = obb.xywhr.cpu().numpy()            # (N, 5): cx, cy, w, h, angle(rad)
-                confs = obb.conf.cpu().numpy()
-                clss = obb.cls.cpu().numpy().astype(int)
-
-                for i in range(len(corners)):
-                    cx, cy = float(xywhr[i][0]), float(xywhr[i][1])
-                    cls = int(clss[i])
-                    detections.append({
-                        'center': (cx, cy),
-                        'angle': float(xywhr[i][4]),
-                        'conf': float(confs[i]),
-                        'class': result.names[cls],
-                        'class_id': cls,
-                        'box': corners[i],
-                        'u': int(cx),
-                        'v': int(cy),
-                    })
+                if corners_arr is not None:
+                    for i in range(len(corners_arr)):
+                        # shift back to full-frame pixel coords
+                        cx = float(xywhr[i][0]) + off_x
+                        cy = float(xywhr[i][1]) + off_y
+                        box = corners_arr[i].copy()
+                        box[:, 0] += off_x
+                        box[:, 1] += off_y
+                        detections.append({
+                            'center': (cx, cy),
+                            'angle': float(xywhr[i][4]),
+                            'conf': float(confs[i]),
+                            'class': result.names[clss[i]],
+                            'class_id': int(clss[i]),
+                            'box': box,
+                            'u': int(cx),
+                            'v': int(cy),
+                        })
+                else:
+                    for i in range(len(seg_xy)):
+                        pts = np.asarray(seg_xy[i], dtype=np.float32).reshape(-1, 2)
+                        if len(pts) < 4:
+                            continue
+                        center_r, wh_r, ang_deg = cv2.minAreaRect(pts)
+                        if wh_r[0] < 1e-3 or wh_r[1] < 1e-3:
+                            continue
+                        box = cv2.boxPoints((center_r, wh_r, ang_deg))
+                        box[:, 0] += off_x
+                        box[:, 1] += off_y
+                        detections.append({
+                            'center': (center_r[0] + off_x, center_r[1] + off_y),
+                            'angle': math.radians(ang_deg),
+                            'conf': float(confs[i]) if i < len(confs) else 0.0,
+                            'class': result.names[clss[i]] if i < len(clss) else 'unknown',
+                            'class_id': int(clss[i]) if i < len(clss) else -1,
+                            'box': box,
+                            'u': int(center_r[0] + off_x),
+                            'v': int(center_r[1] + off_y),
+                        })
 
             return detections
 
@@ -687,7 +960,11 @@ class PalletDetectorNode(Node):
         else:
             # Fallback: pallet perpendicular to the line of sight robot -> pallet
             yaw_base = math.atan2(p_base[1], p_base[0])
-        yaw_base = normalize_angle(yaw_base)
+
+        # --- 3b. Calibration correction (base frame) ----------------------
+        # Same affine model the correction was fitted on; applied here, after
+        # p_base / yaw are final, so published base AND map poses are corrected.
+        p_base, yaw_base = self._correct_base_pose(p_base, yaw_base)
 
         R_pb = yaw_to_rot(yaw_base)       # pallet orientation in base
         R_pc = R_bc.T @ R_pb              # pallet orientation in camera optical
@@ -706,8 +983,13 @@ class PalletDetectorNode(Node):
         rt_map = self.lookup_rt(self.target_frame, camera_frame, cam_corr=True)
         if rt_map is not None:
             R_mc, t_mc = rt_map
-            p_map = R_mc @ p_cam + t_mc
-            R_pm = R_mc @ R_pc
+            # base -> map so the corrected base position is used as-is:
+            #   p_cam = R_bc.T (p_base - t_bc)  =>  p_map = R_mc R_bc.T p_base
+            #                                         + R_mc (-R_bc.T t_bc) + t_mc
+            R_b2m = R_mc @ R_bc.T
+            t_b2m = R_mc @ (-R_bc.T @ t_bc) + t_mc
+            p_map = R_b2m @ p_base + t_b2m
+            R_pm = R_b2m @ R_pb
             pose_map = self.make_pose(self.target_frame, stamp, p_map, R_pm)
             self.pose_pub.publish(pose_map)
             tfs.append(self.make_tf(pose_map, self.pallet_frame_id))
@@ -735,9 +1017,16 @@ class PalletDetectorNode(Node):
     def create_debug_image(self, color_img: np.ndarray,
                            detections: List[dict],
                            best_detection: Optional[dict] = None) -> np.ndarray:
-        """Create debug image with OBB overlays and HUD."""
+        """Create debug image with OBB overlays, ROI box and HUD."""
         debug_img = color_img.copy()
         h, w = debug_img.shape[:2]
+
+        roi = self._roi_crop(h, w)
+        if roi is not None:
+            x0, x1, y0, y1 = roi
+            cv2.rectangle(debug_img, (x0, y0), (x1, y1), (0, 255, 255), 2)
+            cv2.putText(debug_img, 'ROI (YOLO)', (x0 + 6, y0 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         for det in detections:
             box = det['box']

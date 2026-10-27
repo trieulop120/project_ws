@@ -44,14 +44,8 @@ install(PROGRAMS
   RENAME cmd_vel_splitter
 )
 install(PROGRAMS
-  ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/odom_compare.py
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/odom_calib.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME odom_compare
+  RENAME odom_calib
 )
-install(PROGRAMS
-  ${CMAKE_CURRENT_SOURCE_DIR}/amr_hardware/tf_snap.py
-  DESTINATION lib/${PROJECT_NAME}
-  RENAME tf_snap
-)
-
 ament_package()

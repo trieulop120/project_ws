@@ -1,0 +1,1242 @@
+#!/usr/bin/env python3
+"""
+Pallet Detector Node
+====================
+YOLO OBB-based pallet detection using RGB-D camera.
+Publishes pallet pose in map / base_footprint / camera frames and dynamic TF.
+
+Subscribes:
+  - /color/image_raw (Image)
+  - /depth/image_raw (Image)
+  - /color/camera_info (CameraInfo; configurable via camera_info_topic)
+
+Publishes:
+  - /pallet/pose (geometry_msgs/PoseStamped)        - absolute pose in `map` frame
+  - /pallet/pose_base (geometry_msgs/PoseStamped)   - robot-relative pose in `base_footprint`
+  - /pallet/pose_camera (geometry_msgs/PoseStamped) - raw pose in camera optical frame
+  - /pallet/detections (vision_msgs/Detection2DArray)
+  - /perception/pallet_debug_image (sensor_msgs/Image)
+
+Broadcasts:
+  - pallet_frame (dynamic TF, parent = map frame)
+  - pallet_frame_base (dynamic TF, parent = base_footprint)
+
+Model classes (current weights): box, edge, hang, hole, pallet-hole-segmentation1
+  - The class used as "pallet" is the parameter `pallet_class`
+    (default 'pallet-hole-segmentation1').
+  - The class used as "edge" is the parameter `edge_class` (default 'edge').
+
+Frame conventions
+-----------------
+- Camera optical frame: X right, Y down, Z forward (what pixel_to_3d returns).
+- ROS body frame (REP-103): X forward, Y left, Z up.
+  The optical -> ROS conversion is done by TF (camera_color_optical_frame is
+  linked to camera_link / base_footprint by the robot's TF tree), so every
+  point/orientation is carried through the real TF rotation + translation.
+- Camera tilt: the physical camera looks down by `camera_pitch_deg` (default 7)
+  but the URDF has camera_link rpy = 0, so the node adds that tilt itself when
+  going optical -> base/map. Depth Z is distance ALONG the optical axis, not the
+  horizontal distance, so with a tilted camera Base X < depth.
+- Pallet frame: origin at pallet centre, +X is the normal of the pallet's long
+  (front) face pointing INTO the pallet (away from the robot), +Z up.
+  Yaw is the angle of pallet +X relative to base_footprint +X, around the
+  vertical axis, normalized to [-pi, pi]:
+      yaw = 0      -> robot is facing the pallet squarely
+      yaw > 0      -> pallet is rotated counter-clockwise (left) vs robot heading
+      yaw < 0      -> pallet is rotated clockwise (right) vs robot heading
+  The yaw is estimated by fitting lines (RANSAC + least squares) to the valid
+  depth pixels inside (a) the `pallet` OBB (front face) and (b) every `edge` OBB
+  that belongs to that pallet (edge label drawn along a pallet edge). By default
+  the edge is the SIDE edge, perpendicular to the front face in 3D (in the image it
+  looks like a parallelogram, so no right angle is assumed there: everything is
+  done in 3D from depth); its direction gives the yaw +-90 deg. Vertical edges
+  are rejected automatically (they collapse to a point). The estimates
+  are combined with weights (inverse variance, edge trusted more by default) and
+  inconsistent ones are dropped. The result is then smoothed over the last frames
+  (median + dead-band) so the value stays steady. The position (x, y, z) gets the
+  same multi-frame averaging; a real jump (3 frames in a row) restarts the average.
+  ROI: only detections whose centre is in the lower part of the image (floor) are
+  used (`roi_top_ratio`). If nothing can be fitted, the
+  last steady yaw is kept for up to 1 s, otherwise it falls back to the
+  line-of-sight direction (pallet assumed perpendicular to the ray robot -> pallet).
+
+POSITION (x, y): by default (`use_face_center`) it is the MIDPOINT of the fitted
+  front-face line (centre of the visible face, on the face plane), not the ray through
+  the YOLO box centre + a depth percentile. The pixel method is biased sideways and in
+  depth when the pallet is rotated (bias grows with the tilt, its sign follows the tilt).
+  The midpoint is only used when the visible face width is plausible
+  (`face_min_ratio` .. `face_max_ratio` times `pallet_width_m`); otherwise (partial view)
+  the node falls back to the pixel method and logs a warning. The HUD shows the source
+  (`face` / `pixel`) and the visible face width.
+"""
+
+import math
+import os
+import traceback
+import time
+import threading
+from collections import deque
+from typing import Optional, List, Tuple
+
+import cv2
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from rclpy.time import Time
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+from geometry_msgs.msg import PoseStamped, TransformStamped, Quaternion
+from sensor_msgs.msg import Image, CameraInfo
+from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
+from message_filters import Subscriber, ApproximateTimeSynchronizer
+from cv_bridge import CvBridge
+
+from tf2_ros import TransformBroadcaster, TransformListener, Buffer
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
+
+
+# ----------------------------------------------------------------------
+# Small math helpers (no extra dependencies)
+# ----------------------------------------------------------------------
+def quat_to_rot(x: float, y: float, z: float, w: float) -> np.ndarray:
+    """Quaternion -> 3x3 rotation matrix."""
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    if n == 0.0:
+        return np.eye(3)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+        [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
+    ])
+
+
+def rot_to_quat(R: np.ndarray) -> Quaternion:
+    """3x3 rotation matrix -> Quaternion msg."""
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+
+    q = Quaternion()
+    q.x, q.y, q.z, q.w = float(x), float(y), float(z), float(w)
+    return q
+
+
+def normalize_angle(a: float) -> float:
+    """Wrap angle to [-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def yaw_to_rot(yaw: float) -> np.ndarray:
+    """Rotation around Z."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+_YAW_RNG = np.random.default_rng()
+
+
+def _fit_line_2d(Q: np.ndarray):
+    """Total-least-squares line through 2D points: (n, c, d, m).
+
+    n unit normal, c offset (n . p = c), d unit direction, m centroid.
+    """
+    m = Q.mean(axis=0)
+    _, _, vt = np.linalg.svd(Q - m, full_matrices=False)
+    d = vt[0]
+    n = np.array([-d[1], d[0]])
+    return n, float(n @ m), d, m
+
+
+def edge_belongs_to_pallet(pallet_box: np.ndarray, edge_box: np.ndarray,
+                           margin_px: int = 25) -> bool:
+    """True if the edge OBB overlaps the pallet OBB (grown by margin_px)."""
+    pts = np.vstack([pallet_box, edge_box])
+    x0, y0 = (np.floor(pts.min(axis=0)).astype(int) - margin_px - 1)
+    x1, y1 = (np.ceil(pts.max(axis=0)).astype(int) + margin_px + 2)
+    w, h = int(x1 - x0), int(y1 - y0)
+    if w <= 0 or h <= 0 or w * h > 4_000_000:
+        return False
+    off = np.array([x0, y0])
+    a = np.zeros((h, w), dtype=np.uint8)
+    b = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(a, [(pallet_box - off).astype(np.int32).reshape((-1, 1, 2))], 1)
+    a = cv2.dilate(a, np.ones((2 * margin_px + 1, 2 * margin_px + 1), dtype=np.uint8))
+    cv2.fillPoly(b, [(edge_box - off).astype(np.int32).reshape((-1, 1, 2))], 1)
+    return bool(np.any(a & b))
+
+
+def yaw_to_quaternion(yaw: float) -> Quaternion:
+    q = Quaternion()
+    q.x = 0.0
+    q.y = 0.0
+    q.z = math.sin(yaw / 2.0)
+    q.w = math.cos(yaw / 2.0)
+    return q
+
+
+class PalletDetectorNode(Node):
+    """YOLO OBB Pallet Detector with RGB-Depth fusion."""
+
+    # Camera intrinsics (Astra Pro default)
+    DEFAULT_FX = 570.0
+    DEFAULT_FY = 570.0
+    DEFAULT_CX = 320.0
+    DEFAULT_CY = 240.0
+
+    MIN_DEPTH_M = 0.1
+    MAX_DEPTH_M = 10.0
+
+    def __init__(self):
+        super().__init__('pallet_detector_node')
+
+        # ============================================================
+        # Parameters
+        # ============================================================
+        self.declare_parameter('model_path', '')
+        self.declare_parameter('conf_threshold', 0.25)
+        self.declare_parameter('iou_threshold', 0.45)
+        self.declare_parameter('target_frame', 'map')
+        self.declare_parameter('base_frame', 'base_footprint')
+        self.declare_parameter('camera_frame', 'camera_color_optical_frame')
+        # Must match the actual CameraInfo topic after launch remappings.
+        self.declare_parameter('camera_info_topic', '/color/camera_info')
+        self.declare_parameter('require_camera_info', True)
+        self.declare_parameter('pallet_frame_id', 'pallet_frame')
+        self.declare_parameter('tf_timeout', 0.2)
+        self.declare_parameter('debug_image', True)
+        # percentile of depth inside the OBB (low = nearest = pallet front face)
+        self.declare_parameter('depth_percentile', 25.0)
+        self.declare_parameter('use_depth_yaw', True)
+        # Real downward tilt of the camera (deg, positive = looking down) that is
+        # NOT in the URDF/TF (camera_joint rpy = 0 0 0). Default 7 deg.
+        # Set to 0.0 once camera_joint rpy="0 <pitch_rad> 0" is fixed in the URDF,
+        # otherwise the tilt would be applied twice.
+        self.declare_parameter('camera_pitch_deg', 0.0)
+        # Yaw smoothing: median over the last N frames, output only changes when the
+        # smoothed value moves by more than the dead-band (steady number on screen)
+        self.declare_parameter('yaw_filter_window', 15)
+        self.declare_parameter('yaw_deadband_deg', 0.3)
+        # Edge label: OBB class drawn along a pallet edge, used to refine the yaw
+        self.declare_parameter('use_edge_yaw', True)
+        # ROI: ignore detections whose centre is above this fraction of the image
+        # height (0.5 = only the lower half, the floor). 0.0 = whole image.
+        self.declare_parameter('roi_top_ratio', 0.5)
+        # Position averaging (base frame): median/mean of the last N frames, output
+        # changes only when the average moves more than the dead-band; a jump larger
+        # than pose_jump_m (yaw_jump_deg) for 3 frames in a row restarts the average.
+        self.declare_parameter('pose_filter_window', 15)
+        self.declare_parameter('pose_deadband_m', 0.005)
+        self.declare_parameter('pose_jump_m', 0.20)
+        self.declare_parameter('yaw_jump_deg', 10.0)
+        # Class names in the YOLO model (see model.names)
+        self.declare_parameter('pallet_class', 'pallet-hole-segmentation1')
+        self.declare_parameter('edge_class', 'edge')
+        # 'perpendicular': the edge label is the side edge, perpendicular to the front
+        # face in 3D. 'any': it may also be parallel to the front face.
+        self.declare_parameter('edge_mode', 'perpendicular')
+        # estimates further apart than this (deg) from the most trusted one are dropped
+        self.declare_parameter('yaw_gate_deg', 6.0)
+        # trust floors (deg): systematic error assumed for each source, bigger = trusted less
+        self.declare_parameter('yaw_sigma_face_deg', 0.6)
+        self.declare_parameter('yaw_sigma_edge_deg', 0.8)
+        # Position = MIDPOINT of the fitted front-face line (see module docstring)
+        self.declare_parameter('use_face_center', True)
+        self.declare_parameter('pallet_width_m', 0.4)      # real width of the front face (m)
+        self.declare_parameter('face_min_ratio', 0.85)     # accept visible width >= ratio * width
+        self.declare_parameter('face_max_ratio', 1.12)     # ... and <= ratio * width
+        self.declare_parameter('face_gather_scale', 1.0)   # OBB scale used to find the face extent
+        self.declare_parameter('face_inlier_m', 0.02)      # distance to the fitted line (m)
+
+        self.model_path = self.get_parameter('model_path').value
+        self.conf_threshold = self.get_parameter('conf_threshold').value
+        self.iou_threshold = self.get_parameter('iou_threshold').value
+        self.target_frame = self.get_parameter('target_frame').value
+        self.base_frame = self.get_parameter('base_frame').value
+        self.camera_frame_param = self.get_parameter('camera_frame').value
+        self.camera_info_topic = str(self.get_parameter('camera_info_topic').value)
+        self.require_camera_info = bool(self.get_parameter('require_camera_info').value)
+        self.pallet_frame_id = self.get_parameter('pallet_frame_id').value
+        self.tf_timeout = self.get_parameter('tf_timeout').value
+        self.publish_debug = self.get_parameter('debug_image').value
+        self.depth_percentile = self.get_parameter('depth_percentile').value
+        self.use_depth_yaw = self.get_parameter('use_depth_yaw').value
+        self.camera_pitch_deg = self.get_parameter('camera_pitch_deg').value
+        self.yaw_filter_window = max(1, int(self.get_parameter('yaw_filter_window').value))
+        self.yaw_deadband = math.radians(float(self.get_parameter('yaw_deadband_deg').value))
+        self.yaw_hist = deque(maxlen=self.yaw_filter_window)
+        self.yaw_out = None
+        self.yaw_last_t = 0.0
+        self.use_edge_yaw = bool(self.get_parameter('use_edge_yaw').value)
+        self.roi_top_ratio = float(self.get_parameter('roi_top_ratio').value)
+        self.pose_deadband = float(self.get_parameter('pose_deadband_m').value)
+        self.pose_jump = float(self.get_parameter('pose_jump_m').value)
+        self.yaw_jump = math.radians(float(self.get_parameter('yaw_jump_deg').value))
+        self.pos_hist = deque(maxlen=max(1, int(self.get_parameter('pose_filter_window').value)))
+        self.pos_out = None
+        self.pos_last_t = 0.0
+        self.pos_jump_cnt = 0
+        self.yaw_jump_cnt = 0
+        self._fit_reason = ''
+        self._last_yaw_note = ''
+        self.pallet_class = str(self.get_parameter('pallet_class').value)
+        self.edge_class = str(self.get_parameter('edge_class').value)
+        self.edge_mode = str(self.get_parameter('edge_mode').value)
+        self.yaw_gate = math.radians(float(self.get_parameter('yaw_gate_deg').value))
+        self.yaw_sigma_face = math.radians(float(self.get_parameter('yaw_sigma_face_deg').value))
+        self.yaw_sigma_edge = math.radians(float(self.get_parameter('yaw_sigma_edge_deg').value))
+        self._last_yaw_src = '-'
+        self._last_face = None          # front-face line fit of the last frame (dict) or None
+        self.use_face_center = bool(self.get_parameter('use_face_center').value)
+        self.pallet_width = float(self.get_parameter('pallet_width_m').value)
+        self.face_min_ratio = float(self.get_parameter('face_min_ratio').value)
+        self.face_max_ratio = float(self.get_parameter('face_max_ratio').value)
+        self.face_gather_scale = float(self.get_parameter('face_gather_scale').value)
+        self.face_inlier_m = float(self.get_parameter('face_inlier_m').value)
+
+        # Rotation correcting the tilt missing from TF, expressed in the optical frame.
+        # camera_link pitched down by theta about its own Y axis:
+        #   R_corr = R_co^T @ Ry(theta) @ R_co,  R_co: optical -> camera_link
+        theta = math.radians(self.camera_pitch_deg)
+        ct, st = math.cos(theta), math.sin(theta)
+        R_pitch = np.array([[ct, 0.0, st], [0.0, 1.0, 0.0], [-st, 0.0, ct]])
+        R_co = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+        self.R_cam_corr = R_co.T @ R_pitch @ R_co
+
+        # Camera intrinsics
+        self.fx = self.DEFAULT_FX
+        self.fy = self.DEFAULT_FY
+        self.cx = self.DEFAULT_CX
+        self.cy = self.DEFAULT_CY
+        self.camera_info_received = False
+
+        self.bridge = CvBridge()
+
+        # TF2
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_broadcaster = TransformBroadcaster(self)
+
+        # YOLO model
+        self.model = None
+        self._load_model()
+
+        # Thread-safe latest data
+        self.latest_color = None
+        self.latest_depth = None
+        self.latest_depth_encoding = None
+        self.latest_color_header = None
+        self.frame_id_counter = 0
+        self.last_processed_frame = -1
+        self.lock = threading.Lock()
+
+        # ============================================================
+        # Publishers
+        # ============================================================
+        self.pose_pub = self.create_publisher(
+            PoseStamped, '/pallet/pose', QoSProfile(depth=10))
+        self.pose_base_pub = self.create_publisher(
+            PoseStamped, '/pallet/pose_base', QoSProfile(depth=10))
+        self.pose_camera_pub = self.create_publisher(
+            PoseStamped, '/pallet/pose_camera', QoSProfile(depth=10))
+        self.detections_pub = self.create_publisher(
+            Detection2DArray, '/pallet/detections', QoSProfile(depth=10))
+
+        if self.publish_debug:
+            self.debug_image_pub = self.create_publisher(
+                Image,
+                '/perception/pallet_debug_image',
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+            )
+
+        # ============================================================
+        # Subscribers with Time Synchronizer
+        # ============================================================
+        self.color_sub = Subscriber(self, Image, '/color/image_raw')
+        self.depth_sub = Subscriber(self, Image, '/depth/image_raw')
+
+        self.ts = ApproximateTimeSynchronizer(
+            [self.color_sub, self.depth_sub],
+            queue_size=10,
+            slop=0.1
+        )
+        self.ts.registerCallback(self.synced_callback)
+
+        self.camera_info_sub = self.create_subscription(
+            CameraInfo,
+            self.camera_info_topic,
+            self.camera_info_callback,
+            QoSProfile(depth=1)
+        )
+
+        self.timer = self.create_timer(0.1, self.timer_callback)  # 10 Hz
+
+        self.get_logger().info('Pallet Detector Node initialized')
+        self.get_logger().info(f'Model path: {self.model_path}')
+        self.get_logger().info(f'CameraInfo topic: {self.camera_info_topic}')
+        self.get_logger().info(f'Conf threshold: {self.conf_threshold}')
+        self.get_logger().info(
+            f'Classes: pallet="{self.pallet_class}", edge="{self.edge_class}"')
+        self.get_logger().info(
+            f'Frames: camera={self.camera_frame_param}, base={self.base_frame}, '
+            f'target={self.target_frame}')
+
+    # ==================================================================
+    # Model
+    # ==================================================================
+    def _load_model(self):
+        """Load YOLO OBB model."""
+        if YOLO is None:
+            self.get_logger().error('Ultralytics not installed!')
+            return
+
+        if not self.model_path:
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                pkg_dir = get_package_share_directory('amr_perception')
+                self.model_path = os.path.join(pkg_dir, 'weights', 'best.pt')
+                if not os.path.exists(self.model_path):
+                    self.model_path = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                        'weights', 'best.pt'
+                    )
+            except Exception:
+                self.model_path = os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    'weights', 'best.pt'
+                )
+        else:
+            self.model_path = os.path.expanduser(self.model_path)
+
+        if not os.path.exists(self.model_path):
+            self.get_logger().error(
+                f'Model file not found: {self.model_path}. Set model_path to your trained '
+                'YOLO OBB weights (with the required pallet/edge classes). Detection is disabled.'
+            )
+            self.model = None
+            return
+
+        try:
+            self.get_logger().info(f'Loading model from: {self.model_path}')
+            self.model = YOLO(self.model_path)
+            self.get_logger().info('YOLO model loaded successfully')
+            names = list(self.model.names.values()) if isinstance(self.model.names, dict) \
+                else list(self.model.names)
+            self.get_logger().info(f'Model classes: {names}')
+            if self.pallet_class not in names:
+                self.get_logger().error(
+                    f'pallet_class "{self.pallet_class}" is NOT in model classes {names}. '
+                    'Set the pallet_class parameter to one of them.')
+        except Exception as e:
+            self.get_logger().error(f'Failed to load model: {e}')
+            self.model = None
+
+    # ==================================================================
+    # Callbacks
+    # ==================================================================
+    def camera_info_callback(self, msg: CameraInfo):
+        """Update camera intrinsics from the camera's CameraInfo topic."""
+        # CameraInfo.K = [fx, 0, cx, 0, fy, cy, 0, 0, 1]. Do not mark
+        # calibration as received if the driver publishes an empty/invalid K matrix.
+        fx, fy = float(msg.k[0]), float(msg.k[4])
+        cx, cy = float(msg.k[2]), float(msg.k[5])
+        if not (np.isfinite(fx) and np.isfinite(fy) and fx > 0.0 and fy > 0.0
+                and np.isfinite(cx) and np.isfinite(cy)):
+            self.get_logger().warn(
+                f'Invalid camera intrinsics on {self.camera_info_topic}; waiting for valid CameraInfo',
+                throttle_duration_sec=5.0)
+            return
+        self.fx, self.fy, self.cx, self.cy = fx, fy, cx, cy
+        if not self.camera_info_received:
+            self.get_logger().info(
+                f'Camera intrinsics from {self.camera_info_topic}: '
+                f'fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}'
+            )
+        self.camera_info_received = True
+
+    def synced_callback(self, color_msg: Image, depth_msg: Image):
+        """Synchronized callback for color and depth images."""
+        try:
+            color = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
+            depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+            with self.lock:
+                self.latest_color = color
+                self.latest_depth = depth
+                self.latest_depth_encoding = depth_msg.encoding
+                self.latest_color_header = color_msg.header
+                self.frame_id_counter += 1
+        except Exception as e:
+            self.get_logger().error(f'Error converting images: {e}')
+
+    # ==================================================================
+    # Geometry / depth
+    # ==================================================================
+    def pixel_to_3d(self, u: float, v: float, depth: float) -> np.ndarray:
+        """Pixel + depth -> 3D point in camera OPTICAL frame (X right, Y down, Z fwd)."""
+        x = (u - self.cx) * depth / self.fx
+        y = (v - self.cy) * depth / self.fy
+        return np.array([x, y, depth], dtype=np.float64)
+
+    @staticmethod
+    def _to_meters(values: np.ndarray, depth_encoding: str) -> np.ndarray:
+        """Keep only valid depths and convert them to meters."""
+        values = values.astype(np.float32)
+        values = values[np.isfinite(values) & (values > 0)]
+        # '16UC1' / 'mono16': millimeters; '32FC1': meters
+        if depth_encoding in ('16UC1', 'mono16'):
+            values = values / 1000.0
+        return values
+
+    def extract_depth_at_point(self, depth_img: np.ndarray, u: int, v: int,
+                               depth_encoding: str, window: int = 3) -> float:
+        """Median depth (m) in a small window around (u, v). 0.0 if invalid."""
+        h, w = depth_img.shape[:2]
+        x_min, x_max = max(0, u - window), min(w, u + window + 1)
+        y_min, y_max = max(0, v - window), min(h, v + window + 1)
+        if x_min >= x_max or y_min >= y_max:
+            return 0.0
+
+        vals = self._to_meters(depth_img[y_min:y_max, x_min:x_max], depth_encoding)
+        vals = vals[(vals > self.MIN_DEPTH_M) & (vals < self.MAX_DEPTH_M)]
+        if len(vals) == 0:
+            return 0.0
+        return float(np.median(vals))
+
+    def extract_depth_in_obb(self, depth_img: np.ndarray, box: np.ndarray,
+                             depth_encoding: str, shrink: float = 0.6,
+                             min_pixels: int = 20) -> float:
+        """Robust depth (m) of the pallet from pixels inside the (shrunk) OBB.
+
+        Uses a low percentile so gaps between planks (which show the floor /
+        background further away) do not pull the depth backwards.
+        """
+        h, w = depth_img.shape[:2]
+        center = box.mean(axis=0)
+        shrunk = center + (box - center) * shrink
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [shrunk.astype(np.int32).reshape((-1, 1, 2))], 1)
+
+        vals = self._to_meters(depth_img[mask > 0], depth_encoding)
+        vals = vals[(vals > self.MIN_DEPTH_M) & (vals < self.MAX_DEPTH_M)]
+        if len(vals) < min_pixels:
+            return 0.0
+        return float(np.percentile(vals, self.depth_percentile))
+
+    def lookup_rt(self, target: str, source: str,
+                  cam_corr: bool = False, stamp=None) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Return (R, t) such that p_target = R @ p_source + t.
+
+        Use the image timestamp when supplied so a moving robot is transformed at
+        the time the image was captured, rather than using an unrelated latest TF.
+        cam_corr=True adds camera_pitch_deg only if that tilt is absent from URDF/TF.
+        """
+        try:
+            query_time = Time.from_msg(stamp) if stamp is not None else Time()
+            tf = self.tf_buffer.lookup_transform(
+                target, source, query_time,
+                timeout=Duration(seconds=self.tf_timeout))
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().debug(f'TF {source} -> {target} failed: {e}')
+            return None
+        q = tf.transform.rotation
+        t = tf.transform.translation
+        R = quat_to_rot(q.x, q.y, q.z, q.w)
+        if cam_corr and self.camera_pitch_deg != 0.0:
+            R = R @ self.R_cam_corr
+        return R, np.array([t.x, t.y, t.z])
+
+    def _fit_obb_line(self, depth_img: np.ndarray, depth_encoding: str, box: np.ndarray,
+                      R_bc: np.ndarray, t_bc: np.ndarray, shrink: float, z_pct: float,
+                      near: float, min_pixels: int, min_span: float,
+                      pair_min: float, inlier_m: float = 0.015) -> Optional[dict]:
+        """Fit a line, in the horizontal plane of the base frame, to the valid depth
+        pixels inside an OBB (RANSAC, then total least squares).
+
+        Returns dict(n, d, c, rms, n_inl, span) or None. n . p = c is the line, n unit
+        normal, d unit direction. A vertical edge collapses to a point in the
+        horizontal plane, so it fails the min_span test (rejected).
+        """
+        h, w = depth_img.shape[:2]
+        center = box.mean(axis=0)
+        shr = center + (box - center) * shrink
+
+        x0 = max(0, int(np.floor(shr[:, 0].min())))
+        x1 = min(w, int(np.ceil(shr[:, 0].max())) + 1)
+        y0 = max(0, int(np.floor(shr[:, 1].min())))
+        y1 = min(h, int(np.ceil(shr[:, 1].max())) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return self._fail('box outside image')
+
+        sub = depth_img[y0:y1, x0:x1]
+        mask = np.zeros(sub.shape[:2], dtype=np.uint8)
+        poly = (shr - np.array([x0, y0])).astype(np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(mask, [poly], 1)
+        vv, uu = np.nonzero(mask)
+
+        z = sub[vv, uu].astype(np.float32)
+        if depth_encoding in ('16UC1', 'mono16'):     # millimeters -> meters
+            z = z / 1000.0
+        valid = np.isfinite(z) & (z > self.MIN_DEPTH_M) & (z < self.MAX_DEPTH_M)
+        z = z[valid].astype(np.float64)
+        u = (uu[valid] + x0).astype(np.float64)
+        v = (vv[valid] + y0).astype(np.float64)
+        if z.size < min_pixels:
+            return self._fail(f'only {z.size} valid depth px')
+
+        # Drop pixels far from the main surface (openings, floor / wall in gaps)
+        keep = np.abs(z - np.percentile(z, z_pct)) < near
+        if int(keep.sum()) < min_pixels:
+            return self._fail('depth not on one surface')
+        z, u, v = z[keep], u[keep], v[keep]
+
+        P_cam = np.stack([(u - self.cx) * z / self.fx,
+                          (v - self.cy) * z / self.fy, z], axis=1)
+        Q = (P_cam @ R_bc.T + t_bc)[:, :2]            # horizontal plane of base frame
+
+        idx = _YAW_RNG.integers(0, Q.shape[0], size=(150, 2))
+        a, b = Q[idx[:, 0]], Q[idx[:, 1]]
+        dvec = b - a
+        L = np.linalg.norm(dvec, axis=1)
+        ok = L > pair_min                              # sample points far apart
+        nrm = np.stack([-dvec[:, 1], dvec[:, 0]], axis=1) / np.where(ok, L, 1.0)[:, None]
+        c = np.einsum('ij,ij->i', nrm, a)
+        inl = np.abs(nrm @ Q.T - c[:, None]) < inlier_m
+        counts = inl.sum(axis=1)
+        counts[~ok] = 0
+        best = int(np.argmax(counts))
+        if counts[best] < min_pixels:
+            return self._fail('no straight line in depth')
+
+        n, c_f = nrm[best], float(c[best])
+        inl_mask = inl[best]
+        for _ in range(3):
+            if int(inl_mask.sum()) < min_pixels:
+                return self._fail('line lost while refining')
+            n, c_f, _, _ = _fit_line_2d(Q[inl_mask])
+            inl_mask = np.abs(Q @ n - c_f) < inlier_m
+        if int(inl_mask.sum()) < min_pixels:
+            return self._fail('line lost while refining')
+        Qm = Q[inl_mask]
+        n, c_f, d, _ = _fit_line_2d(Qm)
+
+        proj = Qm @ d
+        span = float(np.percentile(proj, 98) - np.percentile(proj, 2))
+        if span < min_span:
+            return self._fail(f'too short ({span:.2f} m)')
+        rms = float(np.sqrt(np.mean((Qm @ n - c_f) ** 2)))
+        return {'n': n, 'd': d, 'c': float(c_f), 'rms': rms,
+                'n_inl': int(inl_mask.sum()), 'span': span}
+
+    def _fail(self, why: str):
+        """Remember why a line fit failed (shown on the HUD) and return None."""
+        self._fit_reason = why
+        return None
+
+    @staticmethod
+    def _line_yaw(fit: dict, p_base: np.ndarray) -> float:
+        """Yaw of the normal of a fitted line, pointing AWAY from the robot
+        (robot at base origin, i.e. same side as the pallet position vector)."""
+        nx, ny = float(fit['n'][0]), float(fit['n'][1])
+        if nx * p_base[0] + ny * p_base[1] < 0.0:
+            nx, ny = -nx, -ny
+        return math.atan2(ny, nx)
+
+    @staticmethod
+    def _line_sigma(fit: dict) -> float:
+        """Statistical std (rad) of the line angle: residual / (span * sqrt(N/12))."""
+        return max(fit['rms'], 0.002) * math.sqrt(12.0 / fit['n_inl']) / fit['span']
+
+    def estimate_yaw_from_depth(self, depth_img: np.ndarray, det: dict,
+                                depth_encoding: str, center_depth: float,
+                                camera_frame: str,
+                                p_base: np.ndarray) -> Optional[float]:
+        """Pallet yaw in base frame from the depth of the front face and edge labels.
+
+        Lines are fitted to the depth pixels of the pallet OBB (front face) and of
+        each `edge` OBB of this pallet (det['edges']). An edge parallel to the front
+        face gives the yaw directly; a perpendicular (side) edge gives it +-90 deg.
+        Estimates are combined with inverse-variance weights; those further than
+        `yaw_gate_deg` from the most trusted one are dropped.
+
+        Returns yaw (rad, in [-pi, pi]) of the pallet +X axis: the normal of
+        the long face pointing INTO the pallet (away from the robot).
+        0 means the robot faces the pallet squarely.
+        Returns None if nothing can be fitted reliably.
+
+        Side effect: self._last_face = front-face line fit (dict with n, d, c, ...) of this
+        frame, or None. Used to get the face midpoint (estimate_face_center).
+        """
+        self._last_yaw_src = '-'
+        self._last_yaw_note = ''
+        self._last_face = None
+        rt = self.lookup_rt(self.base_frame, camera_frame, cam_corr=True)
+        if rt is None:
+            return None
+        R_bc, t_bc = rt
+
+        cands = []      # (yaw, sigma, tag)
+        yaw_face = None
+        face = self._fit_obb_line(depth_img, depth_encoding, det['box'], R_bc, t_bc,
+                                  shrink=0.92, z_pct=30, near=0.35,
+                                  min_pixels=80, min_span=0.3, pair_min=0.25)
+        self._last_face = face
+        if face is None:
+            self._last_yaw_note = f'face: {self._fit_reason}'
+        if face is not None:
+            yaw_face = self._line_yaw(face, p_base)
+            sig = math.hypot(self._line_sigma(face), self.yaw_sigma_face)
+            cands.append((yaw_face, sig, 'face'))
+
+        if self.use_edge_yaw:
+            # reference used only to decide "parallel or perpendicular" for each edge
+            ref = yaw_face if yaw_face is not None else math.atan2(p_base[1], p_base[0])
+            for e in det.get('edges', []):
+                fit = self._fit_obb_line(depth_img, depth_encoding, e['box'], R_bc, t_bc,
+                                         shrink=1.0, z_pct=50, near=0.5,
+                                         min_pixels=40, min_span=0.2, pair_min=0.15)
+                if fit is None:
+                    continue
+                y0 = self._line_yaw(fit, p_base)
+                if self.edge_mode == 'any':
+                    options = (y0, y0 + 0.5 * math.pi, y0 - 0.5 * math.pi)
+                else:       # side edge: the front-face normal is the edge direction
+                    options = (y0 + 0.5 * math.pi, y0 - 0.5 * math.pi)
+                yaw_e = min(options, key=lambda y: abs(normalize_angle(y - ref)))
+                if abs(normalize_angle(yaw_e - ref)) > 0.25 * math.pi:   # too far from the front face
+                    continue
+                sig = math.hypot(self._line_sigma(fit), self.yaw_sigma_edge)
+                cands.append((normalize_angle(yaw_e), sig, 'edge'))
+
+        if not cands:
+            return None
+
+        # keep the estimates that agree with the most trusted one, then weighted mean
+        anchor = min(cands, key=lambda c: c[1])
+        kept = [c for c in cands
+                if abs(normalize_angle(c[0] - anchor[0])) <= self.yaw_gate]
+        wts = np.array([1.0 / (c[1] ** 2) for c in kept])
+        ys = np.array([c[0] for c in kept])
+        yaw = math.atan2(float(np.sum(wts * np.sin(ys))), float(np.sum(wts * np.cos(ys))))
+
+        tags = [c[2] for c in kept]
+        n_edge = tags.count('edge')
+        parts = (['face'] if 'face' in tags else [])
+        if n_edge:
+            parts.append('edge' if n_edge == 1 else f'edge x{n_edge}')
+        self._last_yaw_src = '+'.join(parts)
+        return normalize_angle(yaw)
+
+    def estimate_face_center(self, depth_img: np.ndarray, det: dict,
+                             depth_encoding: str, R_bc: np.ndarray, t_bc: np.ndarray,
+                             face: dict) -> Optional[Tuple[np.ndarray, float]]:
+        """Midpoint of the pallet front face on the fitted line (base frame, xy).
+
+        Takes the depth pixels of the whole OBB (scale face_gather_scale), keeps the ones
+        within face_inlier_m of the fitted face line, and returns the middle of their extent
+        ALONG the line (2..98 percentile) plus that visible width. Openings between the
+        stringers show far depth, so they are rejected; the ends of the face remain.
+        Returns (centre_xy, visible_width) or None.
+        """
+        n, c_f, d = face['n'], face['c'], face['d']
+        h, w = depth_img.shape[:2]
+        box = det['box']
+        centre = box.mean(axis=0)
+        scl = centre + (box - centre) * self.face_gather_scale
+        x0 = max(0, int(np.floor(scl[:, 0].min())))
+        x1 = min(w, int(np.ceil(scl[:, 0].max())) + 1)
+        y0 = max(0, int(np.floor(scl[:, 1].min())))
+        y1 = min(h, int(np.ceil(scl[:, 1].max())) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        sub = depth_img[y0:y1, x0:x1]
+        mask = np.zeros(sub.shape[:2], dtype=np.uint8)
+        poly = (scl - np.array([x0, y0])).astype(np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(mask, [poly], 1)
+        vv, uu = np.nonzero(mask)
+
+        z = sub[vv, uu].astype(np.float32)
+        if depth_encoding in ('16UC1', 'mono16'):
+            z = z / 1000.0
+        valid = np.isfinite(z) & (z > self.MIN_DEPTH_M) & (z < self.MAX_DEPTH_M)
+        z = z[valid].astype(np.float64)
+        u = (uu[valid] + x0).astype(np.float64)
+        v = (vv[valid] + y0).astype(np.float64)
+        if z.size < 150:
+            return None
+
+        P_cam = np.stack([(u - self.cx) * z / self.fx,
+                          (v - self.cy) * z / self.fy, z], axis=1)
+        Q = (P_cam @ R_bc.T + t_bc)[:, :2]
+        on = np.abs(Q @ n - c_f) < self.face_inlier_m
+        if int(on.sum()) < 150:
+            return None
+        s = Q[on] @ d
+        lo, hi = np.percentile(s, [2.0, 98.0])
+        c_xy = 0.5 * (lo + hi) * d + c_f * n
+        return c_xy, float(hi - lo)
+
+    def _filter_position(self, p: np.ndarray) -> np.ndarray:
+        """Average the position over the last frames (median-based, with dead-band)."""
+        now = time.monotonic()
+        if self.pos_hist and (now - self.pos_last_t) > 1.0:   # target was lost
+            self.pos_hist.clear()
+            self.pos_out = None
+        self.pos_last_t = now
+
+        if self.pos_out is not None and np.linalg.norm(p - self.pos_out) > self.pose_jump:
+            self.pos_jump_cnt += 1
+            if self.pos_jump_cnt < 3:
+                return self.pos_out.copy()      # isolated outlier: ignore
+            self.pos_hist.clear()               # the pallet (or robot) really moved
+            self.pos_out = None
+            self.pos_jump_cnt = 0
+            self.yaw_hist.clear()
+            self.yaw_out = None
+        else:
+            self.pos_jump_cnt = 0
+        self.pos_hist.append(np.asarray(p, dtype=np.float64))
+
+        P = np.array(self.pos_hist)
+        med = np.median(P, axis=0)
+        mad = 1.4826 * np.median(np.abs(P - med), axis=0)
+        keep = np.all(np.abs(P - med) <= np.maximum(3.0 * mad, 0.003), axis=1)
+        mean = P[keep].mean(axis=0)
+        if self.pos_out is None or np.linalg.norm(mean - self.pos_out) > self.pose_deadband:
+            self.pos_out = mean
+        return self.pos_out.copy()
+
+    def _filter_yaw(self, yaw_raw: float) -> float:
+        """Median over the last frames + dead-band: a steady yaw value."""
+        now = time.monotonic()
+        if self.yaw_hist and (now - self.yaw_last_t) > 1.0:   # target was lost
+            self.yaw_hist.clear()
+            self.yaw_out = None
+        self.yaw_last_t = now
+        if self.yaw_out is not None and abs(normalize_angle(yaw_raw - self.yaw_out)) > self.yaw_jump:
+            self.yaw_jump_cnt += 1
+            if self.yaw_jump_cnt < 3:
+                return self.yaw_out            # isolated outlier: ignore
+            self.yaw_hist.clear()              # the pallet really turned: restart
+            self.yaw_out = None
+            self.yaw_jump_cnt = 0
+        else:
+            self.yaw_jump_cnt = 0
+        self.yaw_hist.append(yaw_raw)
+
+        ys = np.array(self.yaw_hist)
+        ref = math.atan2(float(np.median(np.sin(ys))), float(np.median(np.cos(ys))))
+        d = np.array([normalize_angle(y - ref) for y in ys])
+        med = float(np.median(d))
+        mad = 1.4826 * float(np.median(np.abs(d - med)))
+        keep = np.abs(d - med) <= max(2.0 * mad, math.radians(0.3))
+        yaw_f = normalize_angle(ref + float(d[keep].mean()))
+
+        if self.yaw_out is None or abs(normalize_angle(yaw_f - self.yaw_out)) > self.yaw_deadband:
+            self.yaw_out = yaw_f
+        return self.yaw_out
+
+    # ==================================================================
+    # Detection
+    # ==================================================================
+    def detect_pallets(self, color_img: np.ndarray) -> List[dict]:
+        """Run YOLO OBB detection on color image."""
+        if self.model is None:
+            return []
+
+        try:
+            results = self.model.predict(
+                color_img,
+                conf=self.conf_threshold,
+                iou=self.iou_threshold,
+                device='cpu',
+                verbose=False
+            )
+
+            detections = []
+            for result in results:
+                obb = result.obb
+                if obb is None or len(obb) == 0:
+                    continue
+
+                corners = obb.xyxyxyxy.cpu().numpy()       # (N, 4, 2)
+                xywhr = obb.xywhr.cpu().numpy()            # (N, 5): cx, cy, w, h, angle(rad)
+                confs = obb.conf.cpu().numpy()
+                clss = obb.cls.cpu().numpy().astype(int)
+
+                for i in range(len(corners)):
+                    cx, cy = float(xywhr[i][0]), float(xywhr[i][1])
+                    cls = int(clss[i])
+                    detections.append({
+                        'center': (cx, cy),
+                        'angle': float(xywhr[i][4]),
+                        'conf': float(confs[i]),
+                        'class': result.names[cls],
+                        'class_id': cls,
+                        'box': corners[i],
+                        'u': int(cx),
+                        'v': int(cy),
+                    })
+
+            return detections
+
+        except Exception as e:
+            self.get_logger().error(f'Detection error: {e}')
+            return []
+
+    # ==================================================================
+    # Publishing helpers
+    # ==================================================================
+    @staticmethod
+    def make_pose(frame_id: str, stamp, p: np.ndarray, R: np.ndarray) -> PoseStamped:
+        msg = PoseStamped()
+        msg.header.frame_id = frame_id
+        msg.header.stamp = stamp
+        msg.pose.position.x = float(p[0])
+        msg.pose.position.y = float(p[1])
+        msg.pose.position.z = float(p[2])
+        msg.pose.orientation = rot_to_quat(R)
+        return msg
+
+    def make_tf(self, pose: PoseStamped, child_frame: str) -> TransformStamped:
+        t = TransformStamped()
+        t.header = pose.header
+        t.child_frame_id = child_frame
+        t.transform.translation.x = pose.pose.position.x
+        t.transform.translation.y = pose.pose.position.y
+        t.transform.translation.z = pose.pose.position.z
+        t.transform.rotation = pose.pose.orientation
+        return t
+
+    def compute_pallet_poses(self, det: dict, depth_img: np.ndarray,
+                             depth_encoding: str, header) -> bool:
+        """Compute the 3D pose of one detection and publish pose/TF.
+
+        Fills det['x_3d'..] (camera optical frame) for the HUD / detections.
+        """
+        camera_frame = header.frame_id or self.camera_frame_param
+
+        depth_m = self.extract_depth_in_obb(depth_img, det['box'], depth_encoding)
+        if depth_m <= 0.0:
+            # fallback: small window around the centre
+            depth_m = self.extract_depth_at_point(
+                depth_img, det['u'], det['v'], depth_encoding)
+        if not (self.MIN_DEPTH_M < depth_m < self.MAX_DEPTH_M):
+            return False
+
+        # --- 1. Position in camera OPTICAL frame -------------------------
+        p_cam = self.pixel_to_3d(float(det['u']), float(det['v']), depth_m)
+
+        # --- 2. Camera optical -> base_footprint (ROS convention) ---------
+        rt_base = self.lookup_rt(self.base_frame, camera_frame, cam_corr=True, stamp=header.stamp)
+        if rt_base is None:
+            self.get_logger().warn(
+                f'No TF {camera_frame} -> {self.base_frame}', throttle_duration_sec=2.0)
+            return False
+        R_bc, t_bc = rt_base
+        p_base = R_bc @ p_cam + t_bc          # pixel-based point (biased if the pallet is rotated)
+
+        # --- 3. Raw yaw around the vertical axis (base frame); also gives the face line ---
+        yaw_raw = None
+        if self.use_depth_yaw:
+            yaw_raw = self.estimate_yaw_from_depth(
+                depth_img, det, depth_encoding, depth_m, camera_frame, p_base)
+        det['yaw_note'] = self._last_yaw_note
+
+        # --- 2b. Position = MIDPOINT of the front face (fitted line) ------------
+        # The pixel method is biased sideways / in depth when the pallet is rotated.
+        pos_src, vis_w = 'pixel', 0.0
+        if (self.use_face_center and yaw_raw is not None and self._last_face is not None
+                and 'face' in self._last_yaw_src):
+            fc = self.estimate_face_center(depth_img, det, depth_encoding, R_bc, t_bc,
+                                           self._last_face)
+            if fc is not None:
+                c_xy, vis_w = fc
+                lo_w = self.face_min_ratio * self.pallet_width
+                hi_w = self.face_max_ratio * self.pallet_width
+                if lo_w <= vis_w <= hi_w:
+                    p_base = np.array([c_xy[0], c_xy[1], p_base[2]])
+                    pos_src = 'face'
+                else:
+                    self.get_logger().warn(
+                        f'Visible face width {vis_w:.2f} m outside [{lo_w:.2f}, {hi_w:.2f}] '
+                        f'(partial view / wrong pallet_width_m) -> using pixel position',
+                        throttle_duration_sec=2.0)
+        det['pos_src'] = pos_src
+        det['vis_w'] = float(vis_w)
+
+        # --- 2c. Average the position over the last frames (steady x, y, z) ---
+        p_base = self._filter_position(p_base)
+        p_cam = R_bc.T @ (p_base - t_bc)      # keep the camera / map poses consistent
+
+        # --- 3b. Smooth the yaw ----------------------------------------------
+        if yaw_raw is not None:
+            yaw_base = self._filter_yaw(yaw_raw)
+            det['yaw_src'] = self._last_yaw_src
+        elif self.yaw_out is not None and (time.monotonic() - self.yaw_last_t) < 1.0:
+            yaw_base = self.yaw_out        # keep the last steady yaw instead of jumping
+            det['yaw_src'] = 'hold'
+        else:
+            # Fallback: pallet perpendicular to the line of sight robot -> pallet
+            yaw_base = math.atan2(p_base[1], p_base[0])
+            det['yaw_src'] = 'line-of-sight'
+        yaw_base = normalize_angle(yaw_base)
+
+        R_pb = yaw_to_rot(yaw_base)       # pallet orientation in base
+        R_pc = R_bc.T @ R_pb              # pallet orientation in camera optical
+
+        stamp = header.stamp
+
+        # --- 4. Publish: camera / base --------------------------------------
+        pose_cam = self.make_pose(camera_frame, stamp, p_cam, R_pc)
+        pose_base = self.make_pose(self.base_frame, stamp, p_base, R_pb)
+        self.pose_camera_pub.publish(pose_cam)
+        self.pose_base_pub.publish(pose_base)
+
+        tfs = [self.make_tf(pose_base, f'{self.pallet_frame_id}_base')]
+
+        # --- 5. Publish: map --------------------------------------------------
+        rt_map = self.lookup_rt(self.target_frame, camera_frame, cam_corr=True, stamp=header.stamp)
+        if rt_map is not None:
+            R_mc, t_mc = rt_map
+            p_map = R_mc @ p_cam + t_mc
+            R_pm = R_mc @ R_pc
+            pose_map = self.make_pose(self.target_frame, stamp, p_map, R_pm)
+            self.pose_pub.publish(pose_map)
+            tfs.append(self.make_tf(pose_map, self.pallet_frame_id))
+            det['x_map'], det['y_map'] = float(p_map[0]), float(p_map[1])
+        else:
+            self.get_logger().debug(
+                f'No TF {camera_frame} -> {self.target_frame}; skip map pose')
+
+        self.tf_broadcaster.sendTransform(tfs)
+
+        # --- 6. Fill detection info ---------------------------------------
+        det['x_3d'], det['y_3d'], det['z_3d'] = (float(p_cam[0]), float(p_cam[1]),
+                                                 float(p_cam[2]))
+        det['x_base'], det['y_base'], det['z_base'] = (float(p_base[0]), float(p_base[1]),
+                                                       float(p_base[2]))
+        det['yaw'] = float(yaw_base)
+        det['yaw_deg'] = math.degrees(yaw_base)
+        det['depth_m'] = depth_m
+        det['pose_cam'] = pose_cam.pose
+        return True
+
+    # ==================================================================
+    # Debug image
+    # ==================================================================
+    def create_debug_image(self, color_img: np.ndarray,
+                           detections: List[dict],
+                           best_detection: Optional[dict] = None) -> np.ndarray:
+        """Create debug image with OBB overlays and HUD."""
+        debug_img = color_img.copy()
+        h, w = debug_img.shape[:2]
+
+        if self.roi_top_ratio > 0.0:           # ROI boundary: only below this line is used
+            y_roi = int(self.roi_top_ratio * h)
+            cv2.line(debug_img, (0, y_roi), (w, y_roi), (255, 255, 0), 1)
+            cv2.putText(debug_img, "ROI", (5, y_roi - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
+
+        for det in detections:
+            box = det['box']
+            if det['class'] == self.pallet_class:
+                color = (0, 255, 0)            # pallet: green
+            elif det['class'] == self.edge_class:
+                color = (0, 255, 255)          # edge label: yellow
+            else:
+                color = (255, 0, 0)            # other classes: blue
+
+            pts = box.astype(np.int32).reshape((-1, 1, 2))
+            cv2.polylines(debug_img, [pts], True, color, 2)
+            cv2.circle(debug_img, (int(det['center'][0]), int(det['center'][1])),
+                       5, color, -1)
+
+            label = f"{det['class']}: {det['conf']:.2f}"
+            cv2.putText(debug_img, label,
+                        (int(det['center'][0]) + 10, int(det['center'][1]) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        if best_detection and 'x_3d' in best_detection:
+            hud_x, hud_w, hud_h = 10, 330, 250
+            hud_y = h - hud_h - 10
+
+            cv2.rectangle(debug_img, (hud_x, hud_y),
+                          (hud_x + hud_w, hud_y + hud_h), (0, 0, 0), -1)
+            cv2.rectangle(debug_img, (hud_x, hud_y),
+                          (hud_x + hud_w, hud_y + hud_h), (0, 255, 0), 2)
+
+            b = best_detection
+            lines = [
+                "=== PALLET DETECTION ===",
+                f"Class: {b['class']}  Conf: {b['conf']:.2f}",
+                f"Depth: {b.get('depth_m', 0):.3f} m",
+                f"Cam  X:{b.get('x_3d', 0):.2f} Y:{b.get('y_3d', 0):.2f} Z:{b.get('z_3d', 0):.2f}",
+                f"Base X:{b.get('x_base', 0):.2f} Y:{b.get('y_base', 0):.2f} Z:{b.get('z_base', 0):.2f}",
+                f"Map  X:{b.get('x_map', float('nan')):.2f} Y:{b.get('y_map', float('nan')):.2f}",
+                f"Yaw(base): {b.get('yaw_deg', 0):.1f} deg",
+                f"Yaw src: {b.get('yaw_src', '-')}",
+                f"Pos: {b.get('pos_src', 'pixel')}  face w={b.get('vis_w', 0):.2f} m",
+            ]
+            if b.get('yaw_note'):
+                lines.append(b['yaw_note'])
+            for i, line in enumerate(lines):
+                cv2.putText(debug_img, line,
+                            (hud_x + 10, hud_y + 25 + i * 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        else:
+            cv2.putText(debug_img, "No pallet detected",
+                        (w // 2 - 100, h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        return debug_img
+
+    def publish_debug_image(self, debug_img: np.ndarray, header):
+        try:
+            if len(debug_img.shape) == 2:
+                debug_img = cv2.cvtColor(debug_img, cv2.COLOR_GRAY2BGR)
+            debug_img = np.ascontiguousarray(debug_img, dtype=np.uint8)
+
+            msg = Image()
+            msg.header = header
+            msg.height = debug_img.shape[0]
+            msg.width = debug_img.shape[1]
+            msg.encoding = 'bgr8'
+            msg.is_bigendian = 0
+            msg.step = debug_img.shape[1] * 3
+            msg.data = debug_img.tobytes()
+            self.debug_image_pub.publish(msg)
+        except Exception:
+            self.get_logger().error(f'Debug image error: {traceback.format_exc()}')
+
+    # ==================================================================
+    # Main loop
+    # ==================================================================
+    def timer_callback(self):
+        """Process the newest frame: detect, localize, publish."""
+        with self.lock:
+            if self.latest_color is None or self.latest_depth is None:
+                return
+            if self.frame_id_counter == self.last_processed_frame:
+                return  # no new frame
+            self.last_processed_frame = self.frame_id_counter
+
+            color_img = self.latest_color.copy()
+            depth_img = self.latest_depth.copy()
+            depth_encoding = self.latest_depth_encoding or '16UC1'
+            header = self.latest_color_header
+
+        # Accurate 3D coordinates require real camera calibration. By default, wait
+        # for CameraInfo instead of silently using approximate focal lengths.
+        if self.require_camera_info and not self.camera_info_received:
+            self.get_logger().warn(
+                f'No valid CameraInfo received on {self.camera_info_topic}; '
+                'not publishing 3D pallet poses yet. Check the camera launch remapping.',
+                throttle_duration_sec=5.0)
+            return
+
+        detections = self.detect_pallets(color_img)
+
+        # ROI: keep only detections whose centre is in the lower (floor) part of the image
+        if self.roi_top_ratio > 0.0:
+            roi_top = self.roi_top_ratio * color_img.shape[0]
+            detections = [d for d in detections if d['center'][1] >= roi_top]
+
+        # Pick the best pallet and localize it
+        best_detection = None
+        best_conf = 0.0
+        for det in detections:
+            if det['class'] == self.pallet_class and det['conf'] > best_conf:
+                best_conf = det['conf']
+                best_detection = det
+
+        if best_detection is not None:
+            # edge labels that belong to this pallet (used for the yaw)
+            best_detection['edges'] = [
+                d for d in detections
+                if d['class'] == self.edge_class
+                and edge_belongs_to_pallet(best_detection['box'], d['box'])]
+            ok = self.compute_pallet_poses(best_detection, depth_img,
+                                           depth_encoding, header)
+            if ok:
+                self.get_logger().debug(
+                    f"Pallet: base=({best_detection['x_base']:.2f}, "
+                    f"{best_detection['y_base']:.2f}) "
+                    f"yaw={best_detection['yaw_deg']:.1f}deg conf={best_conf:.2f}")
+            else:
+                best_detection = None
+
+        # Detections message
+        det_msg = Detection2DArray()
+        det_msg.header = header
+        for det in detections:
+            d = Detection2D()
+            d.header = header
+
+            result = ObjectHypothesisWithPose()
+            result.hypothesis.class_id = det['class']
+            result.hypothesis.score = det['conf']
+            if 'pose_cam' in det:
+                result.pose.pose = det['pose_cam']
+            d.results.append(result)
+
+            bbox = det['box']
+            d.bbox.center.position.x = float(det['center'][0])
+            d.bbox.center.position.y = float(det['center'][1])
+            d.bbox.center.theta = float(det['angle'])
+            d.bbox.size_x = float(np.max(bbox[:, 0]) - np.min(bbox[:, 0]))
+            d.bbox.size_y = float(np.max(bbox[:, 1]) - np.min(bbox[:, 1]))
+
+            det_msg.detections.append(d)
+
+        self.detections_pub.publish(det_msg)
+
+        if self.publish_debug:
+            debug_img = self.create_debug_image(color_img, detections, best_detection)
+            self.publish_debug_image(debug_img, header)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PalletDetectorNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

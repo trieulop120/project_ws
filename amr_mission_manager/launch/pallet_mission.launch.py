@@ -40,19 +40,19 @@ def generate_launch_description():
              'true: chay luon mission_manager (nut HOME -> P_1). '
              'false neu mission_manager da chay rieng'),
         _arg('graph_package', 'amr_navigation', 'package chua route graph'),
-        _arg('graph_yaml_filename', '1_D203B Route.yaml',
+        _arg('graph_yaml_filename', 'D203B Route.yaml',
              'ten file YAML trong <package>/config/graphs/'),
         _arg('standoff_m', '0.40',
              'khoang cach tu base_footprint toi diem dem (m). '
              '= 0.40 + khoang cach tu truc banh toi mui cang'),
         _arg('insert_speed', '0.10', 'van toc tien vao pallet (m/s)'),
-        _arg('stop_dist_cm', '8.0', 'nguong sieu am de dung (cm)'),
+        _arg('stop_dist_cm', '3.5', 'nguong sieu am de dung (cm)'),
         _arg('confirm_count', '10', 'so mau sieu am lien tiep duoi nguong'),
         _arg('auto_insert', 'true', 'true: toi diem dem xong tu canh goc + tien vao'),
         _arg('require_stable', 'true', 'true: Detect OFF chi nhan ket qua on dinh'),
         _arg('final_window_s', '5.0',
              'cua so (s) lay mau cuoi de chot ket qua'),
-        _arg('min_samples', '8',
+        _arg('min_samples', '1',
              'so mau toi thieu (tong va trong cua so). Detector CPU ~2 mau/s'),
         _arg('range_topic', '/ultrasonic/range', 'topic sieu am (sensor_msgs/Range)'),
     ]

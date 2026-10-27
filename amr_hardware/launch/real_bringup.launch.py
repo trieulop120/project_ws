@@ -2,6 +2,7 @@
 """
 Real Hardware Bringup Launch File
 File location: amr_hardware/launch/real_bringup.launch.py
+RTAB-Map VO tuned for 20-30Hz / low CPU
 """
 
 import os
@@ -28,7 +29,7 @@ def generate_launch_description():
 
     esp32_baudrate_arg = DeclareLaunchArgument(
         'esp32_baudrate',
-        default_value='115200',
+        default_value='921600',
         description='ESP32 serial baudrate'
     )
     esp32_baudrate = LaunchConfiguration('esp32_baudrate')
@@ -61,12 +62,36 @@ def generate_launch_description():
     )
     camera_enable = LaunchConfiguration('camera_enable')
 
+    # Tat point cloud cua driver neu khong co node nao dung /points
+    # (tiet kiem CPU dang ke: driver khong phai tao cloud 640x480 @30Hz)
+    enable_pointcloud_arg = DeclareLaunchArgument(
+        'enable_pointcloud',
+        default_value='true',
+        description='Enable astra driver point cloud (/points) + downsampler'
+    )
+    enable_pointcloud = LaunchConfiguration('enable_pointcloud')
+
     use_vo_arg = DeclareLaunchArgument(
         'use_vo',
         default_value='true',
         description='Enable RTAB-Map Visual Odometry & Relay nodes (true/false)'
     )
     use_vo = LaunchConfiguration('use_vo')
+
+    # Giam do phan giai xu ly cua VO: 1 = full 640x480, 2 = 320x240
+    vo_decimation_arg = DeclareLaunchArgument(
+        'vo_decimation',
+        default_value='2',
+        description='Odom/ImageDecimation of RTAB-Map VO (1,2,4)'
+    )
+    vo_decimation = LaunchConfiguration('vo_decimation')
+
+    vo_max_features_arg = DeclareLaunchArgument(
+        'vo_max_features',
+        default_value='400',
+        description='Vis/MaxFeatures of RTAB-Map VO'
+    )
+    vo_max_features = LaunchConfiguration('vo_max_features')
 
     use_rf2o_arg = DeclareLaunchArgument(
         'use_rf2o',
@@ -90,6 +115,15 @@ def generate_launch_description():
         description='Log level of the rf2o node (debug/info/warn/error/fatal)'
     )
     rf2o_log_level = LaunchConfiguration('rf2o_log_level')
+
+    # Log level cho cac node hay spam (rgbd_odometry, relay, filter)
+    # Doi khi chay: quiet_log_level:=info de debug
+    quiet_log_level_arg = DeclareLaunchArgument(
+        'quiet_log_level',
+        default_value='error',
+        description='Log level for noisy nodes (debug/info/warn/error/fatal)'
+    )
+    quiet_log_level = LaunchConfiguration('quiet_log_level')
 
     # ============================================
     # Package paths & Configs
@@ -154,8 +188,9 @@ def generate_launch_description():
             'use_sim_time': False,
             'port': esp32_port,
             'baudrate': ParameterValue(esp32_baudrate, value_type=int),
-            'wheel_radius': 0.05,
-            'wheelbase': 0.477,
+            'wheel_radius': 0.0509,
+            'wheelbase': 0.4813,
+            'odom_scale': 1.0,   # hieu chinh quang duong odometry (chi tinh tien)
             'publish_tf': False,
         }],
     )
@@ -200,11 +235,12 @@ def generate_launch_description():
         executable='scan_filter_node',
         name='scan_filter_node',
         output='screen',
+        ros_arguments=['--log-level', quiet_log_level],
         parameters=[{'use_sim_time': False}],
     )
 
     # ============================================
-    # Camera Driver (Astra Camera)
+    # Camera Driver (Astra Camera) - 30Hz
     # ============================================
     camera_driver = Node(
         package='astra_camera',
@@ -215,13 +251,14 @@ def generate_launch_description():
             'use_sim_time': False,
             'color_width': 640,
             'color_height': 480,
-            'color_fps': 15,           # Khóa 15fps tránh quá tải CPU
+            'color_fps': 15,
             'depth_width': 640,
             'depth_height': 480,
             'depth_fps': 15,
             'enable_depth': True,
             'enable_color': True,
             'use_uvc_camera': True,
+            'uvc_camera_format': 'yuyv',   # dinh dang tho, giam CPU giai nen (MJPEG)
             'enable_depth_to_color_registration': False,
             'use_software_d2c': True,  # Bật Software D2C để dóng hàng Depth/Color
             'color_depth_synchronization': True,
@@ -243,6 +280,7 @@ def generate_launch_description():
         executable='pointcloud_downsampler',
         name='pointcloud_filter',
         output='screen',
+        ros_arguments=['--log-level', quiet_log_level],
         parameters=[{
             'use_sim_time': False,
             'leaf_size': 0.05,
@@ -254,30 +292,41 @@ def generate_launch_description():
 
     # ============================================
     # Visual Odometry Node (RTAB-Map RGB-D)
+    # Muc tieu: 20-30Hz (= toc do camera) voi CPU thap
     # ============================================
     vo_node = Node(
         package='rtabmap_odom',
         executable='rgbd_odometry',
         name='rgbd_odometry',
         output='screen',
+        ros_arguments=['--log-level', quiet_log_level],
         parameters=[{
             'use_sim_time': False,
-            'frame_id': 'base_footprint',        # Khung gốc robot
-            'odom_frame_id': 'odom_vo',          # Khung ảo của VO
-            'publish_tf': False,                 # Nhường xuất TF cho EKF
-            
-            # --- CÁC THAM SỐ CHỦ CHỐT ĐỂ KHÔI PHỤC KHI MẤT TRACK ---
-            'guess_frame_id': 'odom',            # Dùng Odom của EKF làm vị trí đoán khi VO bị mù
-            'always_process_most_recent_frame': True, # Luôn lấy frame mới nhất, chống dồn hàng đợi
-            'approx_sync': True,                 # Bật đồng bộ xấp xỉ nhãn thời gian RGB & Depth
-            'queue_size': 10,
-            
-            # Param thuật toán RTAB-Map
-            'Reg/Force3DoF': 'true',             # Ép chạy trên mặt phẳng 2D
-            'Odom/Strategy': '0',                # 0=Frame-to-Map (rất ổn định)
-            'Odom/ResetCountdown': '1',          # Tự reset keyframe sau 1 frame mất track
-            'Odom/Holonomic': 'false',           # Robot xe nâng không đi ngang
-            'Vis/MinInliers': '12',              # Số điểm đặc trưng tối thiểu để chấp nhận Odom
+            'frame_id': 'base_footprint',
+            'odom_frame_id': 'odom_vo',
+            'publish_tf': False,                 # Nhuong xuat TF cho EKF
+
+            'guess_frame_id': 'odom',            # Dung odom cua EKF lam vi tri doan khi VO bi mu
+            'always_process_most_recent_frame': True,  # Luon lay frame moi nhat, chong don hang doi
+            'approx_sync': True,
+            'approx_sync_max_interval': 0.09,    # ~1 frame @30Hz
+            'queue_size': 5,                     # queue nho = it tre, it RAM
+
+            # --- Tham so thuat toan RTAB-Map (tat ca phai la string) ---
+            'Reg/Force3DoF': 'true',
+            'Odom/Strategy': '0',                # 0=Frame-to-Map. Neu van nang -> doi '1' (Frame-to-Frame)
+            'Odom/ResetCountdown': '1',
+            'Odom/Holonomic': 'false',
+            'Vis/MinInliers': '12',              # mat track nhieu -> thu ha xuong 10
+
+            # --- Toi uu CPU ---
+            'Odom/ImageDecimation': ParameterValue(vo_decimation, value_type=str),
+            'Vis/MaxFeatures': ParameterValue(vo_max_features, value_type=str),
+            'Vis/FeatureType': '6',              # GFTT/BRIEF: nhanh hon mac dinh 8 (GFTT/ORB)
+            'GFTT/MinDistance': '7',
+            'OdomF2M/MaxSize': '800',            # so diem toi da cua local map (mac dinh 2000)
+            'OdomF2M/BundleAdjustment': '0',     # tat g2o BA: giam CPU manh, EKF da bu drift
+            'Odom/KeyFrameThr': '0.3',
         }],
         remappings=[
             ('rgb/image', '/color/image_raw'),
@@ -296,11 +345,13 @@ def generate_launch_description():
         executable='vo_cov_relay',
         name='vo_cov_relay',
         output='screen',
+        ros_arguments=['--log-level', quiet_log_level],
         parameters=[{
             'use_sim_time': False,
-            'vx_covariance': 0.015,       # Mơ hồ hơn Wheel (0.001) để không đè Wheel
+            'vx_covariance': 0.015,       # Mo ho hon Wheel (0.001) de khong de Wheel
             'vyaw_covariance': 0.05,
-            'max_valid_covariance': 1.0,  # Ngưỡng vứt bỏ frame mất track
+            'vx_scale': 0.98,             # Hieu chinh vx cua VO (thuc/do)
+            'max_valid_covariance': 1.0,  # Nguong vut bo frame mat track
             'reset_skip_frames': 5,
         }],
         condition=IfCondition(use_vo)
@@ -391,10 +442,14 @@ def generate_launch_description():
         serial_baudrate_arg,
         scan_mode_arg,
         camera_enable_arg,
+        enable_pointcloud_arg,
         use_vo_arg,
+        vo_decimation_arg,
+        vo_max_features_arg,
         use_rf2o_arg,
         rf2o_delay_arg,
         rf2o_log_level_arg,
+        quiet_log_level_arg,
 
         bringup_info,
         lidar_info,

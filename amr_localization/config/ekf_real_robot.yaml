@@ -4,8 +4,8 @@
     use_sim_time: false
 
     # Frequency & Timeouts
-    frequency: 50.0
-    sensor_timeout: 0.3
+    frequency: 100.0
+    sensor_timeout: 0.1
 
     two_d_mode: true # Robot di chuyển trên mặt phẳng 2D
     publish_tf: true
@@ -24,8 +24,8 @@
     odom0: /odom_raw
     odom0_config: [false, false, false,    # x, y, z position
                    false, false, false,    # roll, pitch, yaw orientation
-                   true,  true, false,    # vx, vy, vz 
-                   false, false, true,    # vroll, vpitch, vyaw 
+                   true,  false, false,    # vx, vy, vz 
+                   false, false, false,    # vroll, vpitch, vyaw 
                    false, false, false]    # ax, ay, az acceleration
     odom0_differential: false
     odom0_relative: false

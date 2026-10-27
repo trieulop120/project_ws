@@ -1,0 +1,64 @@
+{
+  "type": "FeatureCollection",
+  "name": "my_route_graph",
+  "crs": {
+    "type": "name",
+    "properties": {
+      "name": "urn:ogc:def:crs:EPSG::4326"
+    }
+  },
+  "date_generated": "",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 0,
+        "frame": "map"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.055,
+          -0.061
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 1,
+        "frame": "map"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          1.901,
+          -0.254
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 2,
+        "startid": 0,
+        "endid": 1
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              0.055,
+              -0.061
+            ],
+            [
+              1.901,
+              -0.254
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

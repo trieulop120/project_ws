@@ -8,12 +8,15 @@ GUI Tkinter cho pallet_mission_node (cung kieu voi mission_gui.py).
 Nut bam:
     1. HOME -> P_1        goi mission_manager/trigger_home_to_p1 (Empty)
     2. Detect ON / OFF    goi pallet_mission/detect (SetBool)
+                          ON  = bat detector + ha lift ve Home
                           OFF = tat detector + chot x, y, yaw
     3. Go to pallet       goi pallet_mission/go_to_pallet (Trigger)
-    4. STOP               goi pallet_mission/stop (Trigger)
+                          (vao pallet -> nang 5 cm -> lui -> ve Home -> ha lift -> DONE)
+    4. Return HOME        goi mission_manager/trigger_return_home (Empty)
+    5. STOP               goi pallet_mission/stop (Trigger)
 
 Hien thi (doc /pallet_mission/status):
-    trang thai, thong bao, x/y/yaw pallet, diem dem, gia tri sieu am.
+    trang thai, thong bao, x/y/yaw pallet, diem dem, sieu am, chieu cao lift.
 
 Usage:
     ros2 run amr_mission_manager pallet_gui
@@ -33,10 +36,13 @@ from std_msgs.msg import String
 from std_srvs.srv import Empty, SetBool, Trigger
 
 HOME_P1_SERVICE = 'mission_manager/trigger_home_to_p1'
+RETURN_HOME_SERVICE = 'mission_manager/trigger_return_home'
 STATUS_TOPIC = '/pallet_mission/status'
 STATUS_TIMEOUT_S = 2.0
 
-BUSY_STATES = ('NAVIGATING', 'SETTLING', 'ALIGNING', 'INSERTING')
+# dang chay chu trinh: khoa cac nut di chuyen (chi con STOP)
+BUSY_STATES = ('NAVIGATING', 'SETTLING', 'ALIGNING', 'INSERTING',
+               'LIFTING', 'BACKING', 'HOMING', 'LOWERING')
 IDLE_LIKE = ('IDLE', 'READY', 'DONE', 'FAILED', 'STOPPED')
 
 STATE_COLORS = {
@@ -47,6 +53,10 @@ STATE_COLORS = {
     'SETTLING': '#ef6c00',
     'ALIGNING': '#ef6c00',
     'INSERTING': '#ef6c00',
+    'LIFTING': '#6a1b9a',
+    'BACKING': '#ef6c00',
+    'HOMING': '#ef6c00',
+    'LOWERING': '#6a1b9a',
     'DONE': '#2e7d32',
     'FAILED': '#c62828',
     'STOPPED': '#c62828',
@@ -65,6 +75,7 @@ class PalletGUINode(Node):
         self.events = queue.Queue()       # (label, ok, message) tu ROS thread -> GUI
 
         self.cli_home = self.create_client(Empty, HOME_P1_SERVICE)
+        self.cli_return_home = self.create_client(Empty, RETURN_HOME_SERVICE)
         self.cli_detect = self.create_client(SetBool, 'pallet_mission/detect')
         self.cli_go = self.create_client(Trigger, 'pallet_mission/go_to_pallet')
         self.cli_stop = self.create_client(Trigger, 'pallet_mission/stop')
@@ -118,7 +129,7 @@ class PalletGUI(tk.Tk):
         super().__init__()
         self._node = node
         self.title('AMR Pallet Mission')
-        self.geometry('460x700')
+        self.geometry('460x790')
 
         main = ttk.Frame(self, padding='15')
         main.pack(fill=tk.BOTH, expand=True)
@@ -133,7 +144,7 @@ class PalletGUI(tk.Tk):
         self.btn_home.pack(pady=3)
 
         # ---- 2. Detect ----
-        self._section(main, '2. DETECT PALLET')
+        self._section(main, '2. DETECT PALLET (Detect ON: hạ lift về Home)')
         row = ttk.Frame(main)
         row.pack()
         self.btn_det_on = ttk.Button(row, text='Detect ON', width=16,
@@ -144,10 +155,16 @@ class PalletGUI(tk.Tk):
         self.btn_det_off.pack(side='left', padx=3)
 
         # ---- 3. Go to pallet ----
-        self._section(main, '3. ĐI VÀO PALLET')
+        self._section(main, '3. ĐI VÀO PALLET → NÂNG → LÙI → VỀ HOME')
         self.btn_go = ttk.Button(main, text='Go to pallet', width=34,
                                  command=self._on_go)
         self.btn_go.pack(pady=3)
+
+        # ---- 4. Return HOME ----
+        self._section(main, '4. VỀ HOME')
+        self.btn_return = ttk.Button(main, text='Return HOME', width=34,
+                                     command=self._on_return_home)
+        self.btn_return.pack(pady=3)
 
         # ---- STOP ----
         tk.Button(main, text='STOP', width=30, height=2, bg='#c62828', fg='white',
@@ -183,6 +200,10 @@ class PalletGUI(tk.Tk):
         ttk.Label(main, textvariable=self._us_var,
                   font=('Arial', 10)).pack(pady=(8, 0))
 
+        self._lift_var = tk.StringVar(value='Lift: chưa có dữ liệu')
+        ttk.Label(main, textvariable=self._lift_var,
+                  font=('Arial', 10)).pack(pady=(2, 0))
+
         ttk.Separator(main, orient='horizontal').pack(fill='x', pady=12)
 
         self._last_var = tk.StringVar(value='Lệnh gần nhất: -')
@@ -200,6 +221,9 @@ class PalletGUI(tk.Tk):
     # ---------------- Button handlers ----------------
     def _on_home(self):
         self._node.call(self._node.cli_home, Empty.Request(), 'HOME → P_1')
+
+    def _on_return_home(self):
+        self._node.call(self._node.cli_return_home, Empty.Request(), 'Return HOME')
 
     def _on_detect_on(self):
         req = SetBool.Request()
@@ -243,6 +267,7 @@ class PalletGUI(tk.Tk):
             self._enable(self.btn_det_off, False)
             self._enable(self.btn_go, False)
             self._enable(self.btn_home, True)
+            self._enable(self.btn_return, True)
             self.after(100, self._refresh)
             return
 
@@ -289,11 +314,20 @@ class PalletGUI(tk.Tk):
             self._us_var.set(f'Siêu âm: {us:.1f} cm   '
                              f'(mẫu liên tiếp dưới ngưỡng: {cnt})')
 
+        # lift
+        lift = st.get('lift_cm')
+        if lift is None:
+            self._lift_var.set('Lift: không có dữ liệu /joint_states')
+        else:
+            self._lift_var.set(f'Lift: {lift:.1f} cm')
+
         # bat/tat nut theo trang thai
+        busy = state in BUSY_STATES
         self._enable(self.btn_det_on, state in IDLE_LIKE)
         self._enable(self.btn_det_off, state == 'DETECTING')
         self._enable(self.btn_go, state == 'READY')
-        self._enable(self.btn_home, state not in BUSY_STATES)
+        self._enable(self.btn_home, not busy)
+        self._enable(self.btn_return, not busy and state != 'DETECTING')
 
         self.after(100, self._refresh)
 

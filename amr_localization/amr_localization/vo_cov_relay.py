@@ -19,12 +19,16 @@ class VoCovRelayNode(Node):
         self.declare_parameter('vyaw_covariance', 0.05)      # Trọng số vyaw (nếu bật)
         self.declare_parameter('max_valid_covariance', 1.0) # Ngưỡng vứt bỏ frame mất track
         self.declare_parameter('reset_skip_frames', 5)      # Bỏ N frame đầu sau khi track hồi phục
+        # Hệ số hiệu chỉnh vx của VO (thật/đo). Đo được 0.983 (11 lần chạy); làm tròn 0.98 vì
+        # sửa pitch camera trong TF sẽ làm VO đọc tăng thêm ~0.5%. Đo lại sau khi sửa TF.
+        self.declare_parameter('vx_scale', 0.98)
 
         # Fetch parameters
         self.vx_cov = self.get_parameter('vx_covariance').value
         self.vyaw_cov = self.get_parameter('vyaw_covariance').value
         self.max_valid_cov = self.get_parameter('max_valid_covariance').value
         self.skip_count = self.get_parameter('reset_skip_frames').value
+        self.vx_scale = float(self.get_parameter('vx_scale').value)
 
         self.skip_counter = 0
 
@@ -77,8 +81,13 @@ class VoCovRelayNode(Node):
         fused_msg.pose = msg.pose
         fused_msg.twist = msg.twist
 
-        cov = [1000.0] * 36
-        cov[0] = self.vx_cov  # Chỉ truyền vx_covariance (0.015)
+        # Ma trận chéo: các kênh không dùng có phương sai rất lớn, KHÔNG có hệ số chéo
+        # (bản cũ điền 1000 vào cả phần tử ngoài đường chéo -> ma trận không hợp lệ).
+        fused_msg.twist.twist.linear.x = vx * self.vx_scale
+        cov = [0.0] * 36
+        for i in range(6):
+            cov[i * 6 + i] = 1000.0
+        cov[0] = self.vx_cov  # Chỉ truyền vx_covariance
         fused_msg.twist.covariance = cov
 
         self.pub.publish(fused_msg)
