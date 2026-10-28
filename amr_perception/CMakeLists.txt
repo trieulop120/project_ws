@@ -9,6 +9,7 @@ endif()
 # Dependencies
 # =========================================================================
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 
 # C++ dependencies
 find_package(rclcpp REQUIRED)
@@ -46,9 +47,17 @@ install(TARGETS
 # =========================================================================
 # Install Python Executables (ament_cmake pattern)
 # =========================================================================
+ament_python_install_package(${PROJECT_NAME})
+
 install(PROGRAMS
-  amr_perception/pallet_detector_node.py
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_perception/pallet_detector_node.py
   DESTINATION lib/${PROJECT_NAME} RENAME pallet_detector
+)
+
+# OpenVINO INT8 backend (alternative to pallet_detector; run only one at a time)
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_perception/pallet_detector_ov_node.py
+  DESTINATION lib/${PROJECT_NAME} RENAME pallet_detector_ov
 )
 
 # =========================================================================

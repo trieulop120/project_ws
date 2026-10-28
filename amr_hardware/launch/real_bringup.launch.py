@@ -251,10 +251,10 @@ def generate_launch_description():
             'use_sim_time': False,
             'color_width': 640,
             'color_height': 480,
-            'color_fps': 15,
+            'color_fps': 30,
             'depth_width': 640,
             'depth_height': 480,
-            'depth_fps': 15,
+            'depth_fps': 30,
             'enable_depth': True,
             'enable_color': True,
             'use_uvc_camera': True,
@@ -262,6 +262,13 @@ def generate_launch_description():
             'enable_depth_to_color_registration': False,
             'use_software_d2c': True,  # Bật Software D2C để dóng hàng Depth/Color
             'color_depth_synchronization': True,
+            # TF camera (camera_link -> *_optical_frame) là TF DYNAMIC của driver,
+            # mặc định chỉ 10 Hz trong khi ảnh stamp 30 Hz -> TF2 WARN
+            # "extrapolation into the future" (rgbd_odometry) và pallet node block
+            # ở tf_timeout. Ép TF camera chạy bằng tần số ảnh (30 Hz).
+            # NOTE: driver đọc tham số này bằng double (default 10.0) — truyền int
+            # sẽ bị type mismatch và driver giữ nguyên default (đã xảy ra, log "10 Hz").
+            'tf_publish_rate': 0.0,
         }],
         remappings=[
             ('/depth/points', '/points'),

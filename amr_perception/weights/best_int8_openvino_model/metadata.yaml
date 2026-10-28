@@ -1,24 +1,22 @@
-description: Ultralytics YOLO26m-obb model trained on /content/dataset/data.yaml
+description: Ultralytics YOLO26s-seg model trained on /kaggle/working/pallet_dataset/data.yaml
 author: Ultralytics
-date: '2026-10-26T11:52:21.585215+07:00'
-version: 8.4.189
+date: '2026-10-27T15:46:09.017012+07:00'
+version: 8.4.190
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com
 stride: 32
-task: obb
-head: OBB26
+task: segment
+head: Segment26
 batch: 1
 imgsz:
 - 640
 - 640
 names:
   0: box
-  1: edge
-  2: hang
-  3: hole
-  4: pallet-hole-segmentation1
+  1: hole
+  2: pallet
 args:
-  data: C:\DAI_HOC\DO_AN_TOT_NGHIEP\Camera\pallet_dataset\data.yaml
+  data: C:/DAI_HOC/DO_AN_TOT_NGHIEP/Camera/data.yaml
   batch: 1
   fraction: 1.0
   quantize: 8
