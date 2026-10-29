@@ -185,6 +185,10 @@ function connect() {
                         if (d.lift && typeof updateLiftStatus === 'function') {
                             updateLiftStatus(d.lift);
                         }
+                        // Pallet-mission cargo card (LOADED/EMPTY + US/lift detail)
+                        if (typeof window.updateCargo === 'function') {
+                            window.updateCargo(d.mission);
+                        }
                         break;
 
                     case 'laser':

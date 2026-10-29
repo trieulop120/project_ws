@@ -12,8 +12,13 @@
 
   <depend>rclpy</depend>
   <depend>std_srvs</depend>
+  <depend>std_msgs</depend>
   <depend>nav2_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>action_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>amr_navigation</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

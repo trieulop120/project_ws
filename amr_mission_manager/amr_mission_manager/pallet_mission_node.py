@@ -203,9 +203,12 @@ DEFAULTS = {
     'lift_timeout_s': 60.0,
     'lift_start_timeout_s': 4.0,
     'lift_move_eps_cm': 0.3,
+    'lift_settle_s': 0.5,            # sau khi lift dat du chieu cao (nang/ha): cho
+                                      # on dinh `lift_settle_s` (vung bi, lech vai mm)
+                                      # roi moi sang buoc ke. 0 = tat.
     'joint_stale_s': 1.0,
     # sau khi nang: lui -> ve Home -> ha lift
-    'backoff_m': 0.40,              # quang lui (m); 0 = dung handoff_m
+    'backoff_m': 0.50,              # quang lui (m); 0 = dung handoff_m
     'backoff_speed': 0.08,          # toc do lui (m/s)
     'backoff_timeout_s': 20.0,
     # Home = NODE_HOME trong route graph (khung map). Dung cung BT return_home.xml nhu mission_manager.
@@ -657,9 +660,22 @@ class PalletMission(Node):
         self._lift_t0 = 0.0
         self._lift_h0 = 0.0
         self._lift_moved = False
+        self._lift_settle_t0 = None    # thang do "da dat du chieu cao" (cho on dinh)
         self._ins_msg = ''
         self._lift_goal = 0.0           # chieu cao dich cua lan nang/ha hien tai (cm)
         self._lift_is_home = False      # True: dang ha ve Home (LOWERING)
+
+        # ---------------- Cargo (box on lift?) ----------------
+        # True/False/None, OWNED by the state machine so the web cargo card is
+        # meaningful in EVERY phase (the raw ultrasonic only says "something
+        # in front", not whether we are actually carrying a box):
+        #   True  - box grabbed: set when lift reached its goal and we back
+        #           away with the load (_begin_backoff).
+        #   False - box placed / before pickup: set when the cycle is DONE
+        #           (lift lowered onto the shelf) or when a fresh detect
+        #           (pickup) starts.
+        #   None  - unknown (node just started, no cycle yet).
+        self._cargo = None
 
         self._bo_ref = (0.0, 0.0)       # diem bat dau lui (insertion_frame)
         self._bo_t0 = 0.0
@@ -750,6 +766,7 @@ class PalletMission(Node):
              'live': live, 'pallet': pallet, 'pre': pre, 'us_cm': us,
              'us_count': self._us_count,
              'lift_cm': None if lift is None else round(lift, 1),
+             'cargo': self._cargo,
              'phase': self._ctl.phase if self._state in (ALIGNING, INSERTING) else None,
              'err': err}
         m = String()
@@ -985,6 +1002,7 @@ class PalletMission(Node):
         self._pallet_ins = None
         if self.p['lower_on_detect']:
             self._esp32(self.p['lift_home_cmd'])        # ha lift ve Home truoc khi di vao pallet
+        self._cargo = False               # chu ky moi: chua co box tren thang
         self._set_state(DETECTING, 'Dang detect + ha lift ve Home... (xe phai DUNG YEN, cho detector nap model)')
         return True, 'detect ON'
 
@@ -1329,6 +1347,7 @@ class PalletMission(Node):
         self._lift_is_home = home
         self._lift_h0 = h
         self._lift_moved = False
+        self._lift_settle_t0 = None
         self._lift_t0 = time.monotonic()
         if home:
             self._esp32(self.p['lift_home_cmd'])
@@ -1345,11 +1364,19 @@ class PalletMission(Node):
             return
         tol = self.p['lift_home_tol_cm'] if self._lift_is_home else self.p['lift_tol_cm']
         if abs(h - self._lift_goal) <= tol:
-            if self._lift_is_home:
-                self._set_state(DONE, f'XONG chu trinh: {self._ins_msg} | lift ve {h:.1f} cm')
-            else:
-                self._begin_backoff()       # du chieu cao -> lui ra
+            # Du chieu cao: cho `lift_settle_s` de on dinh (bin co lech
+            # vai mm) roi moi sang buoc ke. Trong luc cho: xe giu dung.
+            if self._lift_settle_t0 is None:
+                self._lift_settle_t0 = now
+            if now - self._lift_settle_t0 >= self.p['lift_settle_s']:
+                if self._lift_is_home:
+                    self._cargo = False             # da ha box xuong ke
+                    self._set_state(DONE, f'XONG chu trinh: {self._ins_msg} | lift ve {h:.1f} cm')
+                else:
+                    self._begin_backoff()       # du chieu cao -> lui ra
+                return
             return
+        self._lift_settle_t0 = None            # ra ngoai nguong -> do lai cho
         if abs(h - self._lift_h0) > self.p['lift_move_eps_cm']:
             self._lift_moved = True
         if not self._lift_moved and now - self._lift_t0 > self.p['lift_start_timeout_s']:
@@ -1374,6 +1401,8 @@ class PalletMission(Node):
         self._bo_ref = (pose[0], pose[1])
         self._bo_t0 = time.monotonic()
         self._bo_tf_miss = 0
+        self._cargo = True                # da nang du -> box tren thang
+        self._publish_status()
         self._set_state(BACKING, f'Da nang du {self._lift_goal:.0f} cm -> lui {self._bo_dist * 100:.0f} cm')
 
     def _backoff_control(self, now: float):

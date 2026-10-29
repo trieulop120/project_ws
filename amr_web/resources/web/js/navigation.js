@@ -93,10 +93,15 @@
     // Camera buttons
     const btnCamRgb = document.getElementById('btnCamRgb');
     const btnCamDepth = document.getElementById('btnCamDepth');
+    const btnCamDetect = document.getElementById('btnCamDetect');
     const btnNavToggleCam = document.getElementById('btnNavToggleCam');
 
+    // Cargo card elements (populated from /pallet_mission/status)
+    const navCargoStatus = document.getElementById('navCargoStatus');
+    const navCargoText = document.getElementById('navCargoText');
+
     // Camera state
-    let cameraMode = 'off'; // 'off', 'rgb', 'depth'
+    let cameraMode = 'off'; // 'off', 'rgb', 'depth', 'detect'
 
     // Nav viewport
     const navViewport = document.getElementById('navMapViewport');
@@ -968,6 +973,42 @@
     };
 
     // ============================================
+    // Cargo Card (from /pallet_mission/status, 1Hz)
+    // m: { state, cargo (bool|null), us_cm, lift_cm, stale } | undefined
+    // ============================================
+
+    window.updateCargo = function (m) {
+        const st = document.getElementById('navCargoStatus');
+        const tx = document.getElementById('navCargoText');
+        if (!st || !tx) return;
+
+        const noMission = !m || m.state === undefined;
+
+        if (noMission) {
+            // Mission node not running / not yet published: show placeholder.
+            st.className = 'cargo-status empty mt-2';
+            tx.textContent = 'NO MISSION';
+            return;
+        }
+
+        // Cargo badge: LOADED / EMPTY / -- (unknown, e.g. right after restart)
+        if (m.cargo === true) {
+            st.className = 'cargo-status loaded mt-2';
+            tx.textContent = 'LOADED';
+        } else if (m.cargo === false) {
+            st.className = 'cargo-status empty mt-2';
+            tx.textContent = 'EMPTY';
+        } else {
+            st.className = 'cargo-status empty mt-2';
+            tx.textContent = '--';
+        }
+
+        // Dim the card while the status feed has gone stale (mission stopped).
+        // Applied AFTER the className resets above so it cannot be wiped.
+        st.classList.toggle('stale', !!m.stale);
+    };
+
+    // ============================================
     // Camera Feed Handler
     // ============================================
 
@@ -1197,6 +1238,7 @@
         // Update button states
         if (btnCamRgb) btnCamRgb.classList.toggle('active', mode === 'rgb');
         if (btnCamDepth) btnCamDepth.classList.toggle('active', mode === 'depth');
+        if (btnCamDetect) btnCamDetect.classList.toggle('active', mode === 'detect');
         if (btnNavToggleCam) btnNavToggleCam.classList.toggle('active', mode === 'off');
 
         // Send command to backend - sử dụng start_camera/stop_camera như Documents
@@ -1214,7 +1256,10 @@
             if (mode === 'off') {
                 navCameraFeed.innerHTML = '<span class="muted" style="font-size: 0.75rem;">Camera Offline</span>';
             } else {
-                navCameraFeed.innerHTML = `<span class="muted" style="font-size: 0.75rem;">Connecting to ${mode.toUpperCase()}...</span>`;
+                const label = mode === 'detect'
+                    ? 'Pallet detection (needs detector running)...'
+                    : `Connecting to ${mode.toUpperCase()}...`;
+                navCameraFeed.innerHTML = `<span class="muted" style="font-size: 0.75rem;">${label}</span>`;
             }
         }
 
@@ -1255,6 +1300,7 @@
         // Camera mode buttons
         btnCamRgb?.addEventListener('click', () => setCameraMode(cameraMode === 'rgb' ? 'off' : 'rgb'));
         btnCamDepth?.addEventListener('click', () => setCameraMode(cameraMode === 'depth' ? 'off' : 'depth'));
+        btnCamDetect?.addEventListener('click', () => setCameraMode(cameraMode === 'detect' ? 'off' : 'detect'));
         btnNavToggleCam?.addEventListener('click', () => setCameraMode('off'));
 
         // Mission buttons

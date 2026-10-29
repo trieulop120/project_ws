@@ -1952,6 +1952,10 @@
   color: #10B981;
   border: 1px solid #10B981;
 }
+/* Mission not live: dim the whole badge so "EMPTY" is not read as a live state */
+.cargo-status.stale {
+  opacity: 0.4;
+}
 
 /* --- 3. Cột Giữa: Bản đồ & Tools --- */
 #navMapCanvas {

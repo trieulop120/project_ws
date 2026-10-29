@@ -118,6 +118,13 @@ class WebBridge(Node):
         self._map_topic = self.get_parameter('map_topic').value
         self._camera_topic = self.get_parameter('camera_topic').value
         self._depth_camera_topic = self.get_parameter('depth_camera_topic').value
+        # Pallet detection overlay stream (drawn by pallet_detector_node):
+        # its /pallet/detections + target OBB + box/hole companion overlays.
+        self.declare_parameter('debug_camera_topic', '/perception/pallet_debug_image')
+        self._debug_camera_topic = self.get_parameter('debug_camera_topic').value
+        # pallet_mission status (JSON string) -> web cargo card.
+        self.declare_parameter('mission_status_topic', '/pallet_mission/status')
+        self._mission_status_topic = self.get_parameter('mission_status_topic').value
         self._lidar_topic = self.get_parameter('lidar_topic').value
         self._joint_topic = self.get_parameter('joint_topic').value
         self._pose_rate = self.get_parameter('pose_rate').value
@@ -137,7 +144,12 @@ class WebBridge(Node):
 
         # Camera Streaming Control Flag
         self._camera_streaming = False
-        self._camera_mode = 'off'  # 'rgb', 'depth', 'off'
+        self._camera_mode = 'off'  # 'rgb', 'depth', 'detect', 'off'
+
+        # Pallet mission status (JSON from /pallet_mission/status). None until
+        # the mission node publishes; exposed to web as mission{state,cargo,
+        # us_cm,lift_cm,ts} piggybacked on the 1Hz system_status broadcast.
+        self._mission_status = None
 
         # State Managers
         self._state_bridge = StateBridge()
@@ -234,6 +246,13 @@ class WebBridge(Node):
         self._depth_camera_sub = self.create_subscription(
             Image, self._depth_camera_topic, self._on_camera_depth, qos_profile=sensor_qos(),
             callback_group=self._cb_cam)
+        self._debug_camera_sub = self.create_subscription(
+            Image, self._debug_camera_topic, self._on_camera_debug, qos_profile=sensor_qos(),
+            callback_group=self._cb_cam)
+        # Mission status: String JSON, ~2Hz from pallet_mission. The publisher
+        # is plain reliable (depth 10), so match it with the default profile.
+        self._mission_status_sub = self.create_subscription(
+            String, self._mission_status_topic, self._on_mission_status, 10)
         self._lidar_sub = self.create_subscription(
             LaserScan, self._lidar_topic, self._on_lidar, qos_profile=sensor_qos(),
             callback_group=self._cb_sensor)
@@ -378,6 +397,15 @@ class WebBridge(Node):
 
                 if now - self._last_system_status_send >= self._system_status_interval:
                     system_status = self._state_bridge.get_system_overview_state()
+                    # Piggyback the pallet-mission cargo card data (1Hz is
+                    # plenty; the mission publishes at ~2Hz, we just forward
+                    # the freshest parse). `stale` lets the UI dim when the
+                    # mission node has gone quiet (stopped / not running).
+                    m = self._mission_status
+                    if m is not None:
+                        m = dict(m)
+                        m['stale'] = (now - m.get('ts', 0.0)) > 3.0
+                    system_status['mission'] = m
                     await self._ws_manager.broadcast(json.dumps(system_status))
                     # [history] Feed the edge-trigger monitor (plan §6).
                     if _HISTORY_OK:
@@ -524,6 +552,26 @@ class WebBridge(Node):
 
     def _on_camera_depth(self, msg: Image) -> None:
         self._process_and_broadcast_cam(msg, 'depth')
+
+    def _on_camera_debug(self, msg: Image) -> None:
+        # Pallet detection overlay (bgr8). Reuses the demand-driven encode path
+        # so it only costs CPU when a client selected the 'detect' cam mode.
+        self._process_and_broadcast_cam(msg, 'detect')
+
+    def _on_mission_status(self, msg: String) -> None:
+        """Parse /pallet_mission/status JSON; keep a compact view for the web
+        cargo card. A malformed/absent payload never blocks the bridge."""
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        self._mission_status = {
+            'state': d.get('state'),
+            'cargo': d.get('cargo'),       # None | True | False
+            'us_cm': d.get('us_cm'),       # raw ultrasonic reading, cm (or None)
+            'lift_cm': d.get('lift_cm'),
+            'ts': time.time(),
+        }
 
     def _lookup_map_tf(self, frame_id: str) -> Optional[Tuple[float, float, float]]:
         """Phase B05: tra TF map_frame -> frame_id. Tra ve (x, y, yaw) hoac None neu loi.

@@ -34,5 +34,15 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
   RENAME pallet_gui
   )
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_mission_manager/mission_supervisor_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME mission_supervisor
+)
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_mission_manager/rack_tf_publisher_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME rack_tf_publisher
+  )
 
 ament_package()

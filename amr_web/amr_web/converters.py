@@ -147,20 +147,26 @@ def image_to_json(msg: Image, max_width: int = 480, quality: int = 60) -> dict:
         encoding = msg.encoding.lower() if hasattr(msg, 'encoding') else 'rgb8'
         np_image = None
 
+        def _depth_to_heatmap(depth01, void):
+            # Standard "heat" depth convention: NEAR -> warm/red, FAR/VOID ->
+            # cool/blue. depth01 is in [0,1] with 1.0 = farthest valid range;
+            # pixels flagged void (no return) are pinned to the far/empty end.
+            norm = np.clip((1.0 - depth01) * 255.0, 0.0, 255.0).astype(np.uint8)
+            norm = np.where(void, 0, norm).astype(np.uint8)
+            return cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+
         # 1. Xử lý ảnh Depth 16UC1 / MONO16 (16-bit uint - mm)
         if '16u' in encoding or 'mono16' in encoding:
-            depth_data = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
-            depth_clipped = np.clip(depth_data, 0, 5000)  # Giới hạn 0 - 5000mm (5m)
-            depth_normalized = cv2.normalize(depth_clipped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-            np_image = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+            depth_raw = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+            depth01 = np.clip(depth_raw.astype(np.float32) / 5000.0, 0.0, 1.0)  # 5m
+            np_image = _depth_to_heatmap(depth01, depth_raw == 0)
 
         # 2. Xử lý ảnh Depth 32FC1 (32-bit float - m)
         elif '32f' in encoding:
-            depth_data = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
-            depth_data = np.nan_to_num(depth_data, nan=0.0)
-            depth_clipped = np.clip(depth_data, 0.0, 5.0)  # Giới hạn 0 - 5.0m
-            depth_normalized = (depth_clipped / 5.0 * 255.0).astype(np.uint8)
-            np_image = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+            depth_raw = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+            depth_raw = np.nan_to_num(depth_raw, nan=0.0)
+            depth01 = np.clip(depth_raw / 5.0, 0.0, 1.0)  # 5.0m
+            np_image = _depth_to_heatmap(depth01, depth_raw <= 0)
 
         # 3. Các định dạng RGB/BGR/Mono8 thông thường
         elif 'rgb' in encoding:
@@ -180,16 +186,14 @@ def image_to_json(msg: Image, max_width: int = 480, quality: int = 60) -> dict:
             bytes_per_pixel = total_elements // num_pixels
 
             if bytes_per_pixel == 2:  # Ảnh 16-bit Depth
-                depth_data = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
-                depth_clipped = np.clip(depth_data, 0, 5000)
-                depth_normalized = cv2.normalize(depth_clipped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-                np_image = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+                depth_raw = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+                depth01 = np.clip(depth_raw.astype(np.float32) / 5000.0, 0.0, 1.0)
+                np_image = _depth_to_heatmap(depth01, depth_raw == 0)
             elif bytes_per_pixel == 4:  # Ảnh 32-bit Float Depth
-                depth_data = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
-                depth_data = np.nan_to_num(depth_data, nan=0.0)
-                depth_clipped = np.clip(depth_data, 0.0, 5.0)
-                depth_normalized = (depth_clipped / 5.0 * 255.0).astype(np.uint8)
-                np_image = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+                depth_raw = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+                depth_raw = np.nan_to_num(depth_raw, nan=0.0)
+                depth01 = np.clip(depth_raw / 5.0, 0.0, 1.0)
+                np_image = _depth_to_heatmap(depth01, depth_raw <= 0)
             else:
                 channels = max(1, bytes_per_pixel)
                 if channels == 1:
