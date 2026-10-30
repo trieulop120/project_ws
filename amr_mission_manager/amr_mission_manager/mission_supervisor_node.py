@@ -71,7 +71,12 @@ DEFAULTS = {
     'pick_mission': 'home_to_p1',
     'drop_mission': 'p1_to_d1',
     'pick_dest': 'P_1',            # node graph (map frame) de soi den choi
-    'drop_bin': 'bin_0',          # frame TF cua ke (rack_tf_publisher)
+    # W4 (loi 2 ESP serial -> /shelf/occupancy): 4 bit 0/1 theo thu tu o
+    # (bin co hang = 1). Chuan de chon o / xac nhan: index = so o
+    'shelf_topic': '/shelf/occupancy',
+    'shelf_stale_s': 2.0,        # > 2s khong co dat = coi ket noi mat
+    'drop_bin': 'bin_medium',    # frame TF cua ke (rack_tf_publisher:
+                                    #   bin_low / bin_medium / bin_high)
     'run_drop': False,            # True: sau PICKING -> GOTO_D + DROP
     'mission_manager_node': 'mission_manager',
     'pallet_mission_node': 'pallet_mission',
@@ -134,6 +139,27 @@ class MissionSupervisor(Node):
         self.create_subscription(
             String, f'/{self.p["pallet_mission_node"]}/status', self._on_pm_status, 10)
 
+        # W4: nguon trang thai o ke (bin_state_source.py). O so 4 = ke 2 cot x 2 cap.
+        self._bin_source = self._make_bin_source()
+
+    def _make_bin_source(self):
+        """Tao (la) BinStateSource theo p['bin_source']. Dong source cu neu la source
+        Esp32 (subscription) truoc khi thay -> hot-reload tham so khong leak sub."""
+        from amr_mission_manager.bin_state_source import (
+            NoBinStateSource, Esp32BinStateSource)
+        old = getattr(self, '_bin_source', None)
+        if old is not None and hasattr(old, 'close'):
+            old.close(self)
+        bin_names = list(self.p['bin_names'])
+        if self.p['bin_source'] == 'esp32':
+            return Esp32BinStateSource(
+                self, bin_names,
+                rack_id=self.p['rack_id'],
+                occupancy_topic=self.p['rack_occupancy_topic'],
+                health_topic=self.p['rack_health_topic'],
+                rack_stale_s=float(self.p['rack_stale_s']))
+        return NoBinStateSource(bin_names)
+
         self.create_service(
             Trigger, f'/{NODE_NAME}/start', self._srv_start)
         self.create_service(
@@ -142,8 +168,11 @@ class MissionSupervisor(Node):
         self._cancel_cli = self.create_client(CancelGoal,
                                               '/navigate_to_pose/_action/cancel_goal')
 
-        self.create_timer(0.1, self._tick)
-        self.create_timer(0.5, self._publish_status)
+        # GIỮ reference timer trên self: executor của rclpy giữ callback bằng
+        # weak reference -> không lưu thì timer bị GC ngay sau __init__ và
+        # node đứng im IDLE (khong publish status, khong tick duoc).
+        self._tick_timer = self.create_timer(0.1, self._tick)
+        self._status_timer = self.create_timer(0.5, self._publish_status)
 
         self.get_logger().info(
             f'Mission Supervisor ready: pick={self.p["pick_mission"]} '
@@ -219,11 +248,14 @@ class MissionSupervisor(Node):
                   'pick_dest', 'run_drop',
                   'pm_final_window_s', 'pm_min_samples', 'pm_max_pos_std_m',
                   'pm_max_yaw_std_deg', 'pm_max_sample_age_s',
-                  'pm_require_stable'):
+                  'pm_require_stable',
+                  'bin_source', 'rack_id', 'rack_stale_s', 'drop_bin_fallback'):
             try:
                 self.p[k] = self.get_parameter(k).value
             except Exception:
                 pass
+        # Tái tạo BinStateSource sau khi đổi tham số (bin_source / rack_id / rack_stale_s)
+        self._bin_source = self._make_bin_source()
 
         self._pick_phase = S_SAMPLING
         self._detect_on_called = False
@@ -412,6 +444,25 @@ class MissionSupervisor(Node):
         if now - self._t_state > float(self.p['pick_timeout_s']):
             self._set_state(FAILED, f'PICKING qua thoi gian (pm_state={self._pm_state})')
 
+    def _select_drop_bin(self) -> str:
+        """W4: giai quyet drop_bin: ten cụ the -> dung the; 'auto' -> o tron dau tien
+        cua bin_source, neu khong co (khe offline / het o tron) -> drop_bin_fallback
+        (an toan: siu am khi ha se dung du nguong trong ca 2 truong hop)."""
+        want = self.p['drop_bin']
+        if want != 'auto':
+            return want
+        chosen = self._bin_source.pick_first_empty()
+        if chosen:
+            self.get_logger().info(
+                f'[W4] Chon o tron: {chosen} (bin_states={self._bin_source.get_states()})')
+            return chosen
+        fb = self.p['drop_bin_fallback']
+        self.get_logger().warn(
+            f'[W4] Khong co o tron da xac nhan '
+            f'(rack_ok={self._bin_source.rack_ok}) -> fallback {fb} '
+            f'(tin siu am khi ha)')
+        return fb
+
     def _pick_retry(self, reason: str):
         self._retries += 1
         self._detect_on_called = False
@@ -431,10 +482,13 @@ class MissionSupervisor(Node):
             self._set_state(STOPPED, 'pallet_mission STOPPED')
         else:  # DONE
             if self.p['run_drop']:
+                # W4: chon o tron (bin_source) truoc khi GOTO_D
+                self._drop_bin_chosen = self._select_drop_bin()
                 # Don duoc: pallet_mission can co mode 'post_lift: hold' + 'drop'
                 # (muc M5 report) - hien tai moi chu trinh ket thuc o Home.
-                self._set_state(DONE, 'Pick xong (run_drop=true nhung chua co mode '
-                                      'drop -> xe ve Home, khong drop)')
+                self._set_state(DONE, f'Pick xong (run_drop=true, o chon: '
+                                       f'{self._drop_bin_chosen} - chua co mode drop '
+                                       f'-> xe ve Home, khong drop)')
             else:
                 self._set_state(DONE, f'XONG chu trinh: {self.p["pick_mission"]} + pick')
 
@@ -451,6 +505,10 @@ class MissionSupervisor(Node):
                 'drop_bin': self.p['drop_bin'],
                 'run_drop': bool(self.p['run_drop']),
             },
+            # W4: trang thai o ke (web card Rack - phuong an W6)
+            'bins': self._bin_source.get_states(),
+            'rack_ok': bool(getattr(self._bin_source, 'rack_ok', True)),
+            'drop_bin_chosen': getattr(self, '_drop_bin_chosen', None),
             'pm_state': self._pm_state,
             'pm_phase': self._pm_phase,
             'pm_lift_cm': self._pm_lift,

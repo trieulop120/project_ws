@@ -54,6 +54,12 @@ def generate_launch_description():
     PM_REQUIRE_STABLE = 'true'    # nua nua cuoi: false = bo luon kiem tra std
 
     # ==================== Launch arguments =========================
+    # W4 (REPORT_rack_esp32_network.md): nguồn trạng thái ô kệ
+    BIN_SOURCE = 'none'             # 'none' | 'esp32' (rack_mqtt_bridge)
+    RACK_ID = 'R1'
+    RACK_STALE_S = '10.0'
+    DROP_BIN_FALLBACK = 'bin_0'
+
     args = [
         _arg('pick_mission', PICK_MISSION,
              'mission cua mission_manager de ve node pick (edge/set-goal)'),
@@ -81,6 +87,13 @@ def generate_launch_description():
         _arg('arrive_settle_s', '1.0', 'thoi gian on dinh khi "da den" (s)'),
         _arg('goto_timeout_s', '120.0', 'gioi thoi gian ve node pick (s)'),
         _arg('pick_retries', '2', 'so lan thu detect lai khi that (lan)'),
+        # W4: nguon trang thai o ke
+        _arg('bin_source', BIN_SOURCE,
+             "'none' (tu chon o / siu am) | 'esp32' (rack_mqtt_bridge)"),
+        _arg('rack_id', RACK_ID, 'rack_id noi bat trong /rack/occupancy'),
+        _arg('rack_stale_s', RACK_STALE_S, 'khe stal > nguong -> moi o unknown (s)'),
+        _arg('drop_bin_fallback', DROP_BIN_FALLBACK,
+             'drop_bin=auto ma khong co o tron: dung o nay'),
     ]
 
     from launch_ros.actions import Node
@@ -114,6 +127,11 @@ def generate_launch_description():
             'arrive_settle_s': pv('arrive_settle_s', float),
             'goto_timeout_s': pv('goto_timeout_s', float),
             'pick_retries': pv('pick_retries', int),
+            # W4: nguon trang thai o ke
+            'bin_source': LaunchConfiguration('bin_source'),
+            'rack_id': LaunchConfiguration('rack_id'),
+            'rack_stale_s': pv('rack_stale_s', float),
+            'drop_bin_fallback': LaunchConfiguration('drop_bin_fallback'),
         }],
     )
     return LaunchDescription(args + [supervisor])

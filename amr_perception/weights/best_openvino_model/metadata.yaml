@@ -1,6 +1,6 @@
 description: Ultralytics YOLO26s-seg model trained on /kaggle/working/pallet_dataset/data.yaml
 author: Ultralytics
-date: '2026-10-27T15:46:09.017012+07:00'
+date: '2026-10-29T16:34:25.208107+07:00'
 version: 8.4.190
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com
@@ -16,10 +16,10 @@ names:
   1: hole
   2: pallet
 args:
-  data: C:/DAI_HOC/DO_AN_TOT_NGHIEP/Camera/data.yaml
+  data: C:/DAI_HOC/DO_AN_TOT_NGHIEP/Camera/pallet_dataset/data.yaml
   batch: 1
   fraction: 1.0
-  quantize: 8
+  quantize: 16
   nms: null
   dynamic: false
 channels: 3

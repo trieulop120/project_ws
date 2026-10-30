@@ -44,5 +44,10 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
   RENAME rack_tf_publisher
   )
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_mission_manager/supervisor_gui.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME supervisor_gui
+  )
 
 ament_package()

@@ -10,7 +10,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, JointState, BatteryState, Range
-from std_msgs.msg import String
+from std_msgs.msg import String, Int8MultiArray
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 import tf2_ros
 
 
@@ -36,6 +37,9 @@ class ESP32Bridge(Node):
         self.declare_parameter('ultrasonic_min_range', 0.02)
         self.declare_parameter('ultrasonic_max_range', 1.0)
         self.declare_parameter('ultrasonic_fov', 0.26)
+        self.declare_parameter('shelf_topic', '/shelf/occupancy')
+        self.declare_parameter('shelf_timeout', 1.0)     # s, khong co PKT -> bao mat lien lac
+        self.declare_parameter('shelf_heartbeat', 1.0)
         self.declare_parameter('joint_names', ['front_encoder_wheel_left_joint', 'front_encoder_wheel_right_joint', 'encoder_lift_joint'])
 
         self.port = self.get_parameter('port').value
@@ -52,6 +56,9 @@ class ESP32Bridge(Node):
         self.us_min = float(self.get_parameter('ultrasonic_min_range').value)
         self.us_max = float(self.get_parameter('ultrasonic_max_range').value)
         self.us_fov = float(self.get_parameter('ultrasonic_fov').value)
+        self.shelf_topic = self.get_parameter('shelf_topic').value
+        self.shelf_timeout = float(self.get_parameter('shelf_timeout').value)
+        self.shelf_heartbeat = float(self.get_parameter('shelf_heartbeat').value)
         self._warned_pkt_len = False
 
         # Biến lưu trữ dữ liệu phần cứng từ ESP32
@@ -61,6 +68,10 @@ class ESP32Bridge(Node):
         self.curr_gz = 0.0
         self.curr_battery_percent = 0.0
         self.curr_dist_cm = -1.0   # -1.0 = khong co du lieu / khong co echo
+        self.curr_shelf = None          # [1,0,0,0] hoac None neu NAN
+        self.last_pkt_time = 0.0        # time.monotonic() cua PKT hop le gan nhat
+        self.last_shelf_pub = 0.0
+        self.last_shelf_sent = None
         self.data_lock = threading.Lock()
 
         self.ser = None
@@ -74,7 +85,13 @@ class ESP32Bridge(Node):
         self.pub_odom = self.create_publisher(Odometry, '/odom_raw', 10)
         self.pub_battery = self.create_publisher(BatteryState, '/battery_state', 10)
         self.pub_ultrasonic = self.create_publisher(Range, '/ultrasonic/range', 10)
-
+        shelf_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.pub_shelf = self.create_publisher(Int8MultiArray, self.shelf_topic, shelf_qos)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self) if self.publish_tf else None
 
         # Subscribers (ĐÃ SỬA: Lắng nghe /diff_drive/cmd_vel từ splitter)
@@ -264,47 +281,73 @@ class ESP32Bridge(Node):
                     pass
             time.sleep(0.002)
 
+    @staticmethod
+    def _parse_shelf(s):
+        s = s.strip()
+        if len(s) == 4 and all(c in '01' for c in s):
+            return [int(c) for c in s]
+        return None   # "NAN" hoac sai dinh dang
+
     def parse_line(self, line):
-        if line.startswith('PKT'):
-            p = line.split(',')
-            if len(p) >= 8:
-                try:
-                    el = int(p[1])
-                    er = int(p[2])
-                    em3 = int(p[3])
+        if not line.startswith('PKT'):
+            return
+        p = line.split(',')
+        if len(p) < 8:
+            return
+        try:
+            el = int(p[1])
+            er = int(p[2])
+            em3 = int(p[3])
 
-                    # NOTE: ESP32 gửi "NAN" khi BNO055 lỗi/mất kết nối.
-                    # Giữ nguyên field gyro_z để không làm lệch index distance/battery/timestamp.
-                    if p[4].strip().upper() == 'NAN':
-                        gz = math.nan
-                    else:
-                        gz = float(p[4])
+            # ESP32 gui "NAN" khi BNO055 loi/mat ket noi.
+            if p[4].strip().upper() == 'NAN':
+                gz = math.nan
+            else:
+                gz = float(p[4])
 
-                    battery_percent = float(p[6])
+            battery_percent = float(p[6])
 
-                    # Goi PKT mac dinh co dung 8 truong:
-                    # PKT,el,er,em3,gz,dist_cm,batt,timestamp
-                    # Neu firmware bat tog_yaw/tog_acc hoac tat tog_dist thi so truong
-                    # doi va p[5] KHONG con la khoang cach -> coi nhu khong co du lieu.
-                    if len(p) == 8:
-                        dist_cm = float(p[5])
-                    else:
-                        dist_cm = -1.0
-                        if not self._warned_pkt_len:
-                            self._warned_pkt_len = True
-                            self.get_logger().warn(
-                                f'PKT co {len(p)} truong (mong doi 8): bo qua khoang cach '
-                                'sieu am. Kiem tra tog_yaw/tog_acc/tog_dist tren firmware.')
+            # PKT mac dinh:
+            #   8 truong: PKT,el,er,em3,gz,dist_cm,batt,timestamp            (firmware cu)
+            #   9 truong: PKT,el,er,em3,gz,dist_cm,batt,timestamp,shelf      (firmware co ke)
+            # Cac truong khac (tog_yaw/tog_acc/tog_dist) lam lech index -> bo qua dist va ke.
+            shelf = None
+            if len(p) in (8, 9):
+                dist_cm = float(p[5])
+                if len(p) == 9:
+                    shelf = self._parse_shelf(p[8])
+            else:
+                dist_cm = -1.0
+                if not self._warned_pkt_len:
+                    self._warned_pkt_len = True
+                    self.get_logger().warn(
+                        f'PKT co {len(p)} truong (mong doi 8 hoac 9): bo qua khoang cach '
+                        'sieu am va trang thai ke. Kiem tra tog_yaw/tog_acc/tog_dist tren firmware.')
 
-                    with self.data_lock:
-                        self.curr_el = el
-                        self.curr_er = er
-                        self.curr_em3 = em3
-                        self.curr_gz = gz
-                        self.curr_battery_percent = battery_percent
-                        self.curr_dist_cm = dist_cm
-                except Exception:
-                    pass
+            with self.data_lock:
+                self.curr_el = el
+                self.curr_er = er
+                self.curr_em3 = em3
+                self.curr_gz = gz
+                self.curr_battery_percent = battery_percent
+                self.curr_dist_cm = dist_cm
+                self.curr_shelf = shelf
+                self.last_pkt_time = time.monotonic()
+        except Exception:
+            pass
+
+    def _publish_shelf(self, shelf, last_pkt):
+        now_m = time.monotonic()
+        if shelf is None or (now_m - last_pkt) > self.shelf_timeout:
+            state = [-1, -1, -1, -1]
+        else:
+            state = shelf
+        if state != self.last_shelf_sent or (now_m - self.last_shelf_pub) >= self.shelf_heartbeat:
+            msg = Int8MultiArray()
+            msg.data = state
+            self.pub_shelf.publish(msg)
+            self.last_shelf_sent = list(state)
+            self.last_shelf_pub = now_m
 
     def publish_loop_100hz(self):
         now_time = self.get_clock().now()
@@ -325,7 +368,9 @@ class ESP32Bridge(Node):
             gz = self.curr_gz
             battery_percent = self.curr_battery_percent
             dist_cm = self.curr_dist_cm
-
+            shelf = self.curr_shelf
+            last_pkt = self.last_pkt_time
+        self._publish_shelf(shelf, last_pkt)
         if self.first_run:
             self.last_el = el
             self.last_er = er
