@@ -94,6 +94,7 @@ intrinsics (camera_info) that were active when the detect-vs-real table was
 measured. Change either one and the table must be re-measured.
 """
 import math
+import json
 import os
 import traceback
 import time
@@ -112,6 +113,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import PoseStamped, TransformStamped, Quaternion
 from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import String
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
@@ -268,8 +270,8 @@ class PalletDetectorNode(Node):
         # (sync / camera_info) are still running. Default False keeps the
         # legacy single-threaded behaviour.
         self.declare_parameter('mt_executor', False)
-        self.declare_parameter('roi_bottom_frac', 0.5)
-        self.declare_parameter('roi_side_margin_px', 35)
+        self.declare_parameter('roi_bottom_frac', 0.7)
+        self.declare_parameter('roi_side_margin_px', 0)
 
         self.model_path = self.get_parameter('model_path').value
         self.conf_threshold = self.get_parameter('conf_threshold').value
@@ -326,6 +328,30 @@ class PalletDetectorNode(Node):
         # (overhang, OBB inaccuracy, depth jitter).
         self.declare_parameter('box_pallet_margin_px', 15)
         self.box_pallet_margin_px = int(self.get_parameter('box_pallet_margin_px').value)
+        # Box-height classification from depth (NO re-training). Measures the box
+        # top's Z MINUS the pallet top's Z, both back-projected in the SAME frame
+        # / TF, so the camera's fixed vertical offset (mechanical install error)
+        # cancels out. A box only gets a height_class when it is detected,
+        # 2D-associated with the pallet (is_pallet_loaded), and its depth is
+        # measurable; otherwise 'unknown' -- never a guess.
+        self.declare_parameter('use_box_height_class', True)
+        self.declare_parameter('box_height_threshold_m', 0.30)  # >= tall, < medium
+        self.declare_parameter('box_height_min_pixels', 30)
+        # Optional mission-level cargo filter. Empty means retain the normal
+        # detector policy. When set, SEARCH only locks pallets whose measured
+        # tallest carried box belongs to one of these classes.
+        self.declare_parameter('target_cargo_classes', '')
+        self.use_box_height_class = bool(
+            self.get_parameter('use_box_height_class').value)
+        self.box_height_threshold_m = float(
+            self.get_parameter('box_height_threshold_m').value)
+        self.box_height_min_pixels = int(
+            self.get_parameter('box_height_min_pixels').value)
+        target_classes = str(self.get_parameter('target_cargo_classes').value or '')
+        self.target_cargo_classes = {
+            item.strip().lower() for item in target_classes.split(',')
+            if item.strip().lower() in ('medium', 'tall')
+        }
         # Search-mode target selection (used by _pick_target when >= 2 near
         # pallets): the closest pallet wins by default, unless another pallet
         # inside `nearest_band_m` of the closest one has clearly better yaw
@@ -443,6 +469,14 @@ class PalletDetectorNode(Node):
             PoseStamped, '/pallet/pose_camera', QoSProfile(depth=10))
         self.detections_pub = self.create_publisher(
             Detection2DArray, '/pallet/detections', QoSProfile(depth=10))
+        # Height class consumed by pallet_mission_node. Keep this JSON schema
+        # in sync with its /pallet/cargo subscription (_on_cargo).
+        self.cargo_pub = self.create_publisher(
+            String, '/pallet/cargo', QoSProfile(depth=10))
+        # Per-frame search diagnostics let the mission supervisor distinguish
+        # an empty source from an unclassifiable/incompatible target.
+        self.target_status_pub = self.create_publisher(
+            String, '/pallet/target_status', QoSProfile(depth=10))
 
         if self.publish_debug:
             self.debug_image_pub = self.create_publisher(
@@ -1103,6 +1137,127 @@ class PalletDetectorNode(Node):
         return False
 
     # ==================================================================
+    # Box height classification (depth only, no re-training)
+    # ==================================================================
+    def _obb_z_base(self, det: dict, depth_img: np.ndarray,
+                    depth_encoding: str, header, kind: str,
+                    shrink: float = 0.90) -> Optional[float]:
+        """Height of an OBB's surface in the base frame, from depth.
+
+        Same principle the pallet pose uses (extract_depth_in_obb /
+        estimate_yaw_from_depth): back-project the valid depth pixels inside
+        the shrunken OBB to the base frame with the same TF, then read the Z.
+
+        kind='top'    -> 90th percentile of Z in the top band of the OBB
+                         (the top face of a box, seen from the downward tilt).
+        kind='bottom' -> 1st percentile of Z over the whole OBB (the lowest
+                         visible surface, i.e. where the box meets the pallet
+                         top; the pallet top is the box's support surface).
+
+        Returns None when there are too few valid depth pixels, so the caller
+        can mark the box 'unknown' instead of guessing.
+        """
+        camera_frame = header.frame_id or self.camera_frame_param
+        rt = self.lookup_rt(self.base_frame, camera_frame, cam_corr=True)
+        if rt is None:
+            return None
+        R_bc, t_bc = rt
+
+        h_img, w_img = depth_img.shape[:2]
+        box = det['box']
+        center = box.mean(axis=0)
+        shr = center + (box - center) * shrink
+
+        x0 = max(0, int(np.floor(shr[:, 0].min())))
+        x1 = min(w_img, int(np.ceil(shr[:, 0].max())) + 1)
+        y0 = max(0, int(np.floor(shr[:, 1].min())))
+        y1 = min(h_img, int(np.ceil(shr[:, 1].max())) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        sub = depth_img[y0:y1, x0:x1]
+        mask = np.zeros(sub.shape[:2], dtype=np.uint8)
+        poly = (shr - np.array([x0, y0])).astype(np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(mask, [poly], 1)
+        vv, uu = np.nonzero(mask)
+        if vv.size == 0:
+            return None
+
+        z = sub[vv, uu].astype(np.float32)
+        if depth_encoding in ('16UC1', 'mono16'):      # mm -> m
+            z = z / 1000.0
+        valid = np.isfinite(z) & (z > self.MIN_DEPTH_M) & (z < self.MAX_DEPTH_M)
+        z = z[valid].astype(np.float64)
+        uu = uu[valid]
+        vv = vv[valid]
+        if z.size < self.box_height_min_pixels:
+            return None
+
+        # Back-project to base frame (identical to estimate_yaw_from_depth).
+        u = uu + x0
+        v = vv + y0
+        P_cam = np.stack([(u - self.cx) * z / self.fx,
+                          (v - self.cy) * z / self.fy, z], axis=1)
+        z_base = (P_cam @ R_bc.T + t_bc)[:, 2]
+
+        if kind == 'bottom':
+            # Lowest visible surface -> the support the box sits on.
+            return float(np.percentile(z_base, 1))
+
+        # Top face: top band of the OBB (where the downward camera sees the lid).
+        band = shr[:, 1].max() - (shr[:, 1].min() + 0.35 *
+                                  (shr[:, 1].max() - shr[:, 1].min()))
+        in_top = (v <= shr[:, 1].min() + band)
+        if int(in_top.sum()) < self.box_height_min_pixels:
+            return None
+        return float(np.percentile(z_base[in_top], 90))
+
+    def measure_box_heights(self, pallet: dict, boxes: List[dict],
+                            depth_img: np.ndarray, depth_encoding: str,
+                            header) -> None:
+        """Classify each detected box on `pallet` as 'medium' / 'tall'.
+
+        Prerequisite (per the loaded-pallet gating in timer_callback): a box
+        only gets a height_class when it is DETECTED and 2D-associated with
+        the pallet (is_pallet_loaded). Otherwise it is left 'unknown' -- the
+        system never guesses a height.
+
+        Height principle (same depth machinery as the pallet pose, so the
+        fixed camera install offset cancels out of the difference):
+            h_box = Z_top(box) - Z_bottom(box)   both in the base frame
+        'medium' when h_box < box_height_threshold_m, 'tall' at/above it.
+        The tallest box on the pallet is surfaced on the pallet itself
+        (`pallet['max_box_height_m']`, `pallet['max_box_class']`) for the
+        lifting logic.
+        """
+        if not self.use_box_height_class:
+            return
+
+        max_h: Optional[float] = None
+        max_class = 'unknown'
+        for b in boxes:
+            b['height_class'] = 'unknown'
+            b['height_m'] = None
+            if not self.is_pallet_loaded(pallet, [b]):
+                continue                       # not sitting on this pallet
+            z_top = self._obb_z_base(b, depth_img, depth_encoding, header,
+                                     kind='top')
+            z_bot = self._obb_z_base(b, depth_img, depth_encoding, header,
+                                     kind='bottom')
+            if z_top is None or z_bot is None:
+                continue                       # not enough depth pixels
+            h = z_top - z_bot
+            b['height_m'] = float(h)
+            b['height_class'] = ('tall' if h >= self.box_height_threshold_m
+                                else 'medium')
+            if max_h is None or h > max_h:
+                max_h = h
+                max_class = b['height_class']
+        if max_h is not None:
+            pallet['max_box_height_m'] = max_h
+            pallet['max_box_class'] = max_class
+
+    # ==================================================================
     # Publishing helpers
     # ==================================================================
     @staticmethod
@@ -1349,6 +1504,12 @@ class PalletDetectorNode(Node):
                         load_tag = '[LOADED]' if self.is_pallet_loaded(det, all_boxes) \
                             else '[EMPTY]'
                         label = f"{label} {load_tag}"
+                elif det['class'] == 'box' and self.use_box_height_class:
+                    # Height class only when measured this frame (confirmed target).
+                    if det.get('height_class') in ('medium', 'tall'):
+                        label += f" [{det['height_class']} {det['height_m'] * 100:.0f}cm]"
+                    else:
+                        label += ' [h?]'
                 cv2.putText(debug_img, label,
                             (int(det['center'][0]) + 10, int(det['center'][1]) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -1372,6 +1533,9 @@ class PalletDetectorNode(Node):
                 f"Map  X:{b.get('x_map', float('nan')):.2f} Y:{b.get('y_map', float('nan')):.2f}",
                 f"Yaw(base): {b.get('yaw_deg', 0):.1f} deg",
             ]
+            if self.use_box_height_class and 'max_box_class' in b:
+                hcm = f"{b['max_box_height_m'] * 100:.0f}cm" if b.get('max_box_height_m') is not None else "?"
+                lines.append(f"MaxBox: {b['max_box_class']} ({hcm}) th={self.box_height_threshold_m * 100:.0f}cm")
             for i, line in enumerate(lines):
                 cv2.putText(debug_img, line,
                             (hud_x + 10, hud_y + 25 + i * 24),
@@ -1444,6 +1608,7 @@ class PalletDetectorNode(Node):
             search_pool = [p for p in pallets if self.is_pallet_loaded(p, boxes)]
         else:
             search_pool = pallets
+        loaded_count = len(search_pool)
         pool_ids = {id(p) for p in search_pool}
 
         # 3.1: cheap p_base + docking-cost eval of every pallet candidate
@@ -1454,6 +1619,30 @@ class PalletDetectorNode(Node):
             if p_base is not None:
                 candidates.append((det, p_base, cost))
 
+        # When the supervisor supplies available shelf cargo classes, classify
+        # each loaded candidate before target selection. Existing nearest/yaw,
+        # pending-target inertia, and frame confirmation then operate on only
+        # the compatible candidates. Unknown height never passes the filter.
+        localizable_loaded_count = sum(1 for det, _p, _c in candidates if id(det) in pool_ids)
+        unknown_loaded_count = 0
+        incompatible_loaded_count = 0
+        if self.target_cargo_classes:
+            eligible_ids = set()
+            for det, _p_base, _cost in candidates:
+                if id(det) not in pool_ids:
+                    continue
+                self.measure_box_heights(det, boxes, depth_img,
+                                         depth_encoding, header)
+                cls = det.get('max_box_class')
+                if cls in self.target_cargo_classes:
+                    eligible_ids.add(id(det))
+                elif cls not in ('medium', 'tall'):
+                    unknown_loaded_count += 1
+                else:
+                    incompatible_loaded_count += 1
+            pool_ids = eligible_ids
+        compatible_count = sum(1 for det, _p, _c in candidates if id(det) in pool_ids)
+
         # 3.2: drop the lock when stale
         now_mono = time.monotonic()
         if self.locked_target_base is not None and \
@@ -1463,13 +1652,21 @@ class PalletDetectorNode(Node):
         best_detection = None
 
         if self.locked_target_base is not None:
-            # 3.3a: Tracking mode - closest candidate to the locked position,
-            #       from ALL pallets (box check skipped).
+            # 3.3a: Tracking mode - closest candidate to the locked position;
+            #       normal loaded gating is skipped, but mission class filter
+            #       remains authoritative when configured.
+            #       A mission class filter remains authoritative after lock:
+            #       only candidates with a measured compatible class can
+            #       refresh/publish the target. A temporary unknown is a miss.
+            track_candidates = [
+                c for c in candidates
+                if not self.target_cargo_classes or id(c[0]) in pool_ids
+            ]
             track = min(
-                candidates,
+                track_candidates,
                 key=lambda c: math.hypot(c[1][0] - self.locked_target_base[0],
                                           c[1][1] - self.locked_target_base[1])) \
-                if candidates else None
+                if track_candidates else None
             if track is not None:
                 track_dist = math.hypot(
                     track[1][0] - self.locked_target_base[0],
@@ -1565,12 +1762,40 @@ class PalletDetectorNode(Node):
             ok = self.compute_pallet_poses(best_detection, depth_img,
                                            depth_encoding, header)
             if ok:
+                # Height classification only runs on a confirmed target, using
+                # the boxes already detected this frame (no re-training; depth
+                # principle shared with the pallet pose).
+                self.measure_box_heights(best_detection, boxes, depth_img,
+                                          depth_encoding, header)
+                cargo_class = best_detection.get('max_box_class')
+                cargo_height = best_detection.get('max_box_height_m')
+                if cargo_class in ('medium', 'tall') and cargo_height is not None:
+                    cargo_msg = String()
+                    cargo_msg.data = json.dumps({
+                        'class': cargo_class,
+                        'height_m': float(cargo_height),
+                    })
+                    self.cargo_pub.publish(cargo_msg)
                 self.get_logger().debug(
                     f"[{mode_label}] Pallet: base=({best_detection['x_base']:.2f}, "
                     f"{best_detection['y_base']:.2f}) "
                     f"yaw={best_detection['yaw_deg']:.1f}deg conf={best_detection['conf']:.2f}")
             else:
                 best_detection = None
+
+        target_status = String()
+        target_status.data = json.dumps({
+            'state': 'LOCKED' if best_detection is not None else 'SEARCHING',
+            'seen_pallets': len(pallets),
+            'loaded_pallets': loaded_count,
+            'unlocalized_loaded': max(0, loaded_count - localizable_loaded_count),
+            'compatible_pallets': compatible_count,
+            'unknown_loaded': unknown_loaded_count,
+            'incompatible_loaded': incompatible_loaded_count,
+            'target_cargo_classes': sorted(self.target_cargo_classes),
+            'selected_class': (best_detection or {}).get('max_box_class'),
+        })
+        self.target_status_pub.publish(target_status)
 
         # Detections message
         det_msg = Detection2DArray()

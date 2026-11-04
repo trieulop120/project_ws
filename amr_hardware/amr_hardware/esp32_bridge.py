@@ -40,6 +40,11 @@ class ESP32Bridge(Node):
         self.declare_parameter('shelf_topic', '/shelf/occupancy')
         self.declare_parameter('shelf_timeout', 1.0)     # s, khong co PKT -> bao mat lien lac
         self.declare_parameter('shelf_heartbeat', 1.0)
+        # Loc nhieu cam bien ke (camera do sau chieu vao cam bien hong ngoai khi xe chay):
+        # gia tri tho cua tung o phai DUNG YEN LIEN TUC chung nay giay moi duoc nhan.
+        # Nhap nhay -> dem lai tu dau, giu gia tri da nhan truoc do.
+        # Doi khi dang chay: ros2 param set /esp32_bridge shelf_stable_s 8.0
+        self.declare_parameter('shelf_stable_s', 5.0)
         self.declare_parameter('joint_names', ['front_encoder_wheel_left_joint', 'front_encoder_wheel_right_joint', 'encoder_lift_joint'])
 
         self.port = self.get_parameter('port').value
@@ -72,6 +77,10 @@ class ESP32Bridge(Node):
         self.last_pkt_time = 0.0        # time.monotonic() cua PKT hop le gan nhat
         self.last_shelf_pub = 0.0
         self.last_shelf_sent = None
+        # Bo loc on dinh cua 4 o ke
+        self._sh_raw = [None] * 4       # gia tri tho gan nhat cua tung o
+        self._sh_raw_t = [0.0] * 4      # thoi diem gia tri tho doi lan cuoi
+        self._sh_acc = [None] * 4       # gia tri da duoc nhan (None = chua on dinh lan nao)
         self.data_lock = threading.Lock()
 
         self.ser = None
@@ -339,9 +348,20 @@ class ESP32Bridge(Node):
     def _publish_shelf(self, shelf, last_pkt):
         now_m = time.monotonic()
         if shelf is None or (now_m - last_pkt) > self.shelf_timeout:
+            # mat lien lac: bo trang thai da nhan, phai on dinh lai tu dau
+            self._sh_raw = [None] * 4
+            self._sh_acc = [None] * 4
             state = [-1, -1, -1, -1]
         else:
-            state = shelf
+            stable_s = float(self.get_parameter('shelf_stable_s').value)
+            for i, v in enumerate(shelf):
+                if v != self._sh_raw[i]:                 # doi (ke ca nhap nhay): dem lai
+                    self._sh_raw[i] = v
+                    self._sh_raw_t[i] = now_m
+                elif v != self._sh_acc[i] and now_m - self._sh_raw_t[i] >= stable_s:
+                    self._sh_acc[i] = v                  # dung yen du lau moi nhan
+            # o chua tung on dinh -> -1 (supervisor coi la chua ro)
+            state = [-1 if a is None else a for a in self._sh_acc]
         if state != self.last_shelf_sent or (now_m - self.last_shelf_pub) >= self.shelf_heartbeat:
             msg = Int8MultiArray()
             msg.data = state

@@ -32,8 +32,8 @@
       "geometry": {
         "type": "Point",
         "coordinates": [
-          1.901,
-          -0.254
+          1.7746,
+          0.51257
         ]
       }
     },
@@ -41,22 +41,27 @@
       "type": "Feature",
       "properties": {
         "id": 2,
-        "startid": 0,
-        "endid": 1
+        "frame": "map"
       },
       "geometry": {
-        "type": "MultiLineString",
+        "type": "Point",
         "coordinates": [
-          [
-            [
-              0.055,
-              -0.061
-            ],
-            [
-              1.901,
-              -0.254
-            ]
-          ]
+          -2.96,
+          -0.08
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 3,
+        "frame": "map"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          2.46,
+          2.33
         ]
       }
     }

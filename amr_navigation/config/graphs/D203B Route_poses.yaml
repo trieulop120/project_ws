@@ -22,8 +22,38 @@ poses:
         frame_id: map
       pose:
         position:
-          x: 1.901
-          y: -0.254
+          x: 1.7746
+          y: 0.51257
+          z: 0.0
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: -0.68521
+          w: 0.72835
+  P_2:
+    id: 2
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: -2.96
+          y: -0.08
+          z: 0.0
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: -0.9999999999932537
+          w: -3.673205103346574e-06
+  D_1:
+    id: 3
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 2.46
+          y: 2.33
           z: 0.0
         orientation:
           x: 0.0

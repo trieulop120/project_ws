@@ -13,6 +13,9 @@ ament_python_install_package(${PROJECT_NAME})
 # Install launch files
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
+# Install config (shelf.yaml - rack_tf_publisher doc tu day sau build)
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
+
 # Install console_scripts
 install(PROGRAMS
   ${CMAKE_CURRENT_SOURCE_DIR}/amr_mission_manager/mission_manager_node.py

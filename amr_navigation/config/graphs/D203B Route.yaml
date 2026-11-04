@@ -17,17 +17,32 @@ nodes:
       is_parking: true
   P_1:
     position:
-      x: 1.901
-      y: -0.254
+      x: 1.7746
+      y: 0.51257
       z: 0.0
     orientation:
-      yaw: 1.5708
+      yaw: -1.5097778852928097
     type: pickup_approach
     floor: 1
     description: Node P_1
-edges:
-- from: NODE_HOME
-  to: P_1
-  bidirectional: true
-  weight: 1.0
-  distance: 1.86
+  P_2:
+    position:
+      x: -2.96
+      y: -0.08
+      z: 0.0
+    orientation:
+      yaw: -3.1416
+    type: pickup_approach
+    floor: 1
+    description: Node P_2
+  D_1:
+    position:
+      x: 2.46
+      y: 2.33
+      z: 0.0
+    orientation:
+      yaw: 1.5708
+    type: dropoff_approach
+    floor: 1
+    description: Node D_1
+edges: []

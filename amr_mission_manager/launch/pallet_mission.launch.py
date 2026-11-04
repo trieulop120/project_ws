@@ -55,6 +55,14 @@ def generate_launch_description():
         _arg('min_samples', '1',
              'so mau toi thieu (tong va trong cua so). Detector CPU ~2 mau/s'),
         _arg('range_topic', '/ultrasonic/range', 'topic sieu am (sensor_msgs/Range)'),
+        _arg('detector_executable', 'pallet_detector_ov',
+             'executable detector: pallet_detector_ov (OpenVINO) | pallet_detector (best.pt)'),
+        _arg('after_pick', 'hold',
+             "hold: pick xong lui ra roi DUNG giu pallet (CARRYING) | home: ve Home + ha lift "
+             "(DUNG 'home' khi chay mission_supervisor)"),
+        _arg('with_rack_tf', 'true',
+             'chay rack_tf_publisher (TF slot_A/B1/B2 cho Drop). false neu da chay o '
+             'mission_supervisor.launch.py'),
     ]
 
     def pv(name, typ):
@@ -78,6 +86,20 @@ def generate_launch_description():
             'final_window_s': pv('final_window_s', float),
             'min_samples': pv('min_samples', int),
             'range_topic': LaunchConfiguration('range_topic'),
+            'detector_executable': LaunchConfiguration('detector_executable'),
+            'after_pick': LaunchConfiguration('after_pick'),
+        }],
+    )
+
+    rack_tf_node = Node(
+        package='amr_mission_manager',
+        executable='rack_tf_publisher',
+        name='rack_tf_publisher',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('with_rack_tf')),
+        parameters=[{
+            'graph_package': LaunchConfiguration('graph_package'),
+            'graph_yaml_filename': LaunchConfiguration('graph_yaml_filename'),
         }],
     )
 
@@ -102,4 +124,4 @@ def generate_launch_description():
         parameters=[{'use_sim_time': pv('use_sim_time', bool)}],
     )
 
-    return LaunchDescription(args + [mission_manager_node, mission_node, gui_node])
+    return LaunchDescription(args + [mission_manager_node, rack_tf_node, mission_node, gui_node])

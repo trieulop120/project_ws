@@ -69,7 +69,7 @@ from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import PoseStamped, Twist, Point
 from nav2_msgs.action import NavigateToPose
 from sensor_msgs.msg import JointState, Range
-from std_msgs.msg import String, ColorRGBA
+from std_msgs.msg import String, ColorRGBA, Int8MultiArray
 from std_srvs.srv import SetBool, Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
@@ -92,6 +92,10 @@ LOWERING = 'LOWERING'       # moi: ha lift ve 0
 DONE = 'DONE'
 FAILED = 'FAILED'
 STOPPED = 'STOPPED'
+CARRYING = 'CARRYING'       # giu pallet sau khi lui (after_pick=hold), xe dung yen, lift van nang
+
+# Loai hang theo do cao hop (detector /pallet/cargo): medium -> A (A1/A2), tall -> B (B1/B2)
+CARGO_TYPE_BY_CLASS = {'medium': 'A', 'tall': 'B'}
 
 BUSY_STATES = (NAVIGATING, SETTLING, ALIGNING, INSERTING, LIFTING,
                BACKING, HOMING, LOWERING)
@@ -100,10 +104,14 @@ BUSY_STATES = (NAVIGATING, SETTLING, ALIGNING, INSERTING, LIFTING,
 DEFAULTS = {
     # detector
     'detector_package': 'amr_perception',
-    'detector_executable': 'pallet_detector',
+    'detector_executable': 'pallet_detector_ov',   # OpenVINO; 'pallet_detector' = best.pt
     'detector_camera_info_in': '/camera/color/camera_info',
     'detector_camera_info_out': '/color/camera_info',
-    'detector_extra_args': [''],
+    # Giong pallet_detector_ov.launch.py: da luong + 15 Hz + TF timeout 50 ms
+    'detector_extra_args': ['-p', 'mt_executor:=true',
+                            '-p', 'timer_period:=0.066',
+                            '-p', 'tf_timeout:=0.05'],
+    'detector_omp_threads': 4,
     # topics / frames
     'pose_topic': '/pallet/pose',
     'range_topic': '/ultrasonic/range',
@@ -200,7 +208,7 @@ DEFAULTS = {
     'auto_lift': True,              # True: vao pallet xong tu nang -> lui -> Home -> ha lift
     'lift_height_cm': 5.0,          # chieu cao nang (cm)
     'lift_tol_cm': 1.0,
-    'lift_timeout_s': 60.0,
+    'lift_timeout_s': 150.0,
     'lift_start_timeout_s': 4.0,
     'lift_move_eps_cm': 0.3,
     'lift_settle_s': 0.5,            # sau khi lift dat du chieu cao (nang/ha): cho
@@ -211,6 +219,32 @@ DEFAULTS = {
     'backoff_m': 0.50,              # quang lui (m); 0 = dung handoff_m
     'backoff_speed': 0.08,          # toc do lui (m/s)
     'backoff_timeout_s': 20.0,
+    'after_pick': 'home',           # 'home': lui -> ve Home -> ha lift | 'hold': lui xong DUNG giu pallet (CARRYING)
+    # ---- phan loai hang (detector publish /pallet/cargo) ----
+    'cargo_topic': '/pallet/cargo',
+    'cargo_min_samples': 5,         # so mau co class hop le trong cua so cuoi
+    'cargo_agree_frac': 0.7,        # ti le mau dong y toi thieu, khong dat -> 'unknown' (KHONG doan)
+    'cargo_type_override': '',      # '' = theo detector | 'A' | 'B' (GUI)
+    # ---- DROP (dat pallet len ke) ----
+    'shelf_config': '',             # '' = config/shelf.yaml cua package
+    'shelf_topic': '/shelf/occupancy',
+    'shelf_stale_s': 2.0,
+    'drop_slot': '',                # '' = tu chon o TRONG theo uu tien | 'A1'|'A2'|'B1'|'B2'
+    'drop_ignore_occupancy': False, # True: bo qua cam bien o ke (chi de commissioning)
+    'drop_stop_dist_cm': 3.0,       # sieu am dung; shelf.yaml insert.stop_dist_cm uu tien neu co
+    'drop_start_tol_m': 0.40,       # xe phai o gan D_1: sai so doc/ngang toi da so voi vi tri mong doi
+    'drop_start_yaw_deg': 25.0,
+    'drop_stage_m': 0.90,           # base_footprint -> mat ke luc bat dau (= D_1 -> mat ke)
+    'drop_rot_clear_m': 0.60,       # cho de xoay tai cho khi dang mang pallet
+    'drop_max_sidestep_m': 0.80,    # cho phep di ngang toi 0.60 m (cot A / B2)
+    'drop_side_speed': 0.08,
+    'drop_gate_margin_m': 0.10,     # cong cach mat ke (tinh tu mui cang)
+    'drop_insert_speed': 0.08,
+    'drop_max_insert_m': 1.20,      # chot an toan, KHONG phai do sau ke
+    'drop_clear_m': 0.30,           # lui ra cho mui cang cach mat ke >= nay roi ha lift
+    'drop_backoff_min_m': 0.50,
+    'drop_backoff_timeout_s': 40.0,
+    'drop_total_timeout_s': 360.0,
     # Home = NODE_HOME trong route graph (khung map). Dung cung BT return_home.xml nhu mission_manager.
     'home_set': True,               # True: dung home_x/home_y/home_yaw_deg (khung map)
     'home_x': 0.055,
@@ -396,6 +430,10 @@ class ApproachController:
 
     def restart_align(self, now):
         self._goto(self.ALIGN, now)
+
+    def resume_converge(self, now):
+        """Tiep tuc tien toi cong sau khi nang lift (reset dong ho phase)."""
+        self._goto(self.CONVERGE, now)
 
     def _min_wz(self, wz, e_h):
         """Bu vung chet ma sat khi dang chay: co tre hai nguong de khong chop."""
@@ -683,6 +721,27 @@ class PalletMission(Node):
         self._bo_tf_miss = 0
         self._home = None               # (x, y, yaw) trong map, dat bang set_home
 
+        # ---------------- Drop / cargo / shelf ----------------
+        self._mode = 'pick'             # 'pick' | 'drop' (dung chung ApproachController)
+        self._lift_next = 'pick_backoff'
+        self._bo_after = 'pick'
+        self._bo_timeout = float(self.p['backoff_timeout_s'])
+        self._drop = None               # dict thong tin lan drop hien tai
+        self._drop_lifted = False
+        self._drop_back_m = 0.0
+        self._cargo_samples = deque(maxlen=300)   # (t, class, height_m) tu /pallet/cargo
+        self._cargo_class = None        # 'medium' | 'tall' | 'unknown' | None
+        self._cargo_type = None         # 'A' | 'B' | None
+        self._cargo_h = None            # m
+        self._cargo_why = ''
+        self._shelf = None
+        self._shelf_cfg = {}
+        self._shelf_err = ''
+        self._shelf_data = None
+        self._shelf_t = 0.0
+        self._drop_stop_cm = float(self.p['drop_stop_dist_cm'])
+        self._load_shelf()
+
         # ---------------- ROS I/O ----------------
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                              reliability=ReliabilityPolicy.RELIABLE)
@@ -697,6 +756,8 @@ class PalletMission(Node):
         self.create_subscription(Range, self.p['range_topic'], self._on_range, 10)
         self.create_subscription(JointState, self.p['joint_states_topic'],
                                  self._on_joint_states, 10)
+        self.create_subscription(String, self.p['cargo_topic'], self._on_cargo, 10)
+        self.create_subscription(Int8MultiArray, self.p['shelf_topic'], self._on_shelf, 10)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -711,6 +772,7 @@ class PalletMission(Node):
         self.create_service(Trigger, f'{NODE_NAME}/stop', self._srv_stop)
         self.create_service(Trigger, f'{NODE_NAME}/calibrate', self._srv_calibrate)
         self.create_service(Trigger, f'{NODE_NAME}/set_home', self._srv_set_home)
+        self.create_service(Trigger, f'{NODE_NAME}/drop', self._srv_drop)
 
         self.create_timer(0.05, self._tick)
         self.create_timer(0.5, self._slow_tick)
@@ -767,6 +829,12 @@ class PalletMission(Node):
              'us_count': self._us_count,
              'lift_cm': None if lift is None else round(lift, 1),
              'cargo': self._cargo,
+             'cargo_class': self._cargo_class, 'cargo_type': self._cargo_type,
+             'cargo_h_cm': None if self._cargo_h is None else round(self._cargo_h * 100.0, 1),
+             'cargo_why': self._cargo_why,
+             'mode': self._mode, 'drop': self._drop_status(), 'shelf': self._shelf_status(),
+             'sel': {'cargo': str(self.get_parameter('cargo_type_override').value),
+                     'slot': str(self.get_parameter('drop_slot').value)},
              'phase': self._ctl.phase if self._state in (ALIGNING, INSERTING) else None,
              'err': err}
         m = String()
@@ -794,7 +862,7 @@ class PalletMission(Node):
         lo = msg.min_range * 100.0 if msg.min_range > 0.0 else 0.0
         close = False
         if math.isfinite(cm):
-            if cm < self.p['stop_dist_cm'] and (cm >= lo or self.p['us_below_min_is_close']):
+            if cm < self._stop_cm_now() and (cm >= lo or self.p['us_below_min_is_close']):
                 close = True
         self._us_count = self._us_count + 1 if close else 0
 
@@ -833,6 +901,9 @@ class PalletMission(Node):
             res.message = f'dang ban ({self._state}), khong the ha lift'
         else:
             self._esp32('HOME')
+            if self._state == CARRYING or self._cargo is True:
+                self._cargo = False
+                self._set_state(IDLE, 'Da ha lift tai cho, bo pallet')
             res.success = True
             res.message = 'Da gui HOME: lift dang ha ve 0 cm (bam STOP de dung)'
         return res
@@ -909,8 +980,13 @@ class PalletMission(Node):
                '--ros-args',
                '-r', f"{self.p['detector_camera_info_in']}:={self.p['detector_camera_info_out']}"]
         cmd += [a for a in (self.p['detector_extra_args'] or []) if a]
+        env = os.environ.copy()
+        n_thr = int(self.p['detector_omp_threads'])
+        if n_thr > 0:
+            env['OMP_NUM_THREADS'] = str(n_thr)
+            env['OPENVINO_CPU_THREADS'] = str(n_thr)
         try:
-            self._det_proc = subprocess.Popen(cmd, start_new_session=True)
+            self._det_proc = subprocess.Popen(cmd, start_new_session=True, env=env)
         except Exception as e:
             self._det_proc = None
             return False, f'khong chay duoc detector: {e}'
@@ -963,7 +1039,7 @@ class PalletMission(Node):
     def _map_yaw_err(self) -> Optional[float]:
         """yaw pallet (map, luc chot) - yaw xe trong map hien tai (deg). ~0 = xe song song pallet
         THEO AMCL. Khac so voi err.yaw (theo odom dong bang) neu odom troi hoac AMCL doi."""
-        if not self._result:
+        if self._mode == 'drop' or not self._result:
             return None
         r = self._robot_pose(self.p['map_frame'])
         if r is None:
@@ -988,6 +1064,8 @@ class PalletMission(Node):
     def _start_detect(self) -> Tuple[bool, str]:
         if self._state in BUSY_STATES:
             return False, f'dang ban ({self._state}), khong the detect'
+        if self._state == CARRYING or self._cargo is True:
+            return False, 'dang giu pallet: Drop hoac Ha lift (bo pallet) truoc khi detect'
         if self._state == DETECTING:
             return True, 'dang detect'
         self._reload_params(recompute_stage=True)
@@ -1000,6 +1078,13 @@ class PalletMission(Node):
         self._result = None
         self._pre = None
         self._pallet_ins = None
+        self._mode = 'pick'
+        self._cargo_samples.clear()
+        self._cargo_class = None
+        self._cargo_type = None
+        self._cargo_h = None
+        self._cargo_why = ''
+        self._drop = None
         if self.p['lower_on_detect']:
             self._esp32(self.p['lift_home_cmd'])        # ha lift ve Home truoc khi di vao pallet
         self._cargo = False               # chu ky moi: chua co box tren thang
@@ -1074,6 +1159,8 @@ class PalletMission(Node):
                f"[bu ngang {self.p['pallet_lat_offset_m'] * 100:+.1f}cm, bu yaw {self.p['pallet_yaw_offset_deg']:+.1f}deg] "
                f"(n={est['n']}, std xy={est['pos_std'] * 100:.1f}cm, "
                f"yaw={est['yaw_std_deg']:.1f}deg, AMCL nhay {jm * 100:.1f}cm/{jd:.1f}deg)")
+        self._classify_cargo()
+        txt += ' | ' + self._cargo_text()
         usable = est['stable'] or not self.p['require_stable']
 
         # ---- DONG BANG pallet vao khung odom ngay luc xe dang dung yen ----
@@ -1246,6 +1333,7 @@ class PalletMission(Node):
             self._set_state(FAILED, 'Khong doi duoc pose pallet sang khung odom (TF)')
             return
         self._line = stored
+        self._mode = 'pick'
         self._ctl = ApproachController(self.p, self.stage_m)
         self._tf_miss = 0
         self._phase_shown = None
@@ -1289,14 +1377,24 @@ class PalletMission(Node):
         if done:
             self._ins_msg = done
             self._halt()
-            if self.p['auto_lift']:
-                self._begin_lift()          # nang -> lui -> Home -> ha lift -> DONE
+            if self._mode == 'drop':
+                self._drop_inserted()       # ha lift -> lui ra -> ha lift ve 0 -> DONE
+            elif self.p['auto_lift']:
+                self._begin_lift()          # nang -> lui -> Home/CARRYING
             else:
                 self._set_state(DONE, 'XONG: ' + done)
             return
 
         ph = self._ctl.phase
-        if ph == 'CONVERGE' and not self._trimmed:
+        if self._mode == 'drop' and ph == 'CONVERGE' and not self._drop_lifted:
+            # Da can xong o D_1: nang lift len muc "dut vao ke" de sieu am thoang, roi moi tien.
+            self._drop_lifted = True
+            self._halt()
+            d = self._drop
+            self._begin_lift(d['insert_cm'], nxt='drop_insert',
+                             label=f"Nang lift len {d['insert_cm']:.0f} cm truoc khi vao o {d['slot']}")
+            return
+        if self._mode == 'pick' and ph == 'CONVERGE' and not self._trimmed:
             self._trimmed = True
             my = self._map_yaw_err()
             now_ins = self._map_to_ins(self._result['x'], self._result['y'], self._result['yaw'])
@@ -1312,7 +1410,7 @@ class PalletMission(Node):
                     self.get_logger().warn(f'map_yaw_trim: chinh huong duong pallet {delta:+.1f} deg theo yaw MAP, canh lai')
                     self._phase_shown = None
                     return
-        if ph in ('GATE', 'LOCK') and ph != self._phase_shown:
+        if self._mode == 'pick' and ph in ('GATE', 'LOCK') and ph != self._phase_shown:
             my = self._map_yaw_err()
             self.get_logger().info(f'[diag] {ph}: lech yaw theo odom={math.degrees(self._ctl.err[1]):+.1f} deg, '
                                    f'theo MAP={"?" if my is None else f"{my:+.1f}"} deg, '
@@ -1335,7 +1433,7 @@ class PalletMission(Node):
         self._esp32('M0')
         self._esp32('M0')
 
-    def _begin_lift(self, target=None, home: bool = False):
+    def _begin_lift(self, target=None, home: bool = False, nxt=None, label=None):
         """home=False: nang len `target` cm (mac dinh lift_height_cm). home=True: ha ve 0."""
         h = self._lift_height_now()
         if h is None:
@@ -1345,16 +1443,17 @@ class PalletMission(Node):
         target = float(self.p['lift_height_cm'] if target is None else target)
         self._lift_goal = target
         self._lift_is_home = home
+        self._lift_next = nxt or ('pick_done' if home else 'pick_backoff')
         self._lift_h0 = h
         self._lift_moved = False
         self._lift_settle_t0 = None
         self._lift_t0 = time.monotonic()
         if home:
             self._esp32(self.p['lift_home_cmd'])
-            self._set_state(LOWERING, f'Ha lift ve Home (dang o {h:.1f} cm)...')
+            self._set_state(LOWERING, label or f'Ha lift ve Home (dang o {h:.1f} cm)...')
         else:
             self._esp32(f'H{target:g}')
-            self._set_state(LIFTING, f'Nang lift len {target:.0f} cm (dang o {h:.1f} cm)...')
+            self._set_state(LIFTING, label or f'Nang lift len {target:.0f} cm (dang o {h:.1f} cm)...')
 
     def _lift_control(self, now: float):
         h = self._lift_height_now()
@@ -1369,11 +1468,7 @@ class PalletMission(Node):
             if self._lift_settle_t0 is None:
                 self._lift_settle_t0 = now
             if now - self._lift_settle_t0 >= self.p['lift_settle_s']:
-                if self._lift_is_home:
-                    self._cargo = False             # da ha box xuong ke
-                    self._set_state(DONE, f'XONG chu trinh: {self._ins_msg} | lift ve {h:.1f} cm')
-                else:
-                    self._begin_backoff()       # du chieu cao -> lui ra
+                self._on_lift_reached(h)
                 return
             return
         self._lift_settle_t0 = None            # ra ngoai nguong -> do lai cho
@@ -1391,19 +1486,22 @@ class PalletMission(Node):
     # ==================================================================
     # Lui ra sau khi nang
     # ==================================================================
-    def _begin_backoff(self):
+    def _begin_backoff(self, dist=None, after='pick', cargo=True, msg=None):
         pose = self._robot_pose(self.p['insertion_frame'])
         if pose is None:
             self._set_state(FAILED, 'Mat TF robot, khong lui duoc')
             return
-        d = float(self.p['backoff_m'])
+        d = float(self.p['backoff_m']) if dist is None else float(dist)
         self._bo_dist = d if d > 0.0 else float(self.p['handoff_m'])
+        self._bo_after = after
+        self._bo_timeout = float(self.p['drop_backoff_timeout_s'] if after == 'drop'
+                                 else self.p['backoff_timeout_s'])
         self._bo_ref = (pose[0], pose[1])
         self._bo_t0 = time.monotonic()
         self._bo_tf_miss = 0
-        self._cargo = True                # da nang du -> box tren thang
+        self._cargo = cargo               # pick: box tren thang | drop: box da o tren ke
         self._publish_status()
-        self._set_state(BACKING, f'Da nang du {self._lift_goal:.0f} cm -> lui {self._bo_dist * 100:.0f} cm')
+        self._set_state(BACKING, msg or f'Da nang du {self._lift_goal:.0f} cm -> lui {self._bo_dist * 100:.0f} cm')
 
     def _backoff_control(self, now: float):
         pose = self._robot_pose(self.p['insertion_frame'])
@@ -1417,9 +1515,18 @@ class PalletMission(Node):
         d = math.hypot(pose[0] - self._bo_ref[0], pose[1] - self._bo_ref[1])
         if d >= self._bo_dist:
             self._halt()
-            self._begin_home()
+            if self._bo_after == 'drop':
+                self._begin_lift(0.0, home=True, nxt='drop_done',
+                                 label='Da lui khoi ke -> ha lift ve 0')
+            elif str(self.p['after_pick']).lower() == 'hold':
+                lift = self._lift_height_now()
+                self._set_state(CARRYING,
+                                f'Da lui {d * 100:.0f} cm, DANG GIU PALLET'
+                                + ('' if lift is None else f' (lift {lift:.1f} cm)'))
+            else:
+                self._begin_home()
             return
-        if now - self._bo_t0 > self.p['backoff_timeout_s']:
+        if now - self._bo_t0 > self._bo_timeout:
             self._finish(FAILED, f'Lui qua thoi gian (moi lui {d * 100:.0f} cm)')
             return
         self._cmd(-float(self.p['backoff_speed']), 0.0)
@@ -1490,6 +1597,260 @@ class PalletMission(Node):
         else:
             self._set_state(FAILED, f'Ve Home that bai (status={status}, '
                                     f'cach Home {"?" if d is None else f"{d:.2f}"} m)')
+
+    # ==================================================================
+    # Cargo (phan loai hang tu detector), Shelf, DROP len ke
+    # ==================================================================
+    def _on_cargo(self, msg: String):
+        if self._state != DETECTING:
+            return
+        try:
+            d = json.loads(msg.data)
+            cls = str(d.get('class', 'unknown'))
+            h = d.get('height_m')
+            h = None if h is None else float(h)
+        except Exception:
+            return
+        self._cargo_samples.append((time.monotonic(), cls, h))
+
+    def _on_shelf(self, msg: Int8MultiArray):
+        self._shelf_data = [int(v) for v in msg.data]
+        self._shelf_t = time.monotonic()
+
+    def _stop_cm_now(self) -> float:
+        return self._drop_stop_cm if self._mode == 'drop' else float(self.p['stop_dist_cm'])
+
+    @staticmethod
+    def _default_shelf_path() -> str:
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            return os.path.join(get_package_share_directory('amr_mission_manager'),
+                                'config', 'shelf.yaml')
+        except Exception:
+            return os.path.expanduser('~/project_ws/src/amr_mission_manager/config/shelf.yaml')
+
+    def _load_shelf(self):
+        path = self.p['shelf_config'] or self._default_shelf_path()
+        try:
+            import yaml
+            from amr_mission_manager.shelf_model import ShelfModel
+            with open(path, 'r') as f:
+                cfg = yaml.safe_load(f) or {}
+            self._shelf = ShelfModel(cfg)
+            self._shelf_cfg = cfg
+            ins = cfg.get('insert') or {}
+            if 'stop_dist_cm' in ins:
+                self._drop_stop_cm = float(ins['stop_dist_cm'])
+            self.get_logger().info(
+                f'[ke] nap {path}: sieu am dung {self._drop_stop_cm:.1f} cm, '
+                f'levels={sorted((cfg.get("levels") or {}).keys())}')
+            for w in self._shelf.provisional_sensor_warnings():
+                self.get_logger().warn(f'[ke][CAM BIEN TAM] {w}')
+        except Exception as e:
+            self._shelf = None
+            self._shelf_err = f'{path}: {e}'
+            self.get_logger().error(f'[ke] KHONG nap duoc shelf.yaml ({self._shelf_err}) -> Drop bi khoa')
+
+    def _shelf_fresh(self) -> bool:
+        return (self._shelf_data is not None and
+                time.monotonic() - self._shelf_t <= float(self.p['shelf_stale_s']))
+
+    def _shelf_status(self):
+        if self._shelf is None:
+            return None
+        fresh = self._shelf_fresh()
+        return {'states': self._shelf.slot_states(self._shelf_data, fresh),
+                'raw': None if self._shelf_data is None else list(self._shelf_data),
+                'fresh': fresh}
+
+    def _drop_status(self):
+        if not self._drop:
+            return None
+        d = self._drop
+        return {'slot': d['slot'], 'level': d['level'], 'type': d['type'],
+                'insert_cm': d['insert_cm'], 'release_cm': d['release_cm']}
+
+    # ---- phan loai hang ----
+    def _classify_cargo(self):
+        """Chot class hop tu cac mau /pallet/cargo trong cua so cuoi. Khong du/khong dong y -> 'unknown'."""
+        self._cargo_class, self._cargo_type, self._cargo_h = 'unknown', None, None
+        s = list(self._cargo_samples)
+        if not s:
+            self._cargo_why = 'detector chua gui /pallet/cargo'
+            return
+        t_last = s[-1][0]
+        if time.monotonic() - t_last > float(self.p['max_sample_age_s']):
+            self._cargo_why = 'mau cargo cuoi qua cu'
+            return
+        win = [x for x in s if x[0] >= t_last - float(self.p['final_window_s'])]
+        known = [x for x in win if x[1] in CARGO_TYPE_BY_CLASS]
+        if len(known) < int(self.p['cargo_min_samples']):
+            self._cargo_why = f'chi {len(known)}/{int(self.p["cargo_min_samples"])} mau co do cao hop le'
+            return
+        counts = {}
+        for x in known:
+            counts[x[1]] = counts.get(x[1], 0) + 1
+        best = max(counts, key=counts.get)
+        frac = counts[best] / float(len(known))
+        if frac < float(self.p['cargo_agree_frac']):
+            self._cargo_why = f'cac mau khong dong y ({counts})'
+            return
+        hs = [x[2] for x in known if x[1] == best and x[2] is not None]
+        self._cargo_class = best
+        self._cargo_type = CARGO_TYPE_BY_CLASS[best]
+        self._cargo_h = float(np.median(hs)) if hs else None
+        self._cargo_why = ''
+
+    def _cargo_text(self) -> str:
+        if self._cargo_type is None:
+            return f'hang: KHONG RO ({self._cargo_why}) -> chon A/B tren GUI truoc khi Drop'
+        h = '' if self._cargo_h is None else f' {self._cargo_h * 100:.0f}cm'
+        return f'hang: {self._cargo_class}{h} -> loai {self._cargo_type}'
+
+    # ---- DROP ----
+    def _srv_drop(self, req, res):
+        res.success, res.message = self._start_drop()
+        return res
+
+    def _fail_drop(self, why: str):
+        self.get_logger().warn(f'[drop] tu choi: {why}')
+        return False, why
+
+    def _start_drop(self) -> Tuple[bool, str]:
+        if self._cargo is not True or self._state not in (CARRYING, FAILED, STOPPED):
+            return self._fail_drop(f'chi Drop khi dang giu pallet (state={self._state}, cargo={self._cargo})')
+        self._reload_params(recompute_stage=False)
+        p = self.p
+        if self._shelf is None:
+            return self._fail_drop(f'khong nap duoc shelf.yaml: {self._shelf_err}')
+        model, cfg = self._shelf, self._shelf_cfg
+
+        # ---- loai hang ----
+        ov = str(p['cargo_type_override']).strip().upper()
+        if ov in ('A', 'B'):
+            ctype, src = ov, 'GUI'
+        elif self._cargo_type in ('A', 'B'):
+            ctype, src = self._cargo_type, f'detector ({self._cargo_class})'
+        else:
+            return self._fail_drop('chua biet loai hang (detector khong chac): chon A hoac B tren GUI')
+
+        # ---- o ke ----
+        fresh = self._shelf_fresh()
+        states = model.slot_states(self._shelf_data, fresh)
+        want = str(p['drop_slot']).strip().upper()
+        if want:
+            cand = [s for s in model.slots if s.id == want]
+            if not cand:
+                return self._fail_drop(f"o '{want}' khong co trong shelf.yaml")
+            if cand[0].product_type != ctype:
+                return self._fail_drop(f'o {want} la loai {cand[0].product_type}, hang dang mang la loai {ctype}')
+            st = states.get(want, 'unknown')
+            if st != 'empty' and not p['drop_ignore_occupancy']:
+                return self._fail_drop(f'o {want} dang {st} (khong "empty") -> khong dat')
+            sid = want
+        else:
+            sid, why = model.select_drop_slot(ctype, states)
+            if sid is None:
+                return self._fail_drop(why)
+        slot = [s for s in model.slots if s.id == sid][0]
+        if not slot.sensor_confirmed:
+            self.get_logger().warn(f'[drop] cam bien o {sid} CHUA xac nhan (sensor_confirmed=false)')
+
+        # ---- tang / lift ----
+        levels = cfg.get('levels') or {}
+        slot_level = cfg.get('slot_level') or {}
+        lvl = slot_level.get(sid)
+        lv = levels.get(lvl) or levels.get(str(lvl)) if lvl is not None else None
+        if lv is None:
+            return self._fail_drop(f'shelf.yaml thieu levels/slot_level cho o {sid}')
+        insert_cm = float(lv['insert_lift_cm'])
+        release_cm = float(lv['release_lift_cm'])
+
+        # ---- TF o ke + khung truoc ke ----
+        frame = model.slot_tf_frame(sid)
+        slot_map = self._tf_pose(p['map_frame'], frame)
+        front_map = self._tf_pose(p['map_frame'], 'shelf_front')
+        if slot_map is None or front_map is None:
+            return self._fail_drop(f"chua co TF map->{frame} / shelf_front (rack_tf_publisher chay chua?)")
+
+        # ---- xe co dang o gan D_1 khong ----
+        rp = self._robot_pose(p['map_frame'])
+        if rp is None:
+            return self._fail_drop('khong doc duoc TF map->base')
+        e_yaw, e_lat, a = line_errors(rp[0], rp[1], rp[2], front_map[0], front_map[1], front_map[2], 0.0)
+        exp_a = -float(model.front_distance_m)
+        tol = float(p['drop_start_tol_m'])
+        if abs(a - exp_a) > tol or abs(e_lat) > tol or abs(math.degrees(e_yaw)) > float(p['drop_start_yaw_deg']):
+            return self._fail_drop(
+                f'xe khong o gan D_1: cach mat ke {-a:.2f} m (can ~{-exp_a:.2f}), lech ngang {e_lat * 100:+.0f} cm, '
+                f'lech goc {math.degrees(e_yaw):+.0f} deg -> bam P_x -> D_1 truoc')
+
+        ins = self._map_to_ins(*slot_map)
+        if ins is None:
+            return self._fail_drop('khong doi duoc pose o ke sang khung odom (TF map->odom)')
+        if self._lift_height_now() is None:
+            return self._fail_drop('khong co /joint_states cua lift')
+
+        # ---- bo dieu khien (tham so rieng cho drop) ----
+        pd = dict(p)
+        pd.update({
+            'face_offset_m': 0.0,                       # goc khung o = MAT TRUOC ke
+            'max_sidestep_m': float(p['drop_max_sidestep_m']),
+            'side_speed': float(p['drop_side_speed']),
+            'gate_margin_m': float(p['drop_gate_margin_m']),
+            'insert_speed': float(p['drop_insert_speed']),
+            'max_insert_m': float(p['drop_max_insert_m']),
+            'rot_clear_m': float(p['drop_rot_clear_m']),
+            'total_timeout_s': float(p['drop_total_timeout_s']),
+        })
+        self._ctl = ApproachController(pd, float(p['drop_stage_m']))
+        self._line = ins
+        self._mode = 'drop'
+        self._drop_lifted = False
+        self._drop = {'slot': sid, 'level': lvl, 'type': ctype, 'frame': frame,
+                      'insert_cm': insert_cm, 'release_cm': release_cm}
+        self._tf_miss = 0
+        self._phase_shown = None
+        self._us_count = 0
+        self._ins_msg = ''
+        msg = (f"DROP o {sid} (tang {lvl}, loai {ctype} theo {src}): nang {insert_cm:.0f} cm khi vao, "
+               f"dat o {release_cm:.0f} cm, sieu am dung {self._drop_stop_cm:.1f} cm")
+        self.get_logger().info('[drop] ' + msg)
+        self._set_state(ALIGNING, 'Bat dau canh chinh vao o ' + sid)
+        return True, msg
+
+    def _drop_inserted(self):
+        """Sieu am du mau -> ha lift xuong muc dat; xong thi lui ra."""
+        d = self._drop
+        a = self._ctl.err[2]
+        tip_depth = a + float(self.p['fork_front_m'])          # mui cang vuot mat ke
+        self._drop_back_m = max(tip_depth + float(self.p['drop_clear_m']),
+                                float(self.p['drop_backoff_min_m']))
+        self.get_logger().info(f'[drop] da vao {tip_depth * 100:.0f} cm tu mat ke -> ha lift '
+                               f'{d["release_cm"]:.0f} cm, se lui {self._drop_back_m * 100:.0f} cm')
+        self._begin_lift(d['release_cm'], nxt='drop_release',
+                         label=f"Ha lift xuong {d['release_cm']:.0f} cm de dat pallet len o {d['slot']}")
+
+    def _on_lift_reached(self, h: float):
+        nxt = self._lift_next
+        if nxt == 'pick_done':
+            self._cargo = False
+            self._set_state(DONE, f'XONG chu trinh: {self._ins_msg} | lift ve {h:.1f} cm')
+        elif nxt == 'pick_backoff':
+            self._begin_backoff()
+        elif nxt == 'drop_insert':
+            self._us_count = 0
+            self._phase_shown = None
+            self._ctl.resume_converge(time.monotonic())
+            self._set_state(INSERTING, f'Lift {h:.1f} cm -> tien vao ke')
+        elif nxt == 'drop_release':
+            self._begin_backoff(dist=self._drop_back_m, after='drop', cargo=False,
+                                msg=f'Da dat pallet len ke (lift {h:.1f} cm) -> lui {self._drop_back_m * 100:.0f} cm')
+        elif nxt == 'drop_done':
+            slot = (self._drop or {}).get('slot', '?')
+            self._set_state(DONE, f'XONG DROP vao o {slot} | lift ve {h:.1f} cm')
+        else:
+            self._set_state(FAILED, f'lift_next khong hop le: {nxt}')
 
     # ==================================================================
     # Emergency stop

@@ -1,0 +1,134 @@
+# ============================================================================
+# shelf.yaml - Mo hinh ke 4 o (giai doan 1)
+# ============================================================================
+# Ke 3 cot, 2 loai hang, 4 o (nhin tu phia robot dung o D_1, trai = trai robot):
+#
+#   Cot 1       Cot 2     Cot 3
+#  ┌─────────┬─────────┬─────────┐
+#  │  A2     │         │         │
+#  │ (tren)  │  B1     │  B2     │
+#  ├─────────┤         │         │
+#  │  A1     │         │         │
+#  │ (duoi)  │         │         │
+#  └─────────┴─────────┴─────────┘
+#
+#   - Loai A (san pham cao trung binh): A1 = o DUOI, A2 = o TREN, cung cot 1
+#     (xep chong 2 hang, 1 cot).
+#   - Loai B (san pham cao): B1 = cot 2, B2 = cot 3, moi o mot cot nguyen
+#     (cot B khong chia hang).
+#
+# Nguyen ly hinh hoc (khung map):
+#   - D_1 la diem duy nhat xac dinh vi tri ke, lay tu route graph.
+#     Truc +X cua D_1 (yaw) chi vao ke: robot dung o D_1 (yaw theo graph)
+#     nhan thang vao ke.
+#   - Khung `shelf_front`: goc nam GIUA mat truoc ke theo chieu ngang
+#     (tam cot 2), cach D_1 front_distance_m doc theo +X (yaw D_1),
+#     y = 0 trong khung D_1, cung yaw voi D_1.
+#     * front_distance_m = khoang cach tu D_1 den MAT TRUOC ke
+#       (KHONG phai den tam o).
+#   - Khung tung o la con cua `shelf_front`: x = 0, z = 0, cung yaw;
+#     y = +col_pitch_m (cot 1, ben TRAI robot khi nhan theo +X - quy uoc
+#     ROS: ben trai = +Y), 0 (cot 2), -col_pitch_m (cot 3).
+#   - A1 va A2 cung cot -> khung o TRÙNG NHAU (tf_frame gan nhau),
+#     chinh la ch y do cao (moi o deu z = 0, do cao nang nam ngoai pham vi nay).
+#   - TAT CA o deu z = 0.
+#
+# Cam bien: ESP32 ke doc 4 cam bien (chỉ só 0-3 = GPIO 23,22,21,19;
+# 1 = co hang) -> UDP -> ESP32 xe (PKT truong 9) -> esp32_bridge
+# -> /shelf/occupancy (Int8MultiArray [4], -1 = mat lien lac / cua).
+# ============================================================================
+
+# Diem neo trong route graph (graph chay that: D203B Route.yaml).
+# Neu graph khong co node nay: KHONG phat TF/marker ke, dat hang bi chon
+# voi ly do "khong co D_1". (KHONG tu chuyen sang graph/diem khac.)
+anchor_node: D_1
+
+# Khoang cach tu D_1 den MAT TRUOC ke (m), doc theo +X (yaw D_1).
+# TAM, chua do (du kien 0.50-0.60) - can do that roi chinh so nay;
+# log canh bao khi khoi dong.
+front_distance_m: 0.90
+front_distance_status: "DA CHOT: 0.90 m (D_1 den mat truoc ke)"
+
+# Khoang cach ngang giua tam 2 cot ke nhau (m).
+# TAM giu gia tri mac dinh cu (col_offset_m cu) - chua do;
+# log canh bao khi khoi dong.
+col_pitch_m: 0.60
+col_pitch_status: "TAM, chua do (giu gia tri mac dinh cu 0.60 m) - do that roi chinh"
+
+# Vi tri cot 1 (o loai A) ben TRAI robot khi nhan theo +X (cot 2 = tam).
+# Neu lap ke doi ben: doi -1.0.
+col_sign: 1.0
+
+# Thu tu uu tien khi co nhieu o hop le deu (dat hang):
+#   loai A: A1 (duoi) roi A2 (tren); loai B: B1 roi B2.
+# Dac trong yaml de co the doi (chua luon theo thu tu danh sach).
+priority:
+  A: [A1, A2]
+  B: [B1, B2]
+
+# Trạng thái ô:
+#   - Chua chon loai hang (cargo_type = null) -> KHONG cho dat hang.
+#   - -1 hoac du lieu cua (shelf_stale) -> o 'unknown' -> KHONG dat hang,
+#     bao len status/GUI. KHONG co fallback o du phong.
+#   - Loai A chi vao A1/A2; loai B chi vao B1/B2.
+
+# 4 o (id, cot, hang, loai hang, chi so cam bien, khung o TF)
+# sensor_index: chi so bit trong /shelf/occupancy (0-3).
+# sensor_confirmed: true = da xac nhan bang thu that; false = TAM -
+#   log canh bao moi lan khoi dong de nhac xac nhan (che tung cam bien).
+slots:
+  - id: A1
+    col: 1                    # cot 1 (loai A)
+    row: 1                    # hang duoi
+    product_type: A
+    sensor_index: 0             # GPIO 23 - DA XAC NHAN: ESP32 tra "1000"
+                              # khi o duoi cot 1 co hang
+    sensor_confirmed: true
+    tf_frame: slot_A
+
+  - id: A2
+    col: 1                    # cot 1, hang tren (chong tren A1)
+    row: 2
+    product_type: A
+    sensor_index: 1             # GPIO 22 - TAM, chua xac nhan
+    sensor_confirmed: false
+    tf_frame: slot_A         # cung cot -> khung o trung voi A1 (ch y)
+
+  - id: B1
+    col: 2                    # cot 2 (loai B, cot nguyen)
+    row: 1
+    product_type: B
+    sensor_index: 2             # GPIO 21 - TAM, chua xac nhan
+    sensor_confirmed: false
+    tf_frame: slot_B1
+
+  - id: B2
+    col: 3                    # cot 3 (loai B, cot nguyen)
+    row: 1
+    product_type: B
+    sensor_index: 3             # GPIO 19 - TAM, chua xac nhan
+    sensor_confirmed: false
+    tf_frame: slot_B2
+
+# ============================================================================
+# DU LIEU CHO GIAI DOAN 2 (chuyen dong dat hang) - CHUA DUOC CODE NAO DUNG.
+# So do nguoi dung da chot. Lift tinh bang cm (nhu pallet_mission).
+# ============================================================================
+insert:
+  stop_dist_cm: 3.0           # sieu am: dung khi con 3 cm
+
+levels:
+  1:                          # tang 1
+    insert_lift_cm: 25.0      # do cao nang khi dut cang vao ke
+    release_lift_cm: 20.0     # ha xuong do cao nay de dat pallet len ke
+  2:                          # tang 2 (san pham vua)
+    insert_lift_cm: 60.0
+    release_lift_cm: 55.0
+
+# O nao thuoc tang nao. CHUA XAC NHAN: gia dinh A1, B1, B2 o tang 1 va A2 o
+# tang 2 (theo so do: A2 la o tren cua cot 1). Nguoi dung xac nhan roi moi dung.
+slot_level:
+  A1: 1
+  A2: 2
+  B1: 1
+  B2: 1
