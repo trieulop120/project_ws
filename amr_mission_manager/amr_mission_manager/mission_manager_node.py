@@ -32,7 +32,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from geometry_msgs.msg import PoseStamped
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import ComputeRoute, NavigateToPose
 from std_srvs.srv import Empty
 import os
 
@@ -73,6 +73,11 @@ class MissionManager(Node):
         self._nav_client = ActionClient(
             self, NavigateToPose, 'navigate_to_pose'
         )
+
+        # ComputeRoute's BT node may fail while Nav2 is loading the custom BT
+        # if /compute_route is not active. In that case, send the same pose
+        # with Nav2's configured default BT so navigation can still proceed.
+        self._route_client = ActionClient(self, ComputeRoute, 'compute_route')
 
         if not self._nav_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().warn('NavigateToPose server not ready')
@@ -159,13 +164,22 @@ class MissionManager(Node):
 
             self.get_logger().info(f'  Goal: x={pose.pose.position.x:.3f}, y={pose.pose.position.y:.3f}')
 
-            # Get BT path
-            bt_path = self._get_bt_path(bt_file)
-            if not bt_path:
+            # Check the route action before asking BT Navigator to load a
+            # mission BT containing ComputeRoute. The default BT navigates
+            # directly to the resolved destination pose.
+            use_route_bt = self._route_client.wait_for_server(timeout_sec=0.25)
+            bt_path = self._get_bt_path(bt_file) if use_route_bt else ''
+            if use_route_bt and not bt_path:
                 self.get_logger().error(f'BT not found: {bt_file}')
                 return False
 
-            self.get_logger().info(f'  BT: {bt_file}')
+            if not use_route_bt:
+                self.get_logger().warn(
+                    '/compute_route is unavailable; falling back to the '
+                    'Nav2 default behavior tree (direct goal)')
+
+            self.get_logger().info(
+                f'  BT: {bt_file if bt_path else "Nav2 default (direct goal)"}')
 
             # Special handling for return_home - use home_pose key
             if mission_name == 'return_home':

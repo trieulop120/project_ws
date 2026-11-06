@@ -82,7 +82,11 @@ def main(args=None):
         except KeyboardInterrupt:
             pass
     node.destroy_node()
-    rclpy.shutdown()
+    # SIGINT handled by rclpy may already have shut down the default context.
+    # Avoid raising a second shutdown error while pallet_mission stops this
+    # short-lived detector process after sampling.
+    if rclpy.ok():
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -30,6 +30,7 @@ from tkinter import ttk, messagebox
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from rclpy.parameter import Parameter
 from rcl_interfaces.srv import SetParameters
 from std_msgs.msg import String
@@ -137,8 +138,8 @@ class SupervisorGUI(tk.Tk):
         super().__init__()
         self._node = node
         self.title('AMR Mission Supervisor')
-        self._w = 560
-        self.geometry(f'{self._w}x620')
+        self._window_width = 560
+        self.geometry(f'{self._window_width}x620')
 
         main = ttk.Frame(self, padding='12')
         main.pack(fill='both', expand=True)
@@ -192,7 +193,7 @@ class SupervisorGUI(tk.Tk):
                                            '----  (bit0->A1, bit1->A2, '
                                            'bit2->B1, bit3->B2; 1=co hang)')
         ttk.Label(main, textvariable=self._raw_var,
-                  font=('Arial', 9, 'monospace'),
+                  font=('monospace', 9),
                   foreground='#444444').pack(anchor='w')
 
         # Truyen do
@@ -305,9 +306,10 @@ class SupervisorGUI(tk.Tk):
 
     # ------------------------------------------------------------------
     def _on_start(self):
+        mode = self._mode_var.get()
         def start():
-            return self._node.call_set_mode(self._mode_var.get()) and self._node.call_start()
-        self._run_command(start, 'START ' + self._mode_var.get().upper())
+            return self._node.call_set_mode(mode) and self._node.call_start()
+        self._run_command(start, 'START ' + mode.upper())
 
     def _on_resume(self):
         status = self._node.last_status or {}
@@ -339,12 +341,18 @@ def main():
     app = SupervisorGUI(node)
 
     def spin_ros():
-        while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.1)
+        try:
+            while rclpy.ok():
+                rclpy.spin_once(node, timeout_sec=0.1)
+        except ExternalShutdownException:
+            # The Tk window may close while spin_once is waiting for work.
+            pass
 
     threading.Thread(target=spin_ros, daemon=True).start()
     app.mainloop()
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
+    node.destroy_node()
 
 
 if __name__ == '__main__':

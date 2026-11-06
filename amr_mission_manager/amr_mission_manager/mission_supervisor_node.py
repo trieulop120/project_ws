@@ -35,11 +35,13 @@ import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.parameter import Parameter
+from action_msgs.msg import GoalStatusArray
 from action_msgs.srv import CancelGoal
 from rcl_interfaces.srv import GetParameters, SetParameters
 from std_msgs.msg import String, Int8MultiArray
 from sensor_msgs.msg import Image
-from std_srvs.srv import SetBool, Trigger
+from nav_msgs.msg import Odometry
+from std_srvs.srv import Empty, SetBool, Trigger
 import tf2_ros
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -80,12 +82,18 @@ DEFAULTS = {
     'camera_stale_s': 2.0,
     'mission_manager_node': 'mission_manager',
     'pallet_mission_node': 'pallet_mission',
+    'graph_package': 'amr_navigation',
+    'graph_yaml_filename': 'route_graph.yaml',
     # Frames
     'map_frame': 'map',
     'base_frame': 'base_footprint',
+    'odom_topic': '/odometry/filtered',
+    'nav_status_topic': '/navigate_to_pose/_action/status',
     # Den choi GOTO_PICK
     'arrive_tol_m': 0.30,
     'arrive_settle_s': 1.0,
+    'arrive_max_linear_speed_mps': 0.03,
+    'arrive_max_angular_speed_rps': 0.08,
     'goto_timeout_s': 120.0,
     # PICKING
     'pick_sample_wait_s': 12.0,  # hard timeout; stop earlier after enough stable samples
@@ -118,6 +126,10 @@ class MissionSupervisor(Node):
         self.p = {k: self.get_parameter(k).value for k in DEFAULTS}
         self._client_group = ReentrantCallbackGroup()
         self._control_group = ReentrantCallbackGroup()
+        # Cache service clients. Creating clients on every 10 Hz timer retry
+        # leaks ROS entities and makes startup/recovery progressively less
+        # responsive when a server is offline.
+        self._service_clients = {}
 
         # ---------------- State ----------------
         self._state = IDLE
@@ -146,11 +158,17 @@ class MissionSupervisor(Node):
         self._stable_anchor = None
         self._active_mission = self.p['pick_mission']
         self._active_dest = self.p['pick_dest']
+        self._route_loader = None
         self._cycle = 0
         self._resume_state = None
         self._empty_scans = 0
         self._cancel_requested = False
         self._camera_last_t = 0.0
+        self._odom_t = 0.0
+        self._odom_linear_speed = None
+        self._odom_angular_speed = None
+        self._nav_status_t = 0.0
+        self._nav_goal_active = None
 
         # ---------------- TF ----------------
         self._tf_buffer = tf2_ros.Buffer()
@@ -164,6 +182,9 @@ class MissionSupervisor(Node):
                                  self._on_detector_status, 10)
         self.create_subscription(Image, self.p['camera_topic'], self._on_camera,
                                  qos_profile_sensor_data)
+        self.create_subscription(Odometry, self.p['odom_topic'], self._on_odom, 10)
+        self.create_subscription(
+            GoalStatusArray, self.p['nav_status_topic'], self._on_nav_status, 10)
 
         # W4 (loi 2 ESP serial -> /shelf/occupancy): 4 bit o ke, 1 = co hang;
         # [-1]*4 = mat ket noi. Doc truc tiep tu esp32_bridge. Anh xa
@@ -178,13 +199,13 @@ class MissionSupervisor(Node):
 
         # Services (khong GUI: GUI chinh la nut goi 2 service nay)
         self.create_service(
-            Trigger, f'/{NODE_NAME}/start', self._srv_start,
+            Trigger, '/mission/start', self._srv_start,
             callback_group=self._control_group)
         self.create_service(
-            Trigger, f'/{NODE_NAME}/stop', self._srv_stop,
+            Trigger, '/mission/stop', self._srv_stop,
             callback_group=self._control_group)
         self.create_service(
-            Trigger, f'/{NODE_NAME}/resume', self._srv_resume,
+            Trigger, '/mission/resume', self._srv_resume,
             callback_group=self._control_group)
 
         self._cancel_cli = self.create_client(CancelGoal,
@@ -229,7 +250,11 @@ class MissionSupervisor(Node):
         """Pose cua node cuoi cua pick_mission trong map (tu route graph)."""
         try:
             from amr_navigation.route_graph_loader import RouteGraphLoader
-            loader = RouteGraphLoader()
+            if self._route_loader is None:
+                self._route_loader = RouteGraphLoader(
+                    package_name=self.p['graph_package'],
+                    yaml_filename=self.p['graph_yaml_filename'])
+            loader = self._route_loader
             name = loader.resolve(self._active_dest)
             pose = loader.get_node_pose(name)
             if pose is None:
@@ -241,14 +266,24 @@ class MissionSupervisor(Node):
             return None
 
     def _call_service_result(self, cli, req, timeout: float = 5.0):
-        if not cli.wait_for_service(timeout_sec=5.0):
-            self.get_logger().warn(f'Service {cli.srv_name} chua san sang')
+        # Availability checks happen from the state-machine timer. Keep them
+        # short so a missing service cannot starve STOP/status/timer callbacks.
+        if not cli.wait_for_service(timeout_sec=min(max(timeout, 0.0), 0.2)):
             return None
         fut = cli.call_async(req)
         t_end = time.monotonic() + timeout
         while not fut.done() and time.monotonic() < t_end:
             time.sleep(0.02)
         return fut.result() if fut.done() else None
+
+    def _service_client(self, srv_type, service_name):
+        key = (srv_type, service_name)
+        client = self._service_clients.get(key)
+        if client is None:
+            client = self.create_client(srv_type, service_name,
+                                        callback_group=self._client_group)
+            self._service_clients[key] = client
+        return client
 
     def _call_service(self, cli, req) -> bool:
         return self._call_service_result(cli, req) is not None
@@ -258,8 +293,11 @@ class MissionSupervisor(Node):
         if self._cancel_requested:
             return False
         svc = f'/{self.p["mission_manager_node"]}/trigger_{mission}'
-        cli = self.create_client(Trigger, svc, callback_group=self._client_group)
-        req = Trigger.Request()
+        # mission_manager registers its trigger_* endpoints as std_srvs/Empty.
+        # Using Trigger here makes ROS 2 reject the client/server type match,
+        # so none of the navigation legs can start.
+        cli = self._service_client(Empty, svc)
+        req = Empty.Request()
         result = self._call_service_result(cli, req)
         if self._cancel_requested or result is None or not getattr(result, 'success', True):
             return False
@@ -274,6 +312,11 @@ class MissionSupervisor(Node):
         if requested_mode not in ('single', 'auto'):
             res.success = False
             res.message = "run_mode phai la 'single' hoac 'auto'"
+            return res
+        if self._pm_cargo is True:
+            res.success = False
+            res.message = ('Dang mang pallet; khong the bat dau chu ky pick moi. '
+                           'Dung /mission/resume sau khi kiem tra vi tri va tai.')
             return res
         if self._state not in (IDLE, DONE, FAILED, STOPPED):
             res.message = f'dang ban ({self._state}), dung /mission/stop truoc'
@@ -314,17 +357,24 @@ class MissionSupervisor(Node):
 
     def _srv_stop(self, req, res):
         # Huyen Nav2 (mission_manager) + pallet_mission (xe + lift)
+        carrying = self._pm_cargo is True
         self._cancel_requested = True
         try:
-            if self._cancel_cli.wait_for_service(timeout_sec=2.0):
+            if self._cancel_cli.wait_for_service(timeout_sec=0.2):
                 self._cancel_cli.call_async(CancelGoal.Request())
         except Exception:
             pass
-        cli = self.create_client(Trigger,
-                                 f'/{self.p["pallet_mission_node"]}/stop',
-                                 callback_group=self._client_group)
-        self._call_service(cli, Trigger.Request())
-        self._set_state(STOPPED, 'STOP (Nav2 + pallet_mission)')
+        cli = self._service_client(
+            Trigger, f'/{self.p["pallet_mission_node"]}/stop')
+        self._call_service_result(cli, Trigger.Request(), timeout=1.0)
+        if carrying:
+            # Keep a loaded robot out of the normal START path. Resume is an
+            # explicit operator action and continues toward the drop leg.
+            self._resume_state = GOTO_D
+            self._set_state('RECOVERY',
+                            'STOP khi dang mang pallet; kiem tra an toan roi RESUME de toi D_1')
+        else:
+            self._set_state(STOPPED, 'STOP (Nav2 + pallet_mission)')
         res.success = True
         res.message = 'stopped'
         return res
@@ -337,6 +387,7 @@ class MissionSupervisor(Node):
         self._resume_state = None
         self._triggered = False
         self._go_called = False
+        self._cancel_requested = False
         self._set_state(state, 'Resume tu checkpoint; da kiem tra an toan truoc khi bam')
         res.success, res.message = True, 'resumed'
         return res
@@ -363,8 +414,8 @@ class MissionSupervisor(Node):
         for src_key, (dst_key, ptype) in mapping.items():
             v = self.get_parameter(src_key).value
             params.append(Parameter(dst_key, ptype, v).to_parameter_msg())
-        cli = self.create_client(SetParameters, f'/{pm}/set_parameters', callback_group=self._client_group)
-        if not cli.wait_for_service(timeout_sec=5.0):
+        cli = self._service_client(SetParameters, f'/{pm}/set_parameters')
+        if not cli.wait_for_service(timeout_sec=0.2):
             self.get_logger().warn('SetParameters (pallet_mission) khong du - '
                                    'dung tham so mac dinh cua no')
             return
@@ -402,9 +453,8 @@ class MissionSupervisor(Node):
             self.get_logger().warn('[detector] no compatible shelf class is available')
             return False
 
-        get_cli = self.create_client(GetParameters, f'/{pm}/get_parameters',
-                                     callback_group=self._client_group)
-        if not get_cli.wait_for_service(timeout_sec=3.0):
+        get_cli = self._service_client(GetParameters, f'/{pm}/get_parameters')
+        if not get_cli.wait_for_service(timeout_sec=0.2):
             self.get_logger().warn('[detector] pallet_mission get_parameters unavailable')
             return False
         get_req = GetParameters.Request()
@@ -418,7 +468,20 @@ class MissionSupervisor(Node):
         if not get_future.done():
             return False
         try:
-            args = list(get_future.result().values[0].string_array_value.values)
+            parameter_value = get_future.result().values[0]
+            # ParameterValue.type is the generated message's integer enum;
+            # rclpy.Parameter.Type.STRING_ARRAY is a Python Enum wrapper.
+            if parameter_value.type != Parameter.Type.STRING_ARRAY.value:
+                raise TypeError(
+                    'expected STRING_ARRAY, got parameter type '
+                    f'{parameter_value.type}')
+            # rcl_interfaces exposes string_array_value as a plain Python
+            # list in current ROS 2 releases. Some generated wrappers expose
+            # an object with a `.values` member, so accept both forms.
+            raw_args = parameter_value.string_array_value
+            args = list(getattr(raw_args, 'values', raw_args))
+            if not all(isinstance(arg, str) for arg in args):
+                raise TypeError('string array contains a non-string value')
         except Exception as exc:
             self.get_logger().error(f'[detector] cannot read detector_extra_args: {exc}')
             return False
@@ -437,9 +500,8 @@ class MissionSupervisor(Node):
             i += 1
         clean.extend(['-p', 'target_cargo_classes:=' + ','.join(classes)])
 
-        set_cli = self.create_client(SetParameters, f'/{pm}/set_parameters',
-                                     callback_group=self._client_group)
-        if not set_cli.wait_for_service(timeout_sec=3.0):
+        set_cli = self._service_client(SetParameters, f'/{pm}/set_parameters')
+        if not set_cli.wait_for_service(timeout_sec=0.2):
             return False
         set_req = SetParameters.Request()
         set_req.parameters = [Parameter('detector_extra_args',
@@ -477,6 +539,33 @@ class MissionSupervisor(Node):
 
     def _on_camera(self, _msg: Image):
         self._camera_last_t = time.monotonic()
+
+    def _on_odom(self, msg: Odometry):
+        twist = msg.twist.twist
+        self._odom_linear_speed = math.hypot(twist.linear.x, twist.linear.y)
+        self._odom_angular_speed = abs(twist.angular.z)
+        self._odom_t = time.monotonic()
+
+    def _robot_stopped(self, now: float) -> bool:
+        """Require fresh odometry and low measured speed before pallet detection."""
+        return (
+            self._odom_t > 0.0
+            and now - self._odom_t <= 0.5
+            and self._odom_linear_speed is not None
+            and self._odom_angular_speed is not None
+            and self._odom_linear_speed <= float(self.p['arrive_max_linear_speed_mps'])
+            and self._odom_angular_speed <= float(self.p['arrive_max_angular_speed_rps'])
+        )
+
+    def _navigation_idle(self, now: float) -> bool:
+        """Only hand control to pallet_mission after the Nav2 goal has ended."""
+        return (self._nav_status_t > 0.0 and now - self._nav_status_t <= 2.0
+                and self._nav_goal_active is False)
+
+    def _on_nav_status(self, msg: GoalStatusArray):
+        # GoalStatus constants: ACCEPTED=1, EXECUTING=2, CANCELING=3.
+        self._nav_goal_active = any(s.status in (1, 2, 3) for s in msg.status_list)
+        self._nav_status_t = time.monotonic()
 
     def _on_detector_status(self, msg: String):
         try:
@@ -661,8 +750,8 @@ class MissionSupervisor(Node):
             # Re-select while travelling; pass the selected slot through the
             # existing pallet_mission parameter/service contract.
             self._drop_slot_chosen = (sid, frame)
-            cli = self.create_client(SetParameters, f'/{pm}/set_parameters', callback_group=self._client_group)
-            if not cli.wait_for_service(timeout_sec=1.0):
+            cli = self._service_client(SetParameters, f'/{pm}/set_parameters')
+            if not cli.wait_for_service(timeout_sec=0.2):
                 self._set_state('RECOVERY', 'Pallet mission set_parameters chua san sang')
                 self._resume_state = DROPPING
                 return
@@ -681,8 +770,8 @@ class MissionSupervisor(Node):
                 self._set_state('RECOVERY', 'Khong dat duoc drop_slot cho pallet_mission')
                 self._resume_state = DROPPING
                 return
-            drop = self.create_client(Trigger, f'/{pm}/drop', callback_group=self._client_group)
-            if not drop.wait_for_service(timeout_sec=1.0):
+            drop = self._service_client(Trigger, f'/{pm}/drop')
+            if not drop.wait_for_service(timeout_sec=0.2):
                 self._set_state('RECOVERY', 'Pallet mission drop service chua san sang')
                 self._resume_state = DROPPING
                 return
@@ -729,6 +818,14 @@ class MissionSupervisor(Node):
             elif now - self._t_state > 30.0:
                 self._set_state('RECOVERY', 'Khong goi duoc return_home')
                 self._resume_state = 'RETURN_HOME'
+            return
+        if now - self._t_state > float(self.p['goto_timeout_s']):
+            try:
+                self._cancel_cli.call_async(CancelGoal.Request())
+            except Exception:
+                pass
+            self._set_state('RECOVERY', 'Ve HOME qua timeout; da yeu cau huy goal Nav2')
+            self._resume_state = 'RETURN_HOME'
             return
         dest, pose = self._dest_pose(), self._base_pose()
         if dest is None or pose is None:
@@ -789,9 +886,13 @@ class MissionSupervisor(Node):
             return
         d = math.hypot(pose[0] - dest[0], pose[1] - dest[1])
         if d <= float(self.p['arrive_tol_m']):
-            if self._near_t0 is None:
+            if not self._navigation_idle(now) or not self._robot_stopped(now):
+                # Position alone is insufficient. Wait for the current Nav2
+                # action to finish and for the base to stop before detection.
+                self._near_t0 = None
+            elif self._near_t0 is None:
                 self._near_t0 = now
-            if now - self._near_t0 >= float(self.p['arrive_settle_s']):
+            elif now - self._near_t0 >= float(self.p['arrive_settle_s']):
                 self._near_t0 = None
                 if not self._shelf_ok() or self._shelf_bits is None:
                     self._set_state('RECOVERY', 'Du lieu cam bien ke stale/mat ket noi tai P_1')
@@ -836,7 +937,7 @@ class MissionSupervisor(Node):
 
         if self._pick_phase == S_SAMPLING:
             if not self._detect_on_called:
-                cli = self.create_client(SetBool, f'/{pm}/detect', callback_group=self._client_group)
+                cli = self._service_client(SetBool, f'/{pm}/detect')
                 req = SetBool.Request()
                 req.data = True
                 response = self._call_service_result(cli, req)
@@ -858,7 +959,7 @@ class MissionSupervisor(Node):
                 self._t_state = now
                 self._detect_on_called = False
                 self._go_called = False
-                cli = self.create_client(SetBool, f'/{pm}/detect', callback_group=self._client_group)
+                cli = self._service_client(SetBool, f'/{pm}/detect')
                 req = SetBool.Request()
                 req.data = False
                 res = self._call_service_result(cli, req)
@@ -911,7 +1012,7 @@ class MissionSupervisor(Node):
                 self._start_return_home(f'Khong co o phu hop cho pallet {self._pm_cargo_type or "?"}: {why}')
                 return
             self._drop_slot_chosen = (sid, frame)
-            cli = self.create_client(Trigger, f'/{pm}/go_to_pallet', callback_group=self._client_group)
+            cli = self._service_client(Trigger, f'/{pm}/go_to_pallet')
             res = self._call_service_result(cli, Trigger.Request())
             if self._cancel_requested:
                 return
@@ -956,6 +1057,7 @@ class MissionSupervisor(Node):
             self._set_state(STOPPED, 'pallet_mission STOPPED')
         elif pm_state == 'CARRYING':
             self._empty_scans = 0
+            self._retries = 0
             ctype = self._pm_cargo_type
             sid, frame, why = self._select_drop_slot_for(ctype)
             if sid is None:

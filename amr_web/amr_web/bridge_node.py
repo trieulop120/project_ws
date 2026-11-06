@@ -303,6 +303,9 @@ class WebBridge(Node):
         # Initialize History (HISTORY_RESULTS_PLAN.md §6). Soft-fail.
         self._init_history()
 
+        # LLM voice/command bridge
+        self._init_llm()
+
     def set_camera_stream(self, enable: bool, mode: str = 'off') -> None:
         """Bật/tắt camera stream dynamic theo yêu cầu từ Web SCADA."""
         self._camera_streaming = enable
@@ -322,6 +325,20 @@ class WebBridge(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to init NavBridge: {e}')
             self._nav_bridge = None
+
+    def _init_llm(self) -> None:
+        """LLM bridge (lệnh tiếng Việt/giọng nói). Soft-fail: dashboard vẫn chạy nếu lỗi."""
+        self.llm = None
+        try:
+            from amr_llm.llm_bridge import LLMBridge
+            self.llm = LLMBridge(
+                node=self,
+                broadcast=lambda d: self.broadcast_threadsafe(json.dumps(d)))
+            if self._verbose:
+                self.get_logger().info('LLMBridge initialized')
+        except Exception as e:
+            self.get_logger().error(f'Failed to init LLMBridge: {e}')
+            self.llm = None
 
     def _init_history(self) -> None:
         """Initialise the operation history subsystem (additive, soft-fail)."""

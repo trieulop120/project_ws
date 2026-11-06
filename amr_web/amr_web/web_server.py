@@ -446,6 +446,14 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
 
+        elif command.startswith("llm_"):
+            llm = getattr(bridge_node, "llm", None) if bridge_node else None
+            if llm:
+                result.update(llm.handle(cmd))
+            else:
+                result["status"] = "error"
+                result["message"] = "LLM bridge not available"
+
         else:
             result["status"] = "unknown"
             result["message"] = f"Unknown command: {command}"
@@ -500,6 +508,10 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                     "is_slam_active": bridge_node.get_slam_state()
                 }))
                 await ws_manager.send(websocket, json.dumps(bridge_node.get_nav_state()))
+                _llm = getattr(bridge_node, "llm", None)
+                if _llm and _llm.last_status is not None:
+                    await ws_manager.send(websocket, json.dumps(
+                        {"type": "llm_status", "data": _llm.last_status}))
 
             # P1-9 Fix: Proper error handling, don't swallow exceptions
             while True:

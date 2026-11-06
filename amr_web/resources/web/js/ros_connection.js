@@ -235,6 +235,11 @@ function connect() {
                         if (window.isSlamActive) break;
                         if (window.mapRenderer && window.mapRenderer.setPlan) window.mapRenderer.setPlan(d);
                         break;
+
+                    // LLM assistant (llm_voice.js)
+                    case 'llm_status':
+                        if (typeof window.handleLLMStatus === 'function') window.handleLLMStatus(d);
+                        break;
                 }
             } catch (err) {
                 console.warn('WebSocket message error:', err.message);

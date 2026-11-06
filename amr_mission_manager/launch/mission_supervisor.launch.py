@@ -17,9 +17,12 @@ Vidu:
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.substitutions import FindPackageShare
+
 
 
 def _arg(name, default, desc):
@@ -79,6 +82,7 @@ def generate_launch_description():
         _arg('run_mode', 'single', 'single: 1 chu ky + HOME | auto: lap den khi het pallet/slot'),
         _arg('mission_manager_node', MISSION_MANAGER_NODE, 'ten node mission_manager'),
         _arg('pallet_mission_node', PALLET_MISSION_NODE, 'ten node pallet_mission'),
+        _arg('graph_package', 'amr_navigation', 'package chua route graph dung chung'),
         _arg('shelf_topic', SHELF_TOPIC, 'topic 4 bit o ke tu esp32_bridge (Int8MultiArray)'),
         _arg('shelf_stale_s', SHELF_STALE_S, 'khe stal > nguong -> coi mat ket noi (s)'),
         _arg('camera_topic', '/color/image_raw', 'camera heartbeat de phan biet camera loi voi het pallet'),
@@ -101,6 +105,10 @@ def generate_launch_description():
              'ap len pallet_mission: true = nhan duong "KHONG ON DINH"'),
         _arg('arrive_tol_m', '0.30', 'ban kinh "da den" node pick (m)'),
         _arg('arrive_settle_s', '1.0', 'thoi gian on dinh khi "da den" (s)'),
+        _arg('arrive_max_linear_speed_mps', '0.03',
+             'van toc tinh toi da de bat detect tai P_1 (m/s)'),
+        _arg('arrive_max_angular_speed_rps', '0.08',
+             'van toc quay toi da de bat detect tai P_1 (rad/s)'),
         _arg('goto_timeout_s', '120.0', 'gioi thoi gian ve node pick (s)'),
         _arg('pick_retries', '2', 'so lan thu detect lai khi that (lan)'),
         # Rack TF
@@ -113,6 +121,8 @@ def generate_launch_description():
              'chu ki quan sat anchor (s), chi ap khi rack_publish_once=false'),
         # GUI
         _arg('gui', WITH_GUI, 'chay supervisor_gui (nut START/STOP)'),
+        _arg('with_pallet_mission', 'true',
+             'true: chay luon mission_manager + pallet_mission (khong can launch rieng)'),
     ]
 
     from launch_ros.actions import Node
@@ -134,6 +144,8 @@ def generate_launch_description():
             'run_mode': LaunchConfiguration('run_mode'),
             'mission_manager_node': LaunchConfiguration('mission_manager_node'),
             'pallet_mission_node': LaunchConfiguration('pallet_mission_node'),
+            'graph_package': LaunchConfiguration('graph_package'),
+            'graph_yaml_filename': LaunchConfiguration('rack_graph_yaml'),
             'shelf_topic': LaunchConfiguration('shelf_topic'),
             'shelf_stale_s': pv('shelf_stale_s', float),
             'camera_topic': LaunchConfiguration('camera_topic'),
@@ -149,6 +161,8 @@ def generate_launch_description():
             'pm_require_stable': pv('pm_require_stable', bool),
             'arrive_tol_m': pv('arrive_tol_m', float),
             'arrive_settle_s': pv('arrive_settle_s', float),
+            'arrive_max_linear_speed_mps': pv('arrive_max_linear_speed_mps', float),
+            'arrive_max_angular_speed_rps': pv('arrive_max_angular_speed_rps', float),
             'goto_timeout_s': pv('goto_timeout_s', float),
             'pick_retries': pv('pick_retries', int),
         }],
@@ -161,6 +175,7 @@ def generate_launch_description():
         output='screen',
         condition=IfCondition(LaunchConfiguration('with_rack_tf')),
         parameters=[{
+            'graph_package': LaunchConfiguration('graph_package'),
             'graph_yaml_filename': LaunchConfiguration('rack_graph_yaml'),
             'publish_once': pv('rack_publish_once', bool),
             'check_interval_s': pv('rack_check_interval_s', float),
@@ -175,4 +190,24 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('gui')),
     )
 
-    return LaunchDescription(args + [supervisor, rack_tf, gui])
+    pallet_stack = GroupAction(
+        scoped=True,
+        condition=IfCondition(LaunchConfiguration('with_pallet_mission')),
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(PathJoinSubstitution([
+                    FindPackageShare('amr_mission_manager'),
+                    'launch', 'pallet_mission.launch.py'])),
+                launch_arguments={
+                    'gui': 'false',                 # khong bat pallet_gui (tranh chen lenh)
+                    'with_rack_tf': 'false',        # rack_tf_publisher da chay o day
+                    'with_mission_manager': 'true',
+                    'after_pick': 'hold',           # bat buoc cho supervisor
+                    'graph_package': LaunchConfiguration('graph_package'),
+                    'graph_yaml_filename': LaunchConfiguration('rack_graph_yaml'),
+                }.items(),
+            ),
+        ],
+    )
+
+    return LaunchDescription(args + [pallet_stack, supervisor, rack_tf, gui])
