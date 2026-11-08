@@ -1869,7 +1869,10 @@
 /* Tỷ lệ cột chuẩn hóa 3 Cột: Cột trái (280px), Cột giữa (Flex), Cột phải (280px) đồng bộ với SLAM/Overview */
 .nav-main-grid {
   display: grid;
-  grid-template-columns: 280px 1fr 280px; 
+  grid-template-columns: 280px 1fr 280px;
+  /* Một hàng duy nhất cao đúng bằng grid (minmax(0,1fr) = co được,
+     nếu để auto thì hàng cao theo nội dung và cột phải bị đẩy dài xuống) */
+  grid-template-rows: minmax(0, 1fr);
   gap: 12px; /* Đồng bộ khoảng cách 12px */
   flex: 1;
   min-height: 0;
@@ -1881,6 +1884,12 @@
   gap: 12px; /* Khoảng cách giữa các Card theo chiều dọc */
   overflow-y: auto;
   min-height: 0;
+}
+
+/* Camera + Quick Goals: giữ nguyên chiều cao, không bị bóp méo khi
+   card AI Assistant bên dưới chiếm phần trống còn lại của cột */
+.nav-right-col > .panel-card:not(.card-llm) {
+  flex: none;
 }
 
 .nav-center-col {
@@ -2056,15 +2065,40 @@
   pointer-events: none;
 }
 
+/* Card AI Assistant (LLM): chiều cao bám theo cột phải,
+   ô chat CUỘN BÊN TRONG thay vì kéo giãn card.
+   min-height:0 ở mọi tầng là bắt buộc - nếu không, flex item sẽ giữ
+   chiều cao nội dung (automatic minimum size) và card bị đẩy dài xuống. */
+.panel-card.card-llm {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-card.card-llm > .panel-card-header {
+  flex: none;
+}
+
+.panel-card.card-llm > .panel-card-body {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Ô chat: vùng duy nhất được phép cuộn dọc */
 .ai-chat-box {
-  flex: 1;
+  flex: 1 1 0;
+  min-height: 0;
   background: var(--bg-primary);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 12px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   font-size: 0.75rem;
-  min-height: 80px;
 }
 
 /* Nút Accent dạng viền (Outline) */

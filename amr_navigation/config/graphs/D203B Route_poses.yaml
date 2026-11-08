@@ -7,14 +7,14 @@ poses:
         frame_id: map
       pose:
         position:
-          x: 0.055
-          y: -0.061
+          x: 0.027
+          y: 0.025
           z: 0.0
         orientation:
           x: 0.0
           y: 0.0
-          z: 0.018198995255307392
-          w: 0.9998343845716136
+          z: -0.006499954229263357
+          w: 0.9999788750743775
   P_1:
     id: 1
     pose_stamped:
@@ -22,14 +22,14 @@ poses:
         frame_id: map
       pose:
         position:
-          x: 1.7746
-          y: 0.51257
+          x: 1.764
+          y: 0.562
           z: 0.0
         orientation:
           x: 0.0
           y: 0.0
-          z: -0.68521
-          w: 0.72835
+          z: -0.7321683386151737
+          w: 0.6811237214555784
   P_2:
     id: 2
     pose_stamped:
@@ -38,7 +38,7 @@ poses:
       pose:
         position:
           x: -2.96
-          y: -0.08
+          y: 0.2
           z: 0.0
         orientation:
           x: 0.0
@@ -52,11 +52,11 @@ poses:
         frame_id: map
       pose:
         position:
-          x: 2.46
-          y: 2.33
+          x: 2.616
+          y: 2.16
           z: 0.0
         orientation:
           x: 0.0
           y: 0.0
-          z: 0.7071080798594735
-          w: 0.7071054825112363
+          z: 0.7004301464035808
+          w: 0.7137209608867168

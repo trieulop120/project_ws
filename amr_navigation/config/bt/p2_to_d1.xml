@@ -4,15 +4,23 @@
   start_id = 2 (P_2)
   goal_id  = 3 (D_1)
 
-  Flow:
-    1. ComputeRoute + FollowPath (primary)
-    2. If aborted → ComputePathToPose + FollowPath (fallback)
-       Nav2 will replan around obstacles
+  Hybrid navigation (Route → Free):
+    1. Nhanh: ComputeRoute + FollowPath  (di theo route graph, tuan thu luong giao thong)
+    2. Fallback: ComputePathToPose + FollowPath  (Nav2 tu tim duong bang costmap)
+       -> BT Fallback tu dong nhay sang nhanh 2 khi route_server loi
+          (graph malformed / thieu edge / 2 diem khong noi duoc).
+
+  QUAN TRONG: tach 2 blackboard key rieng ({route_path} va {free_path}).
+  Khong dung chung {path} cho ca 2 nhanh - tranh xung dot bo nho controller.
+
+  ID phai khop thu tu node trong 'D203B Route.yaml':
+    0=NODE_HOME 1=P_1 2=P_2 3=D_1
+  (mission_manager_node.py kiem tra (start_id, goal_id) truoc khi gui goal.)
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <Fallback name="p2_to_d1_fallback">
-      <!-- Primary: Route-based navigation -->
+    <Fallback name="hybrid_nav">
+      <!-- CHINH: uu tien di theo route -->
       <Sequence name="route_nav">
         <SetBlackboard value="2" output_key="my_start_id"/>
         <SetBlackboard value="3" output_key="my_goal_id"/>
@@ -22,19 +30,16 @@
           goal_id="{my_goal_id}"
           use_start="false"
           use_poses="false"
-          path="{path}"
+          path="{route_path}"
           route="{route}"/>
 
-        <FollowPath path="{path}"/>
-
-        <ComputePathToPose goal="{goal}" path="{path}"/>
-        <FollowPath path="{path}"/>
+        <FollowPath path="{route_path}"/>
       </Sequence>
 
-      <!-- Fallback: Direct Nav2 navigation (replan around obstacles) -->
-      <Sequence name="direct_nav">
-        <ComputePathToPose goal="{goal}" path="{fallback_path}"/>
-        <FollowPath path="{fallback_path}"/>
+      <!-- FALLBACK: route_server loi -> Nav2 free navigation -->
+      <Sequence name="free_nav">
+        <ComputePathToPose goal="{goal}" path="{free_path}"/>
+        <FollowPath path="{free_path}"/>
       </Sequence>
     </Fallback>
   </BehaviorTree>

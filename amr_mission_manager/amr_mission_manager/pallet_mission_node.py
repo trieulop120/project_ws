@@ -18,7 +18,7 @@ Luong:
                       qua cong: giu huong, siêu am dung
                    -> LIFTING : nang lift len lift_height_cm (mac dinh 5 cm)
                    -> BACKING : lui thang backoff_m = 0.40 m (neu backoff_m = 0 thi dung handoff_m)
-                   -> HOMING  : Nav2 ve Home (set_home hoac home_x/home_y/home_yaw_deg)
+                   -> HOMING  : Nav2 ve HOME trong graph do Nav2 launch chon (hoac set_home)
                    -> LOWERING: ha lift ve 0 (lenh HOME)
                    -> DONE    : xong 1 chu trinh
     [STOP]       -> huy Nav2, dung xe, DUNG LIFT (M0), tat detector
@@ -126,10 +126,10 @@ DEFAULTS = {
     'max_pos_std_m': 0.03,
     'max_yaw_std_deg': 3.0,
     'require_stable': True,
-    'max_tf_jump_m': 0.03,          # map->odom nhay > nguong trong luc detect -> khong on dinh
-    'max_tf_jump_deg': 1.5,
+    'max_tf_jump_m': 0.05,          # map->odom nhay > nguong trong luc detect -> khong on dinh
+    'max_tf_jump_deg': 2.5,
     # hieu chinh he thong (khung pallet: +x vao pallet, +y trai)
-    'pallet_lat_offset_m': 0.0,     # >0 dich diem dich sang TRAI huong vao pallet
+    'pallet_lat_offset_m': -0.02,     # >0 dich diem dich sang TRAI huong vao pallet
     'pallet_yaw_offset_deg': 0.0,
     'face_offset_m': 0.0,           # vi tri mat truoc so voi diem detector, doc +X
     # Hieu chinh LECH DO NGHIENG: detector lay tia qua pixel TAM OBB nhung do sau = percentile
@@ -158,11 +158,11 @@ DEFAULTS = {
                                     # (CONVERGE + Stanley tu keo yaw ve ~0 truoc cong, cong kiem lai <= gate_yaw_deg)
     'pulse_zone_deg': 8.0,          # lech < nguong nay: xoay tung NHIP ngan roi dung do (khong xoay lien tuc)
     'pulse_gain': 0.6,              # moi nhip xoay ~60% goc con lai; tu giam 1/2 neu phat hien vot qua
-    'max_pulses': 10,
+    'max_pulses': 14,
     'rot_settle_s': 0.5,
-    'lat_tol_cm': 1.5,              # lech ngang > nguong -> di ngang
+    'lat_tol_cm': 2.5,              # lech ngang > nguong -> di ngang (cong gate_lat_cm van bat 2cm)
     'max_sidestep_m': 0.30,
-    'max_sidesteps': 3,
+    'max_sidesteps': 2,
     'side_speed': 0.05,
     'side_tol_deg': 3.0,
     'side_accept_deg': 6.0,
@@ -196,11 +196,12 @@ DEFAULTS = {
     'us_arm_m': 0.10,               # chi tin sieu am sau khi da di vao >= 10 cm tu cong
     'us_below_min_is_close': True,  # doc < min_range cung tinh la "sat"
     'max_insert_m': 0.90,           # quang toi da tu cong (= chieu dai cang + du)
-    'insert_timeout_s': 40.0,
-    'align_timeout_s': 40.0,
-    'total_timeout_s': 180.0,
-    'range_stale_s': 0.5,
-    'tf_stale_s': 0.5,
+    'insert_timeout_s': 60.0,
+    'align_timeout_s': 60.0,
+    'total_timeout_s': 300.0,
+    'range_stale_s': 0.7,
+    'tf_stale_s': 1.0,
+    'tf_miss_max': 40,              # so nhip control (20Hz) mat TF lien tiep moi FAILED (xe dung yen khi cho)
     # lift
     'esp32_cmd_topic': '/esp32_cmd',
     'joint_states_topic': '/joint_states',
@@ -209,12 +210,12 @@ DEFAULTS = {
     'lift_height_cm': 5.0,          # chieu cao nang (cm)
     'lift_tol_cm': 1.0,
     'lift_timeout_s': 150.0,
-    'lift_start_timeout_s': 4.0,
+    'lift_start_timeout_s': 6.0,
     'lift_move_eps_cm': 0.3,
     'lift_settle_s': 0.5,            # sau khi lift dat du chieu cao (nang/ha): cho
                                       # on dinh `lift_settle_s` (vung bi, lech vai mm)
                                       # roi moi sang buoc ke. 0 = tat.
-    'joint_stale_s': 1.0,
+    'joint_stale_s': 2.0,
     # sau khi nang: lui -> ve Home -> ha lift
     'backoff_m': 0.50,              # quang lui (m); 0 = dung handoff_m
     'backoff_speed': 0.08,          # toc do lui (m/s)
@@ -237,19 +238,16 @@ DEFAULTS = {
     'drop_stage_m': 0.90,           # base_footprint -> mat ke luc bat dau (= D_1 -> mat ke)
     'drop_rot_clear_m': 0.60,       # cho de xoay tai cho khi dang mang pallet
     'drop_max_sidestep_m': 0.80,    # cho phep di ngang toi 0.60 m (cot A / B2)
-    'drop_side_speed': 0.08,
+    'drop_side_speed': 0.05,
     'drop_gate_margin_m': 0.10,     # cong cach mat ke (tinh tu mui cang)
     'drop_insert_speed': 0.08,
     'drop_max_insert_m': 1.20,      # chot an toan, KHONG phai do sau ke
     'drop_clear_m': 0.30,           # lui ra cho mui cang cach mat ke >= nay roi ha lift
     'drop_backoff_min_m': 0.50,
     'drop_backoff_timeout_s': 40.0,
-    'drop_total_timeout_s': 360.0,
-    # Home = NODE_HOME trong route graph (khung map). Dung cung BT return_home.xml nhu mission_manager.
-    'home_set': True,               # True: dung home_x/home_y/home_yaw_deg (khung map)
-    'home_x': 0.055,
-    'home_y': -0.061,
-    'home_yaw_deg': 2.086,          # yaw 0.0364 rad
+    'drop_total_timeout_s': 480.0,
+    # HOME pose is supplied by the active Nav2 launch via
+    # /navigation/route_yaml_path; set_home remains an explicit runtime override.
     'lower_on_detect': True,        # bam Detect ON thi ha lift ve Home (lenh lift_home_cmd)
     'lift_home_cmd': 'HOME',        # lenh ha lift ve 0 (giong nut Lift HOME)
     'lift_home_tol_cm': 1.0,        # lift <= nguong nay thi coi la da ve Home
@@ -259,6 +257,12 @@ DEFAULTS = {
     'map_yaw_trim': False,          # True: truoc khi tien vao, chinh lai huong theo yaw MAP hien tai
                                     # (AMCL) thay vi yaw odom da dong bang luc detect
     'amcl_shift_fail_m': 0.60,
+    # Drop: chup lai pose o ke theo map->odom MOI NHAT khi toi CONVERGE (sau khi xe xoay/di ngang).
+    # Luon LOG do dich; chi AP DUNG khi drop_map_trim=True. Tach rieng voi map_yaw_trim (pick).
+    'drop_map_trim': True,
+    'drop_trim_shift_cm': 2.0,      # dich > nguong -> canh lai
+    'drop_trim_yaw_deg': 1.0,       # xoay > nguong -> canh lai
+    'drop_trim_max_shift_m': 0.15,  # dich > nguong nay: nghi ngo AMCL nhay -> KHONG ap dung, chi canh bao
     # marker
     'face_width_m': 1.2,
 }
@@ -746,6 +750,11 @@ class PalletMission(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                              reliability=ReliabilityPolicy.RELIABLE)
         self.pub_status = self.create_publisher(String, f'/{NODE_NAME}/status', 10)
+        route_qos = QoSProfile(depth=1)
+        route_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        route_qos.reliability = ReliabilityPolicy.RELIABLE
+        self._route_path_sub = self.create_subscription(
+            String, '/navigation/route_yaml_path', self._on_route_path, route_qos)
         self.pub_markers = self.create_publisher(MarkerArray, f'/{NODE_NAME}/markers', 10)
         self.pub_pallet = self.create_publisher(PoseStamped, f'/{NODE_NAME}/pallet_pose', latched)
         self.pub_pre = self.create_publisher(PoseStamped, f'/{NODE_NAME}/pre_pose', latched)
@@ -792,9 +801,12 @@ class PalletMission(Node):
                                float(self.p['rot_clear_m']) + 0.03)
 
     # ==================================================================
-    def _set_state(self, state: str, msg: str = ''):
+    def _set_state(self, state: str, msg: str = '', fail_phase=None):
         self._state = state
         self._msg = msg
+        # pha ApproachController luc FAILED (None neu khong phai loi approach) -> supervisor
+        # chi tu thu lai khi cang chua vao pallet/ke.
+        self._fail_phase = fail_phase if state == FAILED else None
         self.get_logger().info(f'[{state}] {msg}')
         self._publish_status()
 
@@ -836,6 +848,7 @@ class PalletMission(Node):
              'sel': {'cargo': str(self.get_parameter('cargo_type_override').value),
                      'slot': str(self.get_parameter('drop_slot').value)},
              'phase': self._ctl.phase if self._state in (ALIGNING, INSERTING) else None,
+             'fail_phase': getattr(self, '_fail_phase', None),
              'err': err}
         m = String()
         m.data = json.dumps(d)
@@ -949,21 +962,40 @@ class PalletMission(Node):
             res.success, res.message = False, 'Khong doc duoc TF map->base'
             return res
         self._home = r
-        msg = (f'Home = ({r[0]:.3f}, {r[1]:.3f}, {math.degrees(r[2]):.1f}deg). '
-               f'Ghi vao DEFAULTS: home_set=True, home_x={r[0]:.3f}, home_y={r[1]:.3f}, '
-               f'home_yaw_deg={math.degrees(r[2]):.1f}')
+        msg = (f'Home runtime override = ({r[0]:.3f}, {r[1]:.3f}, '
+               f'{math.degrees(r[2]):.1f}deg)')
         self.get_logger().info('[home] ' + msg)
         res.success, res.message = True, msg
         return res
 
+    def _on_route_path(self, msg: String):
+        """Take HOME from the graph selected by the active Nav2 launch."""
+        try:
+            from amr_navigation.route_graph_loader import RouteGraphLoader
+            loader = RouteGraphLoader(yaml_path=msg.data)
+            home_name = loader.resolve('HOME')
+            if home_name is None:
+                names = loader.get_all_node_names()
+                home_name = next((name for name in names
+                                  if 'HOME' in name.upper()), None)
+            home_pose = loader.get_node_pose(home_name) if home_name else None
+            if home_pose is None:
+                raise ValueError('graph khong co node HOME')
+            q = home_pose.pose.orientation
+            self._home = (home_pose.pose.position.x, home_pose.pose.position.y,
+                          math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                     1.0 - 2.0 * (q.y * q.y + q.z * q.z)))
+            self.get_logger().info(
+                f'HOME loaded from active Nav2 graph {msg.data}: '
+                f'({self._home[0]:.3f}, {self._home[1]:.3f}, '
+                f'{math.degrees(self._home[2]):.1f}deg)')
+        except Exception as e:
+            self._home = None
+            self.get_logger().error(f'Cannot load HOME from active Nav2 graph {msg.data}: {e}')
+
     def _get_home(self):
-        """Home dang dung: tu set_home, neu khong thi tu tham so (home_set=True)."""
-        if self._home is not None:
-            return self._home
-        if self.p['home_set']:
-            return (float(self.p['home_x']), float(self.p['home_y']),
-                    math.radians(float(self.p['home_yaw_deg'])))
-        return None
+        """HOME from active Nav2 graph, overridden by explicit set_home."""
+        return self._home
 
     # ==================================================================
     # Detector process
@@ -1350,17 +1382,17 @@ class PalletMission(Node):
         for _ in range(3):
             self._cmd(0.0, 0.0)
 
-    def _finish(self, state: str, msg: str):
+    def _finish(self, state: str, msg: str, fail_phase=None):
         self._halt()
-        self._set_state(state, msg)
+        self._set_state(state, msg, fail_phase=fail_phase)
 
     def _control(self, now: float):
         pose = self._robot_pose(self.p['insertion_frame'])
         if pose is None:
             self._cmd(0.0, 0.0)
             self._tf_miss += 1
-            if self._tf_miss >= 6:
-                self._finish(FAILED, 'Mat TF robot -> dung xe')
+            if self._tf_miss >= int(self.p['tf_miss_max']):
+                self._finish(FAILED, 'Mat TF robot -> dung xe', fail_phase=self._ctl.phase)
             return
         self._tf_miss = 0
         us_fresh = (now - self._us_t) <= self.p['range_stale_s']
@@ -1372,7 +1404,8 @@ class PalletMission(Node):
 
         if fail:
             e_lat, e_yaw, a = self._ctl.err
-            self._finish(FAILED, f'{fail} [lat={e_lat * 100:+.1f}cm yaw={math.degrees(e_yaw):+.1f}deg]')
+            self._finish(FAILED, f'{fail} [lat={e_lat * 100:+.1f}cm yaw={math.degrees(e_yaw):+.1f}deg]',
+                         fail_phase=self._ctl.phase)
             return
         if done:
             self._ins_msg = done
@@ -1410,6 +1443,31 @@ class PalletMission(Node):
                     self.get_logger().warn(f'map_yaw_trim: chinh huong duong pallet {delta:+.1f} deg theo yaw MAP, canh lai')
                     self._phase_shown = None
                     return
+        if self._mode == 'drop' and ph == 'CONVERGE' and self._drop_lifted and not self._trimmed:
+            self._trimmed = True
+            slot_map = self._tf_pose(self.p['map_frame'], self._drop['frame'])
+            now_ins = self._map_to_ins(*slot_map) if slot_map is not None else None
+            if now_ins is not None:
+                shift = math.hypot(now_ins[0] - self._line[0], now_ins[1] - self._line[1])
+                dyaw = math.degrees(norm_angle(now_ins[2] - self._line[2]))
+                self.get_logger().info(
+                    f'[diag] DROP truoc khi vao: pose o ke theo map->odom hien tai dich '
+                    f'{shift * 100:.1f} cm / {dyaw:+.1f} deg so voi luc bat dau '
+                    f'(drop_map_trim={self.p["drop_map_trim"]})')
+                if self.p['drop_map_trim']:
+                    if shift > float(self.p['drop_trim_max_shift_m']):
+                        self.get_logger().warn(
+                            f'drop_map_trim: dich {shift * 100:.0f} cm qua lon, nghi AMCL nhay -> bo qua')
+                    elif (shift * 100.0 > float(self.p['drop_trim_shift_cm'])
+                          or abs(dyaw) > float(self.p['drop_trim_yaw_deg'])):
+                        self._line = now_ins
+                        self._halt()
+                        self._ctl.restart_align(now)
+                        self.get_logger().warn(
+                            f'drop_map_trim: cap nhat pose o ke theo AMCL (dich {shift * 100:.1f} cm, '
+                            f'xoay {dyaw:+.1f} deg) -> CANH LAI')
+                        self._phase_shown = None
+                        return
         if self._mode == 'pick' and ph in ('GATE', 'LOCK') and ph != self._phase_shown:
             my = self._map_yaw_err()
             self.get_logger().info(f'[diag] {ph}: lech yaw theo odom={math.degrees(self._ctl.err[1]):+.1f} deg, '
@@ -1537,8 +1595,8 @@ class PalletMission(Node):
     def _begin_home(self):
         home = self._get_home()
         if home is None:
-            self._set_state(FAILED, 'Chua dat Home: goi pallet_mission/set_home hoac dat '
-                                    'home_set/home_x/home_y/home_yaw_deg')
+            self._set_state(FAILED, 'Chua nhan HOME tu Nav2 route graph; '
+                                    'kiem tra route_graph_publisher hoac goi pallet_mission/set_home')
             return
         if not self._nav.server_is_ready():
             self._set_state(FAILED, 'NavigateToPose server chua san sang, khong ve Home duoc')
@@ -1807,6 +1865,7 @@ class PalletMission(Node):
         self._line = ins
         self._mode = 'drop'
         self._drop_lifted = False
+        self._trimmed = False       # moi lan Drop (ke ca thu lai) deu duoc trim 1 lan
         self._drop = {'slot': sid, 'level': lvl, 'type': ctype, 'frame': frame,
                       'insert_cm': insert_cm, 'release_cm': release_cm}
         self._tf_miss = 0

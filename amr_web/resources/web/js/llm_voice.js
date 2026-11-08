@@ -123,6 +123,14 @@
     const el = {};   // tham chiếu tới các phần tử giao diện
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
+    // Bộ icon SVG công nghiệp đồng bộ với hệ thống dashboard
+    const ICONS = {
+        mic: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>`,
+        micActive: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" fill="currentColor"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>`,
+        send: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`,
+        gear: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`
+    };
+
     // ============================================
     // Tiện ích
     // ============================================
@@ -169,7 +177,7 @@
         .llm-msg.sys.err{border:0}
         .llm-plan ol{margin:4px 0 8px;padding-left:18px}
         .llm-row{display:flex;gap:6px;align-items:center}
-        .llm-ctrl{display:flex;flex-direction:column;gap:6px;flex-shrink:0}
+        .llm-ctrl{display:flex;flex-direction:column;gap:6px;flex-shrink:0;flex-grow:0}
         .llm-head{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:1.5em}
         .llm-status{font-size:.68rem;color:var(--text-secondary,#94A3B3);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .llm-lang{background:var(--bg-primary,#0F1416);color:var(--text-secondary,#94A3B3);border:1px solid var(--border,#2A363B);
@@ -178,8 +186,10 @@
         .llm-in{flex:1;min-width:0;background:var(--bg-primary,#0F1416);color:var(--text-primary,#E2E8F0);
           border:1px solid var(--border,#2A363B);border-radius:6px;padding:8px;font:inherit}
         .llm-btn{border:1px solid var(--border,#2A363B);background:var(--bg-panel-secondary,#12181A);color:var(--text-primary,#E2E8F0);
-          border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit;flex-shrink:0}
-        .llm-btn:hover{border-color:var(--accent,#55DDBB)}
+          border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;transition:all .15s ease}
+        .llm-btn svg{width:15px;height:15px;transition:transform .15s ease}
+        .llm-btn:hover{border-color:var(--accent,#55DDBB);color:var(--accent,#55DDBB)}
+        .llm-btn:hover svg{transform:scale(1.1)}
         .llm-btn.ok{background:var(--accent,#55DDBB);color:#000;border-color:var(--accent,#55DDBB);font-weight:600}
         .llm-btn.live{background:var(--error,#F16C70);color:#fff;border-color:var(--error,#F16C70);animation:llmPulse 1.2s infinite}
         @keyframes llmPulse{50%{opacity:.6}}
@@ -187,8 +197,11 @@
         .llm-set.open{display:flex}
         .llm-set label{display:flex;align-items:center;gap:4px;cursor:pointer}
         .llm-set select{background:var(--bg-primary,#0F1416);color:var(--text-primary,#E2E8F0);border:1px solid var(--border,#2A363B);border-radius:4px;font:inherit}
-        #llmFab{position:fixed;right:18px;bottom:18px;z-index:9000;width:54px;height:54px;border-radius:50%;border:1px solid var(--accent,#55DDBB);
-          background:var(--bg-panel,#182023);color:var(--accent,#55DDBB);font-size:24px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.4)}
+        #llmFab{position:fixed;right:18px;bottom:18px;z-index:9000;width:50px;height:50px;border-radius:50%;border:1px solid var(--accent,#55DDBB);
+          background:var(--bg-panel,#182023);color:var(--accent,#55DDBB);cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.4);
+          display:flex;align-items:center;justify-content:center;transition:transform .2s ease,background .2s ease}
+        #llmFab:hover{transform:scale(1.05)}
+        #llmFab svg{width:22px;height:22px}
         #llmFab.live{background:var(--error,#F16C70);color:#fff;border-color:var(--error,#F16C70);animation:llmPulse 1.2s infinite}
         #llmFloat{position:fixed;right:18px;bottom:82px;z-index:9000;width:min(380px,calc(100vw - 36px));height:min(460px,70vh);
           display:flex;flex-direction:column;padding:10px;background:var(--bg-panel,#182023);border:1px solid var(--border,#2A363B);
@@ -219,12 +232,15 @@
 
         // --- hàng điều khiển: [Mic] [Ô nhập] [Send] [Settings] ---
         const row = h('div', 'llm-row');
-        el.mic = h('button', 'llm-btn', '🎤');
+        el.mic = h('button', 'llm-btn');
+        el.mic.innerHTML = ICONS.mic;
         el.input = h('input', 'llm-in');
         el.input.type = 'text';
         el.input.autocomplete = 'off';
-        el.send = h('button', 'llm-btn', '➤');
-        el.gear = h('button', 'llm-btn', '⚙');
+        el.send = h('button', 'llm-btn');
+        el.send.innerHTML = ICONS.send;
+        el.gear = h('button', 'llm-btn');
+        el.gear.innerHTML = ICONS.gear;
         [el.mic, el.input, el.send, el.gear].forEach((x) => row.appendChild(x));
 
         // --- hàng cài đặt ---
@@ -266,8 +282,9 @@
             box.innerHTML = '';
             box.insertAdjacentElement('afterend', ctrl);
         } else {
-            const fab = h('button', null, '🎙️');
+            const fab = h('button', null);
             fab.id = 'llmFab';
+            fab.innerHTML = ICONS.mic;
             fab.title = 'Trợ lý giọng nói (LLM)';
             const fl = h('div');
             fl.id = 'llmFloat';
@@ -352,11 +369,26 @@
             (s.location ? '  ·  ' + t.locLabel.replace(/:$/, '') + ': ' + s.location : '');
     }
 
+    // Ô chat có thể cuộn: chỉ tự cuộn xuống đáy khi người dùng đang ở gần đáy
+    // (hoặc vừa cuộn lên), nếu không thì giữ nguyên vị trí để người dùng đọc lại.
+    function atBottom() {
+        if (!el.chat) return true;
+        return el.chat.scrollHeight - el.chat.scrollTop - el.chat.clientHeight < 40;
+    }
+
+    function scrollToBottom(force) {
+        if (!el.chat) return;
+        if (force === true || atBottom()) {
+            el.chat.scrollTop = el.chat.scrollHeight;
+        }
+    }
+
     function addMsg(kind, text, extra) {
+        const stick = atBottom();
         const m = h('div', 'llm-msg ' + kind + (extra ? ' ' + extra : ''), text);
         el.chat.appendChild(m);
         while (el.chat.children.length > 80) el.chat.removeChild(el.chat.firstChild);
-        el.chat.scrollTop = el.chat.scrollHeight;
+        scrollToBottom(stick);
         return m;
     }
 
@@ -398,7 +430,7 @@
         row.appendChild(no);
         b.appendChild(row);
         el.chat.appendChild(b);
-        el.chat.scrollTop = el.chat.scrollHeight;
+        scrollToBottom();
         planBubble = { el: b, row: row };
     }
 
@@ -469,8 +501,11 @@
     function setMic(on) {
         listening = on;
         el.mic.classList.toggle('live', on);
-        el.mic.textContent = on ? '🎙️' : '🎤';
-        if (el.fab) el.fab.classList.toggle('live', on);
+        el.mic.innerHTML = on ? ICONS.micActive : ICONS.mic;
+        if (el.fab) {
+            el.fab.classList.toggle('live', on);
+            el.fab.innerHTML = on ? ICONS.micActive : ICONS.mic;
+        }
     }
 
     function startListen() {

@@ -44,7 +44,7 @@ class ESP32Bridge(Node):
         # gia tri tho cua tung o phai DUNG YEN LIEN TUC chung nay giay moi duoc nhan.
         # Nhap nhay -> dem lai tu dau, giu gia tri da nhan truoc do.
         # Doi khi dang chay: ros2 param set /esp32_bridge shelf_stable_s 8.0
-        self.declare_parameter('shelf_stable_s', 5.0)
+        self.declare_parameter('shelf_stable_s', 1.0)
         self.declare_parameter('joint_names', ['front_encoder_wheel_left_joint', 'front_encoder_wheel_right_joint', 'encoder_lift_joint'])
 
         self.port = self.get_parameter('port').value

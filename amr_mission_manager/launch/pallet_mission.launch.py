@@ -39,9 +39,6 @@ def generate_launch_description():
         _arg('with_mission_manager', 'true',
              'true: chay luon mission_manager (nut HOME -> P_1). '
              'false neu mission_manager da chay rieng'),
-        _arg('graph_package', 'amr_navigation', 'package chua route graph'),
-        _arg('graph_yaml_filename', 'D203B Route.yaml',
-             'ten file YAML trong <package>/config/graphs/'),
         _arg('standoff_m', '0.40',
              'khoang cach tu base_footprint toi diem dem (m). '
              '= 0.40 + khoang cach tu truc banh toi mui cang'),
@@ -97,10 +94,6 @@ def generate_launch_description():
         name='rack_tf_publisher',
         output='screen',
         condition=IfCondition(LaunchConfiguration('with_rack_tf')),
-        parameters=[{
-            'graph_package': LaunchConfiguration('graph_package'),
-            'graph_yaml_filename': LaunchConfiguration('graph_yaml_filename'),
-        }],
     )
 
     mission_manager_node = Node(
@@ -109,10 +102,6 @@ def generate_launch_description():
         name='mission_manager',
         output='screen',
         condition=IfCondition(LaunchConfiguration('with_mission_manager')),
-        parameters=[{
-            'graph_package': LaunchConfiguration('graph_package'),
-            'graph_yaml_filename': LaunchConfiguration('graph_yaml_filename'),
-        }],
     )
 
     gui_node = Node(

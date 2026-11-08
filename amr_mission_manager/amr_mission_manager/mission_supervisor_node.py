@@ -43,9 +43,10 @@ from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
 from std_srvs.srv import Empty, SetBool, Trigger
 import tf2_ros
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (QoSProfile, DurabilityPolicy, ReliabilityPolicy,
+                       qos_profile_sensor_data)
 
 from amr_mission_manager.shelf_model import ShelfModel, UNKNOWN, EMPTY, FULL
 
@@ -76,14 +77,12 @@ DEFAULTS = {
     # lien lac / het o tron / chua chon loai hang) -> KHONG dat hang,
     # bao len status/GUI (dung tai cho, khong tu ve Home).
     'shelf_topic': '/shelf/occupancy',
-    'shelf_stale_s': 2.0,        # > 2s khong co dat = coi mat lien lac
+    'shelf_stale_s': 10.0,       # du lieu ke doi cham: > 10s khong co dat = coi mat lien lac
     'shelf_config': '',          # '' = config/shelf.yaml (mac dinh)
     'camera_topic': '/color/image_raw',
-    'camera_stale_s': 2.0,
+    'camera_stale_s': 4.0,
     'mission_manager_node': 'mission_manager',
     'pallet_mission_node': 'pallet_mission',
-    'graph_package': 'amr_navigation',
-    'graph_yaml_filename': 'route_graph.yaml',
     # Frames
     'map_frame': 'map',
     'base_frame': 'base_footprint',
@@ -92,15 +91,23 @@ DEFAULTS = {
     # Den choi GOTO_PICK
     'arrive_tol_m': 0.30,
     'arrive_settle_s': 1.0,
-    'arrive_max_linear_speed_mps': 0.03,
-    'arrive_max_angular_speed_rps': 0.08,
-    'goto_timeout_s': 120.0,
+    'arrive_max_linear_speed_mps': 0.05,
+    'arrive_max_angular_speed_rps': 0.12,
+    'goto_timeout_s': 180.0,
     # PICKING
-    'pick_sample_wait_s': 12.0,  # hard timeout; stop earlier after enough stable samples
+    'pick_sample_wait_s': 20.0,  # hard timeout (tinh tu Detect ON, gom ca thoi gian detector nap model)
     'sample_stable_s': 2.0,
-    'no_pallet_retries': 3,
-    'pick_retries': 2,
-    'pick_timeout_s': 300.0,
+    'no_pallet_conclude_s': 10.0,  # detector DA CHAY ma sau ngan nay van 0 mau -> ket luan khong co pallet
+    'no_pallet_retries': 1,      # 1 = ket luan ngay lan quet trong dau tien (-> ve HOME)
+    'detector_restarts': 2,      # pallet_mission FAILED luc detect (detector chet...) -> tu bat lai tu ngan nay lan
+    'pick_retries': 3,
+    # --- tu phuc hoi (truoc khi can nguoi bam RESUME) ---
+    'approach_retries': 2,       # so lan tu thu lai pick/drop khi approach FAILED TRUOC khi cang vao
+    'shelf_wait_s': 30.0,        # du lieu ke stale: cho toi da bay nhieu giay roi moi RECOVERY
+    'retry_backoff_s': 2.0,      # nghi giua cac lan thu lai
+    'start_retries': 5,          # pallet_mission tu choi Drop (khong chuyen dong) -> thu lai moi 2s
+    'nav_finish_wait_s': 8.0,    # xe da dung o D_1 nhung Nav2 goal van active > nguong -> huy goal
+    'pick_timeout_s': 420.0,
     # Bo tham so SAMPLING rong (demo 1-1.5 Hz) ap len pallet_mission (HOT,
     # khong sua node cu - chi la parameter service, pallet_mission self._reload_params)
     'pm_final_window_s': 4.0,
@@ -109,6 +116,7 @@ DEFAULTS = {
     'pm_max_yaw_std_deg': 5.0,
     'pm_max_sample_age_s': 3.0,
     'pm_require_stable': True,   # nua cuoi cung: false = bo luon kiem tra std
+    'pm_after_pick': 'hold',     # supervisor BAT BUOC 'hold' (pallet_mission giu pallet sau khi lui)
 }
 
 
@@ -126,6 +134,20 @@ class MissionSupervisor(Node):
         self.p = {k: self.get_parameter(k).value for k in DEFAULTS}
         self._client_group = ReentrantCallbackGroup()
         self._control_group = ReentrantCallbackGroup()
+        # _tick CHAN (time.sleep cho service) -> phai nam group RIENG, neu khong no
+        # chan cac subscription (shelf/pm status/TF listener) cung default group.
+        self._tick_group = MutuallyExclusiveCallbackGroup()
+        self._shelf_bad_t0 = None
+        self._approach_retries = 0
+        self._drop_retries = 0
+        self._pm_fail_phase = None
+        self._retry_wait_until = 0.0
+        self._stuck_t0 = None
+        self._start_refusals = 0
+        self._detector_restarts = 0
+        self._detect_on_t = 0.0
+        self._scan_t0 = None
+        self._pm_msg = ''
         # Cache service clients. Creating clients on every 10 Hz timer retry
         # leaks ROS entities and makes startup/recovery progressively less
         # responsive when a server is offline.
@@ -176,6 +198,11 @@ class MissionSupervisor(Node):
 
         # ---------------- ROS I/O ----------------
         self.pub_status = self.create_publisher(String, f'/{NODE_NAME}/status', 10)
+        route_qos = QoSProfile(depth=1)
+        route_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        route_qos.reliability = ReliabilityPolicy.RELIABLE
+        self._route_path_sub = self.create_subscription(
+            String, '/navigation/route_yaml_path', self._on_route_path, route_qos)
         self.create_subscription(
             String, f'/{self.p["pallet_mission_node"]}/status', self._on_pm_status, 10)
         self.create_subscription(String, '/pallet/target_status',
@@ -215,8 +242,10 @@ class MissionSupervisor(Node):
         # GIỮ reference timer trên self: executor của rclpy giữ callback bằng
         # weak reference -> không lưu thì timer bị GC ngay sau __init__ và
         # node đứng im IDLE (khong publish status, khong tick duoc).
-        self._tick_timer = self.create_timer(0.1, self._tick)
-        self._status_timer = self.create_timer(0.5, self._publish_status)
+        self._tick_timer = self.create_timer(0.1, self._tick,
+                                             callback_group=self._tick_group)
+        self._status_timer = self.create_timer(0.5, self._publish_status,
+                                               callback_group=self._control_group)
 
         # O da chon cho drop (id, frame_tf) tu chu trinh goc - null khi
         # chua chu trinh nao chon duoc o (GUI hien o dang chon)
@@ -234,6 +263,9 @@ class MissionSupervisor(Node):
         self._state = state
         self._msg = msg
         self._t_state = time.monotonic()
+        self._shelf_bad_t0 = None
+        self._stuck_t0 = None
+        self._start_refusals = 0
         self.get_logger().info(f'[{state}] {msg}')
 
     def _base_pose(self):
@@ -250,11 +282,9 @@ class MissionSupervisor(Node):
         """Pose cua node cuoi cua pick_mission trong map (tu route graph)."""
         try:
             from amr_navigation.route_graph_loader import RouteGraphLoader
-            if self._route_loader is None:
-                self._route_loader = RouteGraphLoader(
-                    package_name=self.p['graph_package'],
-                    yaml_filename=self.p['graph_yaml_filename'])
             loader = self._route_loader
+            if loader is None:
+                return None
             name = loader.resolve(self._active_dest)
             pose = loader.get_node_pose(name)
             if pose is None:
@@ -264,6 +294,18 @@ class MissionSupervisor(Node):
         except Exception as e:
             self.get_logger().warn(f'Khong doc duoc route graph ({self._active_dest}): {e}')
             return None
+
+    def _on_route_path(self, msg: String):
+        """Use only the graph announced by the active Nav2 launch."""
+        try:
+            from amr_navigation.route_graph_loader import RouteGraphLoader
+            loader = RouteGraphLoader(yaml_path=msg.data)
+            loader.get_all_node_names()  # validate/load before replacing current graph
+            self._route_loader = loader
+            self.get_logger().info(f'Using active Nav2 route graph: {msg.data}')
+        except Exception as e:
+            self._route_loader = None
+            self.get_logger().error(f'Failed to load active Nav2 route graph {msg.data}: {e}')
 
     def _call_service_result(self, cli, req, timeout: float = 5.0):
         # Availability checks happen from the state-machine timer. Keep them
@@ -338,6 +380,9 @@ class MissionSupervisor(Node):
         self._detect_on_called = False
         self._go_called = False
         self._retries = 0
+        self._approach_retries = 0
+        self._drop_retries = 0
+        self._detector_restarts = 0
         self._near_t0 = None
         self._triggered = False
         self._pm_state = None
@@ -385,6 +430,9 @@ class MissionSupervisor(Node):
             return res
         state = self._resume_state
         self._resume_state = None
+        self._approach_retries = 0
+        self._drop_retries = 0
+        self._detector_restarts = 0
         self._triggered = False
         self._go_called = False
         self._cancel_requested = False
@@ -409,6 +457,7 @@ class MissionSupervisor(Node):
             'pm_max_yaw_std_deg': ('max_yaw_std_deg', Parameter.Type.DOUBLE),
             'pm_max_sample_age_s': ('max_sample_age_s', Parameter.Type.DOUBLE),
             'pm_require_stable': ('require_stable', Parameter.Type.BOOL),
+            'pm_after_pick': ('after_pick', Parameter.Type.STRING),
         }
         params = []
         for src_key, (dst_key, ptype) in mapping.items():
@@ -535,6 +584,8 @@ class MissionSupervisor(Node):
         self._pm_cargo_type = d.get('cargo_type')
         self._pm_cargo_why = d.get('cargo_why') or ''
         self._pm_cargo = d.get('cargo')
+        self._pm_fail_phase = d.get('fail_phase')
+        self._pm_msg = d.get('msg') or ''
         self._pm_status_t = time.monotonic()
 
     def _on_camera(self, _msg: Image):
@@ -597,6 +648,38 @@ class MissionSupervisor(Node):
         if self._shelf_last_t == 0.0:
             return False
         return (time.monotonic() - self._shelf_last_t) <= float(self.p['shelf_stale_s'])
+
+    def _shelf_expired(self, now) -> bool:
+        """Du lieu ke tuoi -> False. Stale: bat dau dem; chi tra True (-> RECOVERY)
+        khi stale lien tuc > shelf_wait_s. Tranh dung xe vi 1 nhip tre."""
+        if self._shelf_ok() and self._shelf_bits is not None:
+            self._shelf_bad_t0 = None
+            return False
+        if self._shelf_bad_t0 is None:
+            self._shelf_bad_t0 = now
+            self.get_logger().warn('[shelf] du lieu ke stale - cho tuoi tro lai '
+                                   f'(toi da {self.p["shelf_wait_s"]:.0f}s) truoc khi RECOVERY')
+        return (now - self._shelf_bad_t0) > float(self.p['shelf_wait_s'])
+
+    # Pha ApproachController ma khi FAILED thi cang CHUA vao pallet/ke
+    # (ENTER va LOCK bi loai: mui cang da sat/qua mat, can nguoi kiem tra)
+    SAFE_RETRY_PHASES = ('RETREAT', 'ALIGN', 'SIDE_TURN', 'SIDE_DRIVE', 'CONVERGE', 'GATE')
+
+    def _drop_refused(self, now, why: str):
+        """pallet_mission tu choi Drop (xe KHONG chuyen dong): thu lai vai lan roi moi RECOVERY,
+        va hien dung ly do (truoc day ly do bi bo, chi con 'can kiem tra pallet/lift')."""
+        self._start_refusals += 1
+        if self._start_refusals <= int(self.p['start_retries']):
+            self.get_logger().warn(f'[DROPPING] {why} -> thu lai {self._start_refusals}/{self.p["start_retries"]}')
+            self._retry_wait_until = now + 2.0
+            return
+        self._set_state('RECOVERY', why)
+        self._resume_state = DROPPING
+
+    def _can_auto_retry(self, used: int) -> bool:
+        return (used < int(self.p['approach_retries'])
+                and self._pm_fail_phase in self.SAFE_RETRY_PHASES
+                and not self._cancel_requested)
 
     def _shelf_states(self) -> dict:
         """Trang thai 4 o (A1/A2/B1/B2) tu /shelf/occupancy + shelf.yaml.
@@ -676,7 +759,7 @@ class MissionSupervisor(Node):
         self._set_state('RETURN_HOME', why + ' -> tu dong ve HOME')
 
     def _do_goto_d(self, now):
-        if not self._shelf_ok() or self._shelf_bits is None:
+        if self._shelf_expired(now):
             try:
                 self._cancel_cli.call_async(CancelGoal.Request())
             except Exception:
@@ -684,16 +767,28 @@ class MissionSupervisor(Node):
             self._set_state('RECOVERY', 'Du lieu cam bien ke stale/mat ket noi tren duong toi D_1')
             self._resume_state = GOTO_D
             return
-        sid, frame, why = self._select_drop_slot_for(self._pm_cargo_type)
-        if sid is None:
-            try:
-                self._cancel_cli.call_async(CancelGoal.Request())
-            except Exception:
-                pass
-            self._start_return_home('Khong con o ke phu hop tren duong toi D_1: ' + why)
-            return
-        self._drop_slot_chosen = (sid, frame)
+        if self._shelf_ok() and self._shelf_bits is not None:
+            # Ke chi can tuoi luc chon o; tren duong di thoang stale thi KHONG cat Nav2.
+            sid, frame, why = self._select_drop_slot_for(self._pm_cargo_type)
+            if sid is None:
+                try:
+                    self._cancel_cli.call_async(CancelGoal.Request())
+                except Exception:
+                    pass
+                self._start_return_home('Khong con o ke phu hop tren duong toi D_1: ' + why)
+                return
+            self._drop_slot_chosen = (sid, frame)
         if not self._triggered:
+            self._active_dest = 'D_1'
+            d0, p0 = self._dest_pose(), self._base_pose()
+            if (d0 is not None and p0 is not None
+                    and math.hypot(p0[0] - d0[0], p0[1] - d0[1]) <= float(self.p['arrive_tol_m'])
+                    and self._nav_goal_active is not True):
+                # RESUME khi xe da dung o D_1: KHONG gui lai Nav2 (se di chuyen them va
+                # lam lech pose truoc khi vao ke).
+                self.get_logger().info('[GOTO_D] Xe da o D_1 -> bo qua gui lai mission Nav2')
+                self._triggered = True
+                return
             if self._trigger_mission(self.p['drop_mission']):
                 self._triggered = True
             elif now - self._t_state > 30.0:
@@ -713,11 +808,31 @@ class MissionSupervisor(Node):
             return
         d = math.hypot(pose[0] - dest[0], pose[1] - dest[1])
         if d <= float(self.p['arrive_tol_m']):
-            self._near_t0 = self._near_t0 or now
-            if now - self._near_t0 >= float(self.p['arrive_settle_s']):
-                if not self._shelf_ok() or self._shelf_bits is None:
-                    self._set_state('RECOVERY', 'Mat ket noi/cam bien ke stale khi den D_1')
-                    self._resume_state = GOTO_D
+            # Truoc day chi can vao ban kinh arrive_tol_m 1s la bat dau Drop, du Nav2 van dang
+            # chay -> hai nguon lenh cmd_vel va pose xuat phat Drop chua on dinh. Giong GOTO_PICK:
+            # cho xe DUNG va Nav2 khong con goal active.
+            if not self._robot_stopped(now) or self._nav_goal_active is True:
+                self._near_t0 = None
+                if self._robot_stopped(now) and self._nav_goal_active is True:
+                    self._stuck_t0 = self._stuck_t0 or now
+                    if now - self._stuck_t0 > float(self.p['nav_finish_wait_s']):
+                        self.get_logger().warn('[GOTO_D] Xe da dung o D_1 nhung Nav2 goal chua ket thuc -> huy goal')
+                        try:
+                            self._cancel_cli.call_async(CancelGoal.Request())
+                        except Exception:
+                            pass
+                        self._stuck_t0 = None
+                else:
+                    self._stuck_t0 = None
+            else:
+                self._stuck_t0 = None
+                self._near_t0 = self._near_t0 or now
+            if self._near_t0 is not None and now - self._near_t0 >= float(self.p['arrive_settle_s']):
+                if not (self._shelf_ok() and self._shelf_bits is not None):
+                    if self._shelf_expired(now):
+                        self._set_state('RECOVERY', 'Mat ket noi/cam bien ke stale khi den D_1')
+                        self._resume_state = GOTO_D
+                    # else: dung o D_1 cho du lieu ke tuoi tro lai
                 else:
                     sid, frame, why = self._select_drop_slot_for(self._pm_cargo_type)
                     if sid is None:
@@ -739,9 +854,12 @@ class MissionSupervisor(Node):
     def _do_dropping(self, now):
         pm = self.p['pallet_mission_node']
         if not self._go_called:
-            if not self._shelf_ok() or self._shelf_bits is None:
-                self._set_state('RECOVERY', 'Du lieu ke stale/mat ket noi truoc khi bat dau drop')
-                self._resume_state = DROPPING
+            if now < self._retry_wait_until:
+                return
+            if not (self._shelf_ok() and self._shelf_bits is not None):
+                if self._shelf_expired(now):
+                    self._set_state('RECOVERY', 'Du lieu ke stale/mat ket noi truoc khi bat dau drop')
+                    self._resume_state = DROPPING
                 return
             sid, frame, why = self._select_drop_slot_for(self._pm_cargo_type)
             if sid is None:
@@ -772,8 +890,7 @@ class MissionSupervisor(Node):
                 return
             drop = self._service_client(Trigger, f'/{pm}/drop')
             if not drop.wait_for_service(timeout_sec=0.2):
-                self._set_state('RECOVERY', 'Pallet mission drop service chua san sang')
-                self._resume_state = DROPPING
+                self._drop_refused(now, 'Pallet mission drop service chua san sang')
                 return
             if self._cancel_requested:
                 return
@@ -784,14 +901,17 @@ class MissionSupervisor(Node):
             if self._cancel_requested:
                 return
             if not fut.done() or not fut.result().success:
-                self._set_state('RECOVERY', 'Drop chua khoi dong; can kiem tra pallet/lift')
-                self._resume_state = DROPPING
+                why = fut.result().message if fut.done() else 'service khong tra loi trong 3s'
+                self._drop_refused(now, f'Drop chua khoi dong: {why}')
                 return
+            self._start_refusals = 0
             self._go_called = True
+            self._pm_state = None      # bo status cu (FAILED lan truoc)
             self._t_state = now
             return
         if self._pm_state == DONE and self._pm_cargo is False:
             self._cycle += 1
+            self._drop_retries = 0
             self._go_called = False
             if self.p.get('run_mode') == 'auto' and (not self._shelf_ok() or self._shelf_bits is None):
                 self._start_return_home('Da dat pallet; cam bien ke mat ket noi nen dung Auto')
@@ -802,8 +922,19 @@ class MissionSupervisor(Node):
             else:
                 self._start_return_home('Hoan tat chu ky' if self.p.get('run_mode') != 'auto'
                                          else 'Ke da day')
-        elif self._pm_state == FAILED:
-            self._set_state('RECOVERY', 'Drop FAILED; dung tai checkpoint, kiem tra vi tri pallet')
+        elif self._pm_state == FAILED and now - self._t_state > 1.5:
+            if self._can_auto_retry(self._drop_retries):
+                self._drop_retries += 1
+                self.get_logger().warn(
+                    f'[DROPPING] Drop FAILED o pha {self._pm_fail_phase} (cang chua vao ke) '
+                    f'-> tu thu lai {self._drop_retries}/{self.p["approach_retries"]}')
+                self._pm_state = None
+                self._go_called = False
+                self._t_state = now
+                self._retry_wait_until = now + float(self.p['retry_backoff_s'])
+                return
+            self._set_state('RECOVERY', 'Drop FAILED; dung tai checkpoint, kiem tra vi tri pallet '
+                                        f'(pha loi: {self._pm_fail_phase})')
             self._resume_state = DROPPING
         elif now - self._t_state > float(self.p.get('drop_timeout_s', 360.0)):
             self._set_state('RECOVERY', 'Drop timeout; can kiem tra pallet va lift truoc Resume')
@@ -853,7 +984,7 @@ class MissionSupervisor(Node):
             self._do_return_home(now)
 
     def _do_goto_pick(self, now):
-        if not self._shelf_ok() or self._shelf_bits is None:
+        if self._shelf_expired(now):
             try:
                 self._cancel_cli.call_async(CancelGoal.Request())
             except Exception:
@@ -861,10 +992,18 @@ class MissionSupervisor(Node):
             self._set_state('RECOVERY', 'Du lieu cam bien ke stale/mat ket noi truoc khi di pick')
             self._resume_state = GOTO_PICK
             return
-        if not self._any_slot_available():
+        if (self._shelf_ok() and self._shelf_bits is not None
+                and not self._any_slot_available()):
             self._start_return_home('Khong con o ke trong')
             return
         if not self._triggered:
+            d0, p0 = self._dest_pose(), self._base_pose()
+            if (d0 is not None and p0 is not None
+                    and math.hypot(p0[0] - d0[0], p0[1] - d0[1]) <= float(self.p['arrive_tol_m'])
+                    and self._nav_goal_active is not True):
+                self.get_logger().info('[GOTO_PICK] Xe da o diem pick -> bo qua gui lai mission Nav2')
+                self._triggered = True
+                return
             if self._trigger_mission(self._active_mission):
                 self._triggered = True
             if now - self._t_state > 30.0:
@@ -894,9 +1033,11 @@ class MissionSupervisor(Node):
                 self._near_t0 = now
             elif now - self._near_t0 >= float(self.p['arrive_settle_s']):
                 self._near_t0 = None
-                if not self._shelf_ok() or self._shelf_bits is None:
-                    self._set_state('RECOVERY', 'Du lieu cam bien ke stale/mat ket noi tai P_1')
-                    self._resume_state = GOTO_PICK
+                if not (self._shelf_ok() and self._shelf_bits is not None):
+                    if self._shelf_expired(now):
+                        self._set_state('RECOVERY', 'Du lieu cam bien ke stale/mat ket noi tai P_1')
+                        self._resume_state = GOTO_PICK
+                    # else: cho du lieu ke tuoi tro lai, thu lai o nhip sau
                 elif not self._any_slot_available():
                     self._start_return_home('Khong con o ke trong hoac du lieu ke khong hop le')
                 else:
@@ -937,6 +1078,8 @@ class MissionSupervisor(Node):
 
         if self._pick_phase == S_SAMPLING:
             if not self._detect_on_called:
+                if now < self._retry_wait_until:
+                    return
                 cli = self._service_client(SetBool, f'/{pm}/detect')
                 req = SetBool.Request()
                 req.data = True
@@ -948,13 +1091,49 @@ class MissionSupervisor(Node):
                 self._stable_since, self._stable_anchor = None, None
                 if self._detect_on_called:
                     self._t_state = now
+                    self._detect_on_t = now
+                    self._scan_t0 = None
+                    self._pm_state = None          # bo status cu (FAILED lan truoc)
                 elif not self._camera_ok():
                     self._set_state('RECOVERY', 'Detect service tu choi va camera stale/mat ket noi')
                     self._resume_state = PICKING
+                else:
+                    self._detector_restarts += 1
+                    why = response.message if response else 'service khong tra loi'
+                    if self._detector_restarts > int(self.p['detector_restarts']):
+                        self._set_state('RECOVERY', f'Bat detect that bai {self._detector_restarts} lan: {why}')
+                        self._resume_state = PICKING
+                    else:
+                        self.get_logger().warn(f'[PICKING] Bat detect that bai ({why}) -> thu lai '
+                                               f'{self._detector_restarts}/{self.p["detector_restarts"]}')
+                        self._retry_wait_until = now + float(self.p['retry_backoff_s'])
+                return
+            # pallet_mission FAILED ngay trong luc lay mau (detector tu thoat, khong len duoc...):
+            # tu bat lai detector vai lan truoc khi vao RECOVERY; khong cho het thoi gian roi doan.
+            if self._pm_state == FAILED and now - self._detect_on_t > 1.5:
+                self._detector_restarts += 1
+                if self._detector_restarts > int(self.p['detector_restarts']):
+                    self._set_state('RECOVERY', 'pallet_mission FAILED khi detect (da tu bat lai detector '
+                                                f'{self._detector_restarts - 1} lan): {self._pm_msg}')
+                    self._resume_state = PICKING
+                    return
+                self.get_logger().warn(f'[PICKING] pallet_mission FAILED khi detect ({self._pm_msg}) -> '
+                                       f'bat lai detector {self._detector_restarts}/{self.p["detector_restarts"]}')
+                self._pm_state = None
+                self._detect_on_called = False
+                self._retry_wait_until = now + float(self.p['retry_backoff_s'])
                 return
             enough = self._pm_samples >= int(self.p['pm_min_samples'])
             stable = self._sample_window_stable()
-            if (enough and stable) or now - self._t_state >= float(self.p['pick_sample_wait_s']):
+            # Dong ho "khong thay pallet" chi chay tu luc DETECTOR THAT SU bao status (da nap model
+            # xong va con song), nen 10 s la 10 s nhin that chu khong gom thoi gian nap model.
+            det_live = (self._detector_status_t > self._detect_on_t
+                        and now - self._detector_status_t <= 2.0)
+            if det_live and self._scan_t0 is None:
+                self._scan_t0 = now
+            no_pallet = (self._pm_samples == 0 and self._scan_t0 is not None
+                         and now - self._scan_t0 >= float(self.p['no_pallet_conclude_s']))
+            if (enough and stable) or no_pallet or now - self._t_state >= float(self.p['pick_sample_wait_s']):
                 # dat -> detect OFF (chot median; success <=> state READY)
                 self._t_state = now
                 self._detect_on_called = False
@@ -970,6 +1149,7 @@ class MissionSupervisor(Node):
                     return
                 self.get_logger().info(f'[PICKING] detect OFF: {res.message}')
                 if res.success:
+                    self._detector_restarts = 0
                     self._pick_phase = S_APPROACHING
                     self._t_state = now
                 else:
@@ -1023,6 +1203,7 @@ class MissionSupervisor(Node):
                 return
             if res.success:
                 self._go_called = True
+                self._pm_state = None      # bo status cu
                 self.get_logger().info(f'[PICKING] {res.message}')
             else:
                 self._pick_retry(res.message)
@@ -1050,6 +1231,19 @@ class MissionSupervisor(Node):
                                f'{self._retries}/{self.p["pick_retries"]}')
 
     def _finish_picking(self, pm_state: str):
+        if (pm_state == FAILED and self._pm_cargo is not True
+                and self._can_auto_retry(self._approach_retries)):
+            self._approach_retries += 1
+            self.get_logger().warn(
+                f'[PICKING] Approach FAILED o pha {self._pm_fail_phase} (cang chua vao pallet) '
+                f'-> detect lai va thu lai {self._approach_retries}/{self.p["approach_retries"]}')
+            self._pm_state = None
+            self._detect_on_called = False
+            self._go_called = False
+            self._detector_filter_applied = False
+            self._pick_phase = S_SAMPLING
+            self._t_state = time.monotonic()
+            return
         if pm_state == FAILED:
             self._set_state('RECOVERY', 'pallet_mission FAILED; kiem tra tai va vi tri xe truoc Resume')
             self._resume_state = GOTO_D if self._pm_cargo is True else GOTO_PICK
@@ -1058,6 +1252,7 @@ class MissionSupervisor(Node):
         elif pm_state == 'CARRYING':
             self._empty_scans = 0
             self._retries = 0
+            self._approach_retries = 0
             ctype = self._pm_cargo_type
             sid, frame, why = self._select_drop_slot_for(ctype)
             if sid is None:

@@ -34,8 +34,7 @@ Luu y (TF static, latched):
 Chay:
     ros2 launch amr_mission_manager shelf_tf.launch.py
 Hoac thuc nghiem:
-    ros2 run amr_mission_manager rack_tf_publisher \
-        graph_yaml_filename:='D203B Route.yaml'
+    # Start nav2.launch.py first so /navigation/route_yaml_path is available.
     ros2 run tf2_ros tf2_echo map shelf_front slot_A slot_B1 slot_B2
 """
 
@@ -47,7 +46,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import TransformStamped, Point
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from visualization_msgs.msg import MarkerArray, Marker
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, String
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 NODE_NAME = 'rack_tf_publisher'
 
@@ -55,10 +55,6 @@ DEFAULTS = {
     # Mo hinh ke (front_distance_m, col_pitch_m, 4 o, anh xa cam bien,
     # uu tien, anchor_node): tat ca nam trong 1 file duy nhat shelf.yaml
     'shelf_config': '',    # '' = config/shelf.yaml (share sau build -> src)
-    # Nguon graph: ten file YAML trong <graph_package>/config/graphs/
-    # (mac dinh = graph chay that; D_1 se duoc tao bang graph builder)
-    'graph_package': 'amr_navigation',
-    'graph_yaml_filename': 'D203B Route.yaml',
     'map_frame': 'map',
     # Phat marker + chuc nang
     'publish_markers': True,
@@ -91,6 +87,7 @@ class RackTfPublisher(Node):
         for k, v in DEFAULTS.items():
             self.declare_parameter(k, v)
         self.p = {k: self.get_parameter(k).value for k in DEFAULTS}
+        self._active_graph_path = None
 
         # Nap moi hinh ke tu shelf.yaml (1 lan, tai khoi dong)
         from amr_mission_manager.shelf_model import ShelfModel, ShelfError
@@ -114,6 +111,12 @@ class RackTfPublisher(Node):
         self._static_tf = StaticTransformBroadcaster(self)
         self._bcast_m = self.create_publisher(MarkerArray, '/rack/markers', 10)
 
+        route_qos = QoSProfile(depth=1)
+        route_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        route_qos.reliability = ReliabilityPolicy.RELIABLE
+        self._route_path_sub = self.create_subscription(
+            String, '/navigation/route_yaml_path', self._on_route_path, route_qos)
+
         # Lan dau: kiem tra va phat ngay.
         if self._model is None:
             return  # da log loi: di ngui, khong co gi de quan sat
@@ -133,10 +136,9 @@ class RackTfPublisher(Node):
         (map_poses nhan radian).
         """
         from amr_navigation.route_graph_loader import RouteGraphLoader
-        # Instan moi moi lan de luon doc file hien hanh (khong che).
-        loader = RouteGraphLoader(
-            package_name=self.p['graph_package'],
-            yaml_filename=self.p['graph_yaml_filename'])
+        if not self._active_graph_path:
+            return None
+        loader = RouteGraphLoader(yaml_path=self._active_graph_path)
         name = loader.resolve(self._model.anchor_node)
         if name is None:
             return None
@@ -146,18 +148,28 @@ class RackTfPublisher(Node):
         p = pose.pose.position
         return p.x, p.y, _yaw_from_quat(pose.pose.orientation)
 
+    def _on_route_path(self, msg: String):
+        """Use the route YAML announced by the active Nav2 launch."""
+        self._active_graph_path = msg.data
+        self._last_tf_key = None
+        self._warned_no_anchor = False
+        self.get_logger().info(f'Using active Nav2 route graph: {msg.data}')
+        if self._model is not None:
+            self._publish_if_anchor()
+
     # ------------------------------------------------------------------
     # Kiem tra + phat
     # ------------------------------------------------------------------
     def _publish_if_anchor(self) -> bool:
+        if not self._active_graph_path:
+            return False
         d1 = self._anchor_pose()
         if d1 is None:
             if not self._warned_no_anchor:
                 self._warned_no_anchor = True
                 self.get_logger().warn(
                     f"Khong thay node '{self._model.anchor_node}' trong graph "
-                    f"'{self.p['graph_yaml_filename']}' "
-                    f"(package '{self.p['graph_package']}'). KHONG phat "
+                    f"'{self._active_graph_path}'. KHONG phat "
                     f"TF/marker ke, dat hang se bi chon voi ly do 'khong co "
                     f"{self._model.anchor_node}' (khong tu chuyen sang graph "
                     f"khac). Quan sat moi {self.p['check_interval_s']:.0f}s.")
@@ -184,7 +196,7 @@ class RackTfPublisher(Node):
         self.get_logger().info(
             f'[ke] Neo {self._model.anchor_node} = ({x_d:.3f}, {y_d:.3f}, '
             f'{math.degrees(yaw_d):.1f} deg) tu graph '
-            f"'{self.p['graph_yaml_filename']}' "
+            f"'{self._active_graph_path}' "
             f"(yaw trong graph theo RADIAN - da doi ve rad cho shelf_model)")
         fx, fy, _ = poses['shelf_front']
         self.get_logger().info(

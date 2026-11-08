@@ -164,6 +164,33 @@ class YamlToGeojson(Node):
             }
             features.append(feature)
 
+            # CHU Y (quan trong): nav2_route (Humble) mo ta edge theo HIEU -
+            # feature startid->endid la canh MOT CHIEU. Truong 'bidirectional'
+            # trong YAML phai duoc chiet thanh 2 features (forward + reverse),
+            # neu khong luong nguoc se fail 'NO_VALID_ROUTE'.
+            # Da thuc nghiem: graph chi co 0->1 thi 0->1 SUCCEEDED,
+            # nhung 1->0 ABORTED.
+            if edge.get('bidirectional', True) and startid != endid:
+                feature_rev = {
+                    'type': 'Feature',
+                    'properties': {
+                        'id': len(features),
+                        'startid': endid,
+                        'endid': startid,
+                    },
+                    'geometry': {
+                        'type': 'MultiLineString',
+                        'coordinates': [[[
+                            to_pos.get('x', 0.0),
+                            to_pos.get('y', 0.0)
+                        ], [
+                            from_pos.get('x', 0.0),
+                            from_pos.get('y', 0.0)
+                        ]]]
+                    }
+                }
+                features.append(feature_rev)
+
         graph_name = data.get('graph_name', 'route_graph')
         output = {
             'type': 'FeatureCollection',

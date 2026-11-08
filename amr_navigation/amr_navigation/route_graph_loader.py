@@ -23,7 +23,8 @@ from ament_index_python.packages import get_package_share_directory
 class RouteGraphLoader:
     """Load route graph data tu route_graph.yaml."""
 
-    def __init__(self, package_name: str = 'amr_navigation', yaml_filename: str = 'route_graph.yaml'):
+    def __init__(self, package_name: str = 'amr_navigation',
+                 yaml_filename: str = 'route_graph.yaml', yaml_path: str = ''):
         """
         Initialize RouteGraphLoader.
 
@@ -33,6 +34,7 @@ class RouteGraphLoader:
         """
         self._package_name = package_name
         self._yaml_filename = yaml_filename
+        self._yaml_path = os.path.abspath(os.path.expanduser(yaml_path)) if yaml_path else ''
         self._yaml_data: dict = {}
         self._node_order: List[str] = []  # Sequential IDs
         self._loaded = False
@@ -46,6 +48,8 @@ class RouteGraphLoader:
 
     def _get_graph_path(self) -> str:
         """Get graph YAML path."""
+        if self._yaml_path:
+            return self._yaml_path
         return os.path.join(
             self._get_package_share_path(),
             'config', 'graphs', self._yaml_filename

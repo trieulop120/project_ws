@@ -479,8 +479,10 @@ html, body {
         min-height: 200px !important;
     }
 
-    /* AI Assistant (đang có inline flex:1): đặt chiều cao cố định */
-    .nav-right-col > .panel-card:last-child {
+    /* AI Assistant: đặt chiều cao cố định (mobile đã bỏ cơ chế co giãn
+       của desktop, nên phải hủy flex-basis:0 để card không bị xẹp về 0) */
+    .nav-right-col > .panel-card.card-llm {
+        flex: none !important;
         height: 280px !important;
         min-height: 280px !important;
     }

@@ -61,13 +61,13 @@ def generate_launch_description():
     # ============================================
     map_arg = DeclareLaunchArgument(
         'map',
-        default_value=os.path.expanduser('~/project_ws/maps/map_01.yaml'),
+        default_value=os.path.expanduser('~/project_ws/maps/D203B.yaml'),
         description='Full path to map YAML file selected from Web'
     )
 
     route_arg = DeclareLaunchArgument(
         'route',
-        default_value=os.path.expanduser('~/project_ws/maps/map_01/routes/map_01 Route.geojson'),
+        default_value=os.path.expanduser('~/project_ws/maps/D203B/routes/D203B Route.geojson'),
         description='Full path to route GeoJSON file selected from Web'
     )
 
@@ -282,15 +282,26 @@ def generate_launch_description():
     # ============================================
     # Route Graph Publisher
     # ============================================
-    route_graph_publisher = Node(
-        package='amr_navigation',
-        executable='route_graph_publisher',
-        name='route_graph_publisher',
-        output='screen',
-        parameters=[{
-            'graph_yaml_path': LaunchConfiguration('route'),
-        }],
-    )
+    # route_graph_publisher DOC file YAML (khong phai .geojson) - file .yaml
+    # nam canh file .geojson cung ten (duoc web / interactive node creator
+    # tao song song).
+    # LUON launch publisher voi duong dan YAML suy ra tu route da chon. Neu
+    # thieu file .yaml canh: publisher (fail-fast) log loi ro va thoat, khong
+    # im lang bo qua nhu cu.
+    def _make_route_graph_publisher(context):
+        route_abs = context.perform_substitution(LaunchConfiguration('route'))
+        yaml_path = os.path.splitext(route_abs)[0] + '.yaml'
+        return [Node(
+            package='amr_navigation',
+            executable='route_graph_publisher',
+            name='route_graph_publisher',
+            output='screen',
+            parameters=[{
+                'graph_yaml_path': yaml_path,
+            }],
+        )]
+
+    route_graph_publisher = OpaqueFunction(function=_make_route_graph_publisher)
 
     # ============================================
     # Return Launch Description

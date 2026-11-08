@@ -257,6 +257,9 @@ def generate_launch_description():
     # ============================================
     # Route Graph Publisher
     # ============================================
+    # Sim: dung graph SIM trong package. Dev mode tuong minh de publisher
+    # (dev_mode) duoc giu cho thuc hanh cu (fallback route_graph.yaml); tren
+    # robot that dev_mode = false va launch phai truyen graph_yaml_path.
     route_graph_publisher = Node(
         package='amr_navigation',
         executable='route_graph_publisher',
@@ -264,6 +267,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'graph_yaml_path': graph_file.replace('.geojson', '.yaml'),
+            'dev_mode': True,
         }],
     )
 
