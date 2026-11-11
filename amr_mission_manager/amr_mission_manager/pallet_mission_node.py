@@ -115,7 +115,7 @@ DEFAULTS = {
     # topics / frames
     'pose_topic': '/pallet/pose',
     'range_topic': '/ultrasonic/range',
-    'cmd_vel_topic': '/cmd_vel',
+    'cmd_vel_topic': '/cmd_vel_mission',
     'map_frame': 'map',
     'base_frame': 'base_footprint',
     'insertion_frame': 'odom',
@@ -191,7 +191,7 @@ DEFAULTS = {
     'lock_lat_abort_cm': 3.0,
     'lock_yaw_abort_deg': 4.0,
     # dung (sieu am)
-    'stop_dist_cm': 3.0,
+    'stop_dist_cm': 5.0,
     'confirm_count': 10,
     'us_arm_m': 0.10,               # chi tin sieu am sau khi da di vao >= 10 cm tu cong
     'us_below_min_is_close': True,  # doc < min_range cung tinh la "sat"
@@ -696,6 +696,7 @@ class PalletMission(Node):
         self._us_cm = None
         self._us_t = 0.0
         self._us_count = 0
+        self._us_pick_confirmed = False
 
         self._lift_cm = None
         self._lift_t = 0.0
@@ -724,6 +725,8 @@ class PalletMission(Node):
         self._bo_dist = 0.0
         self._bo_tf_miss = 0
         self._home = None               # (x, y, yaw) trong map, dat bang set_home
+        self._route_path_loaded = None
+        self._route_path_last_received = 0.0
 
         # ---------------- Drop / cargo / shelf ----------------
         self._mode = 'pick'             # 'pick' | 'drop' (dung chung ApproachController)
@@ -779,6 +782,7 @@ class PalletMission(Node):
         self.create_service(Trigger, f'{NODE_NAME}/go_to_pallet', self._srv_go)
         self.create_service(Trigger, f'{NODE_NAME}/lift_home', self._srv_lift_home)
         self.create_service(Trigger, f'{NODE_NAME}/stop', self._srv_stop)
+        self.create_service(Trigger, f'{NODE_NAME}/reset', self._srv_reset)
         self.create_service(Trigger, f'{NODE_NAME}/calibrate', self._srv_calibrate)
         self.create_service(Trigger, f'{NODE_NAME}/set_home', self._srv_set_home)
         self.create_service(Trigger, f'{NODE_NAME}/drop', self._srv_drop)
@@ -823,6 +827,8 @@ class PalletMission(Node):
         us = None
         if self._us_cm is not None and math.isfinite(self._us_cm):
             us = round(self._us_cm, 1)
+        us_fresh = (self._us_t > 0.0 and
+                    time.monotonic() - self._us_t <= float(self.p['range_stale_s']))
         live = None
         if self._state == DETECTING and self._samples:
             s = self._samples[-1]
@@ -838,7 +844,8 @@ class PalletMission(Node):
                    'yaw_map_deg': None if my is None else round(my, 1)}
         d = {'state': self._state, 'msg': self._msg, 'samples': len(self._samples),
              'live': live, 'pallet': pallet, 'pre': pre, 'us_cm': us,
-             'us_count': self._us_count,
+             'us_count': self._us_count, 'us_fresh': us_fresh,
+             'us_pick_confirmed': self._us_pick_confirmed,
              'lift_cm': None if lift is None else round(lift, 1),
              'cargo': self._cargo,
              'cargo_class': self._cargo_class, 'cargo_type': self._cargo_type,
@@ -951,8 +958,69 @@ class PalletMission(Node):
         return res
 
     def _srv_stop(self, req, res):
-        self._emergency_stop()
-        res.success, res.message = True, 'STOPPED'
+        res.success, res.message = self._emergency_stop()
+        return res
+
+    def _srv_reset(self, req, res):
+        if self._state in BUSY_STATES:
+            res.success = False
+            res.message = f'Cannot reset active pallet state {self._state}; stop first'
+            return res
+        if self._state not in (IDLE, DONE, FAILED, STOPPED, CARRYING):
+            res.success = False
+            res.message = f'Cannot reset pallet state {self._state}'
+            return res
+
+        cargo = self._cargo
+        self._terminate_detector()
+        self._goal_handle = None
+        self._samples.clear()
+        self._tf_hist.clear()
+        self._result = self._pre = self._pallet_ins = self._line = None
+        self._ctl.reset()
+        self._phase_shown = None
+        self._trimmed = False
+        self._settle_t0 = 0.0
+        self._settle_tf.clear()
+        self._handoff_t0 = None
+        self._tf_miss = 0
+        self._bo_ref = (0.0, 0.0)
+        self._bo_t0 = self._bo_dist = 0.0
+        self._bo_tf_miss = 0
+        self._drop = None
+        self._drop_lifted = False
+        self._drop_back_m = 0.0
+        self._lift_next = 'pick_backoff'
+        self._bo_after = 'pick'
+        self._bo_timeout = float(self.p['backoff_timeout_s'])
+        self._lift_t0 = self._lift_h0 = 0.0
+        self._lift_moved = False
+        self._lift_settle_t0 = None
+        self._lift_is_home = False
+        self._lift_goal = self._lift_height_now() or 0.0
+        self._ins_msg = ''
+        self._mode = 'pick'
+        self._us_count = 0
+        self._us_pick_confirmed = False
+        self._cargo_samples.clear()
+        if cargo is not True:
+            self._cargo_class = self._cargo_type = self._cargo_h = None
+            self._cargo_why = ''
+        params = self.set_parameters([
+            Parameter('drop_slot', value=''),
+            Parameter('cargo_type_override', value=''),
+        ])
+        if not all(result.successful for result in params):
+            res.success = False
+            res.message = 'Pallet logic reset incomplete: failed to clear reserved shelf slot'
+            return res
+        self.p['drop_slot'] = ''
+        self.p['cargo_type_override'] = ''
+        state = CARRYING if cargo is True else IDLE
+        self._set_state(state, 'Logic reset by operator; cargo and lift position preserved')
+        cargo_label = 'true' if cargo is True else 'false' if cargo is False else 'unknown'
+        res.success, res.message = True, (
+            f'{state}; cargo={cargo_label}; cargo/lift unchanged; reserved slot cleared')
         return res
 
     def _srv_set_home(self, req, res):
@@ -970,9 +1038,13 @@ class PalletMission(Node):
 
     def _on_route_path(self, msg: String):
         """Take HOME from the graph selected by the active Nav2 launch."""
+        self._route_path_last_received = time.monotonic()
+        if msg.data == self._route_path_loaded:
+            return
         try:
             from amr_navigation.route_graph_loader import RouteGraphLoader
             loader = RouteGraphLoader(yaml_path=msg.data)
+            loader.get_all_node_names()
             home_name = loader.resolve('HOME')
             if home_name is None:
                 names = loader.get_all_node_names()
@@ -985,6 +1057,7 @@ class PalletMission(Node):
             self._home = (home_pose.pose.position.x, home_pose.pose.position.y,
                           math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                                      1.0 - 2.0 * (q.y * q.y + q.z * q.z)))
+            self._route_path_loaded = msg.data
             self.get_logger().info(
                 f'HOME loaded from active Nav2 graph {msg.data}: '
                 f'({self._home[0]:.3f}, {self._home[1]:.3f}, '
@@ -1111,6 +1184,7 @@ class PalletMission(Node):
         self._pre = None
         self._pallet_ins = None
         self._mode = 'pick'
+        self._us_pick_confirmed = False
         self._cargo_samples.clear()
         self._cargo_class = None
         self._cargo_type = None
@@ -1350,8 +1424,13 @@ class PalletMission(Node):
             shift = math.hypot(now_ins[0] - stored[0], now_ins[1] - stored[1])
             dyaw = math.degrees(abs(norm_angle(now_ins[2] - stored[2])))
             if shift > self.p['amcl_shift_fail_m']:
-                self._set_state(FAILED, f'map->odom doi {shift:.2f} m tu luc detect '
-                                        f'(odom reset?) -> detect lai')
+                # fail_phase='DETECT_DRIFT': xe DUNG YEN tai diem lay, chua cam
+                # pallet, chua dua cang vao pallet -> an toan de supervisor detect
+                # lai va thu tiep (khong can nguoi). Truoc day fail_phase=None
+                # nen loi nay luon bi day vao RECOVERY.
+                self._finish(FAILED, f'map->odom doi {shift:.2f} m tu luc detect '
+                                     f'(odom reset?) -> detect lai',
+                             fail_phase='DETECT_DRIFT')
                 return
             self.get_logger().info(f'[diag] map->odom doi {shift * 100:.1f} cm / {dyaw:.1f} deg '
                                    f'tu luc detect (yaw pallet map={math.degrees(self._result["yaw"]):.1f})')
@@ -1409,6 +1488,10 @@ class PalletMission(Node):
             return
         if done:
             self._ins_msg = done
+            # In pick mode ApproachController only completes after the fresh
+            # ultrasonic samples confirm contact in the LOCK phase.
+            if self._mode == 'pick':
+                self._us_pick_confirmed = True
             self._halt()
             if self._mode == 'drop':
                 self._drop_inserted()       # ha lift -> lui ra -> ha lift ve 0 -> DONE
@@ -1903,10 +1986,16 @@ class PalletMission(Node):
             self._ctl.resume_converge(time.monotonic())
             self._set_state(INSERTING, f'Lift {h:.1f} cm -> tien vao ke')
         elif nxt == 'drop_release':
-            self._begin_backoff(dist=self._drop_back_m, after='drop', cargo=False,
+            # Giu `cargo=True` cho toi khi lui xong + lift ve 0 (drop_done).
+            # Truoc day dat False o day -> neu BACKING fail giua chung thi pallet
+            # da nam tren ke nhung he thong "nghi" xe khong cam gi, supervisor goi
+            # lai drop (bi tu choi) -> ket vao RECOVERY khong loi thoat.
+            self._begin_backoff(dist=self._drop_back_m, after='drop', cargo=True,
                                 msg=f'Da dat pallet len ke (lift {h:.1f} cm) -> lui {self._drop_back_m * 100:.0f} cm')
         elif nxt == 'drop_done':
             slot = (self._drop or {}).get('slot', '?')
+            # Luu toi day moi xoa co hang: pallet da len ke va lui xong.
+            self._cargo = False
             self._set_state(DONE, f'XONG DROP vao o {slot} | lift ve {h:.1f} cm')
         else:
             self._set_state(FAILED, f'lift_next khong hop le: {nxt}')
@@ -1922,6 +2011,7 @@ class PalletMission(Node):
             self.get_logger().warn(f'Cancel all Nav2 goals failed: {e}')
 
     def _emergency_stop(self):
+        """Issue drive zero and lift M0 without changing cargo or lift target."""
         if self._goal_handle is not None:
             try:
                 self._goal_handle.cancel_goal_async()
@@ -1932,7 +2022,17 @@ class PalletMission(Node):
         self._terminate_detector()
         self._halt()
         self._lift_stop()
-        self._set_state(STOPPED, 'DUNG KHAN CAP (xe + lift)')
+        missing = []
+        if self.pub_cmd.get_subscription_count() == 0:
+            missing.append(self.p['cmd_vel_topic'])
+        if self.pub_esp32.get_subscription_count() == 0:
+            missing.append(self.p['esp32_cmd_topic'])
+        if missing:
+            message = 'STOP not confirmed; no subscriber for ' + ', '.join(missing)
+            self._set_state(FAILED, message)
+            return False, message
+        self._set_state(STOPPED, 'DUNG KHAN CAP (xe + lift; M0 da gui)')
+        return True, 'STOP commands published to drive and lift controller (M0)'
 
     # ==================================================================
     # Timers

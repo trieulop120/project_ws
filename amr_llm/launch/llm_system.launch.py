@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Launch hệ thống LLM điều khiển robot bằng tiếng Việt.
 
-  ros2 launch amr_llm llm_system.launch.py                  # dry_run (an toàn)
-  ros2 launch amr_llm llm_system.launch.py dry_run:=false   # chạy thật
+  ros2 launch amr_llm llm_system.launch.py                  # chạy thật
+  ros2 launch amr_llm llm_system.launch.py dry_run:=true     # chỉ xem trước kế hoạch
 
 Giao diện giọng nói nằm trong dashboard có sẵn (llm_voice.js) - sau khi
 amr_web đã vá qua apply script, KHÔNG cần with_web.
@@ -29,6 +29,8 @@ def _preflight(context, *args, **kwargs):
     if LaunchConfiguration("dry_run").perform(context).lower() == "false":
         msgs.append(LogInfo(msg="[CHẠY THẬT] dry_run=false - robot sẽ di chuyển. "
                                 "Giữ nút dừng cứng trong tầm tay."))
+    else:
+        msgs.append(LogInfo(msg="[DRY RUN] Chỉ xem trước kế hoạch; không gửi lệnh điều khiển robot."))
     if LaunchConfiguration("with_web").perform(context).lower() == "true":
         msgs.append(LogInfo(msg="[CẢNH BÁO] with_web=true nhưng llm_web_node không "
                                 "tồn tại trong repo - bỏ qua. Dùng dashboard "
@@ -38,8 +40,8 @@ def _preflight(context, *args, **kwargs):
 
 def generate_launch_description():
     dry_run = DeclareLaunchArgument(
-        "dry_run", default_value="true",
-        description="true: chỉ in kế hoạch, robot không chạy thật")
+        "dry_run", default_value="false",
+        description="true: chỉ xem trước kế hoạch, không gửi lệnh cho robot")
     require_confirm = DeclareLaunchArgument(
         "require_confirm", default_value="true",
         description="true: phải xác nhận kế hoạch trước khi chạy")

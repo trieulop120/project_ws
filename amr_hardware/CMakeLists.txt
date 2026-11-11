@@ -19,6 +19,7 @@ install(FILES
 # Install config (udev rules)
 install(FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/config/99-amr-usb.rules
+  ${CMAKE_CURRENT_SOURCE_DIR}/config/twist_mux.yaml
   DESTINATION share/${PROJECT_NAME}/config
 )
 

@@ -41,6 +41,7 @@ class MissionGUINode(Node):
             'mission_manager/trigger_home_to_p2',
             'mission_manager/trigger_p1_to_d1',
             'mission_manager/trigger_p2_to_d1',
+            'mission_manager/trigger_p1_to_p2',
             'mission_manager/trigger_d1_to_p1',
             'mission_manager/trigger_d1_to_p2',
             'mission_manager/trigger_return_home',

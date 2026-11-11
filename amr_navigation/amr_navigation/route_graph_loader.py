@@ -170,11 +170,13 @@ class RouteGraphLoader:
         pose = PoseStamped()
         pose.header.frame_id = 'map'
 
-        pose.pose.position.x = pos.get('x', 0.0)
-        pose.pose.position.y = pos.get('y', 0.0)
-        pose.pose.position.z = pos.get('z', 0.0)
+        # YAML commonly writes zero coordinates as integers (for example
+        # `z: 0`). ROS geometry message fields require Python floats.
+        pose.pose.position.x = float(pos.get('x', 0.0))
+        pose.pose.position.y = float(pos.get('y', 0.0))
+        pose.pose.position.z = float(pos.get('z', 0.0))
 
-        yaw = orient.get('yaw', 0.0)
+        yaw = float(orient.get('yaw', 0.0))
         pose.pose.orientation = self._yaw_to_quaternion(yaw)
 
         return pose
@@ -183,6 +185,53 @@ class RouteGraphLoader:
         """Lay tat ca ten node."""
         self._load()
         return self._node_order.copy()
+
+    def get_connected_nodes(self, node_name: str) -> List[str]:
+        """Ten cac node ke voi `node_name` qua edge trong graph.
+
+        Dung de kiem tra mot node co "nhanh" nao dang hoat dong hay khong:
+        vi du P_2 chi duoc dung khi graph that co edge noi P_2 voi node
+        khac (khong phai node bi bo troi trong YAML).
+
+        Quy uoc edge trong YAML:
+            - `from` / `to` la TEN node (khong phai id).
+            - `bidirectional` thi cho ca hai chieu; thieu key = mac dinh True
+              (khop voi yaml_to_geojson.py).
+            - `distance` la tu chon, khong bat buoc.
+
+        Returns:
+            Danh sach ten node lien ke (khong trung ten node, thu tu file).
+            Rong [] neu node khong ton tai hoac khong co edge nao.
+        """
+        self._load()
+        if node_name not in self._node_order:
+            return []
+        edges = self._yaml_data.get('edges') or []
+        known = set(self._node_order)
+        out: List[str] = []
+        for e in edges:
+            if not isinstance(e, dict):
+                continue
+            src, dst = e.get('from'), e.get('to')
+            if src is None or dst is None:
+                continue
+            # Edge chi hop le khi ca hai dau deu la node co that.
+            if src not in known or dst not in known:
+                continue
+            # Chieu thuan chi hop le khi bidirectional (thieu key = True).
+            fwd = (e.get('bidirectional') is not False)
+            if src == node_name and dst != node_name:
+                out.append(dst)
+            elif dst == node_name and src != node_name and fwd:
+                out.append(src)
+        # Bo trung, giu thu tu xuat hien trong file.
+        seen = set()
+        uniq = []
+        for n in out:
+            if n not in seen:
+                seen.add(n)
+                uniq.append(n)
+        return uniq
 
     def get_summary(self) -> str:
         """Tao summary cho log."""

@@ -59,6 +59,32 @@ function handleCommandResponse(d) {
 
     console.log('Command response:', cmd, status, message);
 
+    if (cmd && cmd.startsWith('mission_cycle_')) {
+        if (typeof window.handleMissionCycleCommandResponse === 'function') {
+            window.handleMissionCycleCommandResponse(d);
+        }
+        if (typeof window.showToast === 'function') {
+            let text;
+            if (status === 'error') text = message || 'Mission command failed';
+            else if (cmd === 'mission_cycle_start') text = 'Auto cycle started';
+            else if (cmd === 'mission_cycle_stop') text = 'Cycle stopped';
+            else if (cmd === 'mission_cycle_resume') text = 'Cycle resumed';
+            else text = 'Mission command accepted';
+            window.showToast(text, status === 'error' ? 'error' : 'success');
+        }
+        return;
+    }
+
+    if (cmd === 'set_op_mode') {
+        return;
+    }
+
+    if (cmd === 'get_nav_state' && d.nav_state &&
+        typeof window.handleNavStateUpdate === 'function') {
+        window.handleNavStateUpdate(d.nav_state);
+        return;
+    }
+
     // Phase 5 Fix: Redirect nav commands to navigation.js
     if (['start_navigation', 'stop_navigation', 'nav_goal', 'nav_cancel',
          'waypoint_mission', 'set_initial_pose', 'emergency_stop'].includes(cmd)) {

@@ -34,6 +34,10 @@
           route="{route}"/>
 
         <FollowPath path="{route_path}"/>
+
+        <!-- Chot pose dich chinh xac sau khi da di het route graph -->
+        <ComputePathToPose goal="{goal}" path="{goal_pose_path}"/>
+        <FollowPath path="{goal_pose_path}"/>
       </Sequence>
 
       <!-- FALLBACK: route_server loi -> Nav2 free navigation -->

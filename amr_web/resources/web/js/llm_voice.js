@@ -12,10 +12,11 @@
     // Cấu hình
     // ============================================
     const REQUIRE_NAV = true;    // phải bật Navigation (Nav2) mới cho LLM chạy lệnh
-    const REQUIRE_AUTO = true;   // phải ở chế độ AUTO (tránh xung đột với teleop tay)
     const LOCATIONS = ['home', 'p1', 'p2', 'd1', 'unknown'];
-    const STOP_RE = /^(dừng|dung|stop|khẩn cấp|emergency)(\s|$)/i;
-    const CANCEL_RE = /^(hủy|huỷ|không|thôi|cancel|no)(\s|$)/i;
+    // STOP intent at the start of a compound command still stops immediately;
+    // trailing requests are discarded and can be sent again after the stop.
+    const STOP_RE = /^(dừng( lại)?|dung( lai)?|stop( the robot)?|emergency stop|khẩn cấp|hủy|huỷ|cancel|thôi)(?=$|[\s,;.!?:])/i;
+    const CANCEL_RE = /^(hủy|huỷ|không|thôi|cancel|no)$/i;
     const YES_RE = /^(xác nhận|đồng ý|ok|okay|oke|chạy đi|làm đi|được|confirm|yes|go ahead)(\s|$)/i;
     const WATCHDOG_MS = 6000;
 
@@ -26,13 +27,13 @@
         en: {
             status: {
                 planning: 'Thinking…', waiting_confirm: 'Waiting for confirmation',
-                running: 'Running', done: 'Done', failed: 'Failed', error: 'Error',
+                running: 'Running', done: 'Done', started: 'Cycle started', simulated: 'Preview complete; no robot commands were sent', failed: 'Failed', error: 'Error',
                 clarify: 'Robot asks', stopped: 'Stopped', noop: 'Nothing to do',
                 cancelled: 'Cancelled', idle: 'Ready', busy: 'Busy'
             },
-            welcome: "LLM Assistant is ready. Example: 'pick pallet at P1 and place on level 2 rack'. Say 'stop' for emergency stop.",
+            welcome: "LLM Assistant is ready. Example: 'pick pallet at P1 and place on level 2 rack'. Say 'stop' to stop the active mission.",
             httpWarn: 'HTTP connection detected: Browser restricts microphone access. Please use HTTPS, localhost, or mobile voice keyboard.',
-            manualWarn: 'Robot is currently in MANUAL mode. Please switch to AUTO mode first.',
+            manualWarn: 'Robot is currently in MANUAL mode. Navigation commands remain available when their safety checks pass.',
             navWarn: 'Navigation (Nav2) is not running. Please start Navigation first.',
             placeholder: 'Type your command...',
             micTitle: 'Tap to speak',
@@ -45,11 +46,20 @@
             locLabel: 'Robot location:',
             goHome: 'Return to HOME',
             goRoute: 'Go route ',
+            mode: 'Set operating mode:',
+            quickGoal: 'Navigate to',
+            autoCycle: 'Start automatic pallet cycle',
+            singleCycle: 'Run one pallet cycle',
+            stopCycle: 'Stop pallet cycle',
+            resumeCycle: 'Resume pallet cycle',
+            cancelNavigation: 'Cancel current navigation goal',
             arrow: ' → ',
             pick: 'Detect and pick pallet',
             drop: 'Place pallet on shelf',
             lift: 'Lift height: ',
             planTitle: 'Plan:',
+            actionsTitle: 'Actions to execute:',
+            interpretation: 'LLM interpretation: ',
             btnYes: 'Confirm',
             btnNo: 'Cancel',
             okYes: '✔ confirmed',
@@ -68,14 +78,14 @@
         vi: {
             status: {
                 planning: 'Đang suy nghĩ…', waiting_confirm: 'Chờ bạn xác nhận',
-                running: 'Đang chạy', done: 'Hoàn thành', failed: 'Thất bại',
-                error: 'Lỗi', clarify: 'Robot hỏi lại', stopped: 'Đã dừng',
+                running: 'Đang chạy', done: 'Hoàn thành', started: 'Đã khởi động chu trình', simulated: 'Xem trước hoàn tất; robot không nhận lệnh điều khiển', failed: 'Thất bại', error: 'Lỗi',
+                clarify: 'Robot hỏi lại', stopped: 'Đã dừng',
                 noop: 'Không có hành động', cancelled: 'Đã hủy',
                 idle: 'Sẵn sàng', busy: 'Đang bận'
             },
-            welcome: "Trợ lý LLM sẵn sàng. Ví dụ: 'đi lấy pallet ở P1 rồi đưa lên kệ tầng 2'. Nói 'dừng' để dừng khẩn.",
+            welcome: "Trợ lý LLM sẵn sàng. Ví dụ: 'đi lấy pallet ở P1 rồi đưa lên kệ tầng 2'. Nói 'dừng' để dừng mission đang chạy.",
             httpWarn: 'Trang chạy HTTP nên trình duyệt chặn micro. Mở bằng https (Tailscale) hoặc localhost, hoặc dùng nút micro trên bàn phím điện thoại.',
-            manualWarn: 'Robot đang ở chế độ MANUAL. Hãy chuyển sang AUTO trước.',
+            manualWarn: 'Robot đang ở chế độ MANUAL. Vẫn có thể ra lệnh điều hướng nếu vượt qua các chốt an toàn.',
             navWarn: 'Chưa bật Navigation (Nav2). Hãy Start Navigation trước.',
             placeholder: 'Nhập lệnh của bạn...',
             micTitle: 'Chạm để nói',
@@ -88,11 +98,20 @@
             locLabel: 'Vị trí robot:',
             goHome: 'Quay về HOME',
             goRoute: 'Đi tuyến ',
+            mode: 'Chuyển mode:',
+            quickGoal: 'Đi tới quick goal',
+            autoCycle: 'Chạy chu trình pallet Auto',
+            singleCycle: 'Chạy một chu trình pallet',
+            stopCycle: 'Dừng chu trình pallet',
+            resumeCycle: 'Tiếp tục chu trình pallet',
+            cancelNavigation: 'Hủy goal điều hướng hiện tại',
             arrow: ' → ',
             pick: 'Nhận diện và lấy pallet',
             drop: 'Đặt pallet lên kệ',
             lift: 'Nâng/hạ càng: ',
             planTitle: 'Kế hoạch:',
+            actionsTitle: 'Các thao tác sẽ thực hiện:',
+            interpretation: 'LLM diễn giải: ',
             btnYes: 'Xác nhận',
             btnNo: 'Hủy',
             okYes: '✔ đã xác nhận',
@@ -403,6 +422,13 @@
         if (s.action === 'pick_pallet') return t.pick;
         if (s.action === 'drop_pallet') return t.drop;
         if (s.action === 'lift_to') return t.lift + a.level;
+        if (s.action === 'set_mode') return `${t.mode} ${a.mode}`;
+        if (s.action === 'quick_goal') return `${t.quickGoal} ${a.target}`;
+        if (s.action === 'start_auto_cycle') return t.autoCycle;
+        if (s.action === 'start_single_cycle') return t.singleCycle;
+        if (s.action === 'stop_cycle') return t.stopCycle;
+        if (s.action === 'resume_cycle') return t.resumeCycle;
+        if (s.action === 'cancel_navigation') return t.cancelNavigation;
         return s.action;
     }
 
@@ -417,9 +443,11 @@
         closePlan(T().noteNew);
         curSteps = s.steps || [];
         const b = h('div', 'llm-msg llm-plan');
-        b.appendChild(h('div', null, s.msg || T().planTitle));
+        b.appendChild(h('div', null, T().actionsTitle));
+        if (s.say) b.appendChild(h('div', 'llm-msg sys', T().interpretation + s.say));
         const ol = h('ol');
-        curSteps.forEach((x) => ol.appendChild(h('li', null, describe(x))));
+        const summary = Array.isArray(s.action_summary) ? s.action_summary : curSteps.map(describe);
+        summary.forEach((x) => ol.appendChild(h('li', null, String(x))));
         b.appendChild(ol);
         const row = h('div', 'llm-row');
         const yes = h('button', 'llm-btn ok', T().btnYes);
@@ -439,7 +467,6 @@
     // ============================================
     function preflight() {
         if (REQUIRE_NAV && !window.isNavigationActive) return T().navWarn;
-        if (REQUIRE_AUTO && window.currentOpMode !== 'AUTO') return T().manualWarn;
         return null;
     }
 
@@ -448,20 +475,21 @@
         speaking = false;
         if (rec && listening) { try { rec.abort(); } catch (e) { /* bỏ qua */ } }
         clearTimeout(watchdog);
-        // Dùng đúng đường dừng khẩn của dashboard + bảo node LLM hủy kế hoạch
-        send({ command: 'nav_cancel' });
-        send({ command: 'emergency_stop' });
+        // Let the LLM node select the active mission's stop path (cycle,
+        // pallet action, or a standalone Nav2 goal).
         send({ command: 'llm_stop' });
-        addMsg('user', '⛔ DỪNG KHẨN');
-        activity('warn', 'LLM: dừng khẩn');
+        addMsg('user', '⛔ STOP');
+        activity('warn', 'LLM: stop requested');
     }
 
-    function sendLLM(text) {
+    function sendLLM(text, speechConfidence) {
         const problem = preflight();
         if (problem) { addMsg('sys', '⚠ ' + problem, 'err'); toast(problem, 'warn'); speak(problem); return; }
         addMsg('user', text);
         activity('info', 'LLM lệnh: ' + text);
-        if (!send({ command: 'llm_command', text: text })) {
+        const command = { command: 'llm_command', text: text, language: lang };
+        if (Number.isFinite(speechConfidence) && speechConfidence >= 0) command.speech_confidence = speechConfidence;
+        if (!send(command)) {
             addMsg('sys', T().wsDown, 'err');
             return;
         }
@@ -470,7 +498,7 @@
     }
 
     // fromVoice: true nếu là câu nói (xác nhận bằng giọng chỉ hoạt động khi bật tùy chọn)
-    function processText(raw, fromVoice) {
+    function processText(raw, fromVoice, speechConfidence) {
         const text = (raw || '').trim();
         if (!text) return;
         el.input.value = '';
@@ -482,7 +510,7 @@
             if (CANCEL_RE.test(t)) { addMsg('user', text); send({ command: 'llm_confirm', ok: false }); closePlan(T().okNo); return; }
         }
         if (state === 'running' && CANCEL_RE.test(t)) { stopAll(); return; }   // "hủy/thôi" khi đang chạy = dừng
-        sendLLM(text);
+        sendLLM(text, speechConfidence);
     }
 
     // ============================================
@@ -500,13 +528,40 @@
 
     function setMic(on) {
         listening = on;
-        el.mic.classList.toggle('live', on);
-        el.mic.innerHTML = on ? ICONS.micActive : ICONS.mic;
+        if (el.mic) {
+            el.mic.classList.toggle('live', on);
+            el.mic.innerHTML = on ? ICONS.micActive : ICONS.mic;
+        }
         if (el.fab) {
             el.fab.classList.toggle('live', on);
             el.fab.innerHTML = on ? ICONS.micActive : ICONS.mic;
         }
     }
+
+    window.resetLLMSession = function () {
+        if (window.speechSynthesis) window.speechSynthesis.cancel();
+        speaking = false;
+        if (rec) {
+            try { rec.abort(); } catch (e) { /* phiên nghe có thể đã đóng */ }
+            rec = null;
+        }
+        listening = false;
+        clearTimeout(watchdog);
+        watchdog = null;
+        if (planBubble?.row?.parentNode) planBubble.row.remove();
+        planBubble = null;
+        curSteps = [];
+        lastStep = -1;
+        state = '';
+        lastStatus = null;
+        if (el.input) el.input.value = '';
+        setMic(false);
+        if (el.chat) {
+            el.chat.replaceChildren();
+            addMsg('sys', T().welcome);
+        }
+        renderStatus();
+    };
 
     function startListen() {
         if (!SR) { addMsg('sys', T().noMic, 'err'); return; }
@@ -517,13 +572,17 @@
         rec.continuous = false;
         rec.maxAlternatives = 1;
         rec.onresult = (e) => {
-            let t = '', fin = false;
+            let t = '', fin = false, confidence = null;
             for (let i = e.resultIndex; i < e.results.length; i++) {
                 t += e.results[i][0].transcript;
-                if (e.results[i].isFinal) fin = true;
+                if (e.results[i].isFinal) {
+                    fin = true;
+                    const score = Number(e.results[i][0].confidence);
+                    if (Number.isFinite(score) && score >= 0) confidence = score;
+                }
             }
             el.input.value = t;
-            if (fin) { if (el.auto.checked) processText(t, true); }
+            if (fin) { if (el.auto.checked) processText(t, true, confidence); }
         };
         rec.onerror = (e) => {
             const t = T();
@@ -573,9 +632,18 @@
                 speak(s.msg, startListen);
                 break;
             case 'done':
-                addMsg('robot', '✔ ' + t.status.done + '.');
-                speak(t.status.done + '.');
-                activity('success', 'LLM: ' + t.status.done);
+                const doneText = s.msg || t.status.done;
+                addMsg('robot', '✔ ' + doneText + '.');
+                speak(doneText + '.');
+                activity('success', 'LLM: ' + doneText);
+                break;
+            case 'simulated':
+                addMsg('robot', '◉ ' + (s.msg || t.status.simulated) + '.');
+                speak((s.msg || t.status.simulated) + '.');
+                break;
+            case 'started':
+                addMsg('robot', '▶ ' + (s.msg || t.status.started) + '.');
+                speak((s.msg || t.status.started) + '.');
                 break;
             case 'stopped':
                 addMsg('robot', '⛔ ' + t.status.stopped + '.');

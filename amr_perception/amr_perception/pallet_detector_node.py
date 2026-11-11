@@ -335,7 +335,7 @@ class PalletDetectorNode(Node):
         # 2D-associated with the pallet (is_pallet_loaded), and its depth is
         # measurable; otherwise 'unknown' -- never a guess.
         self.declare_parameter('use_box_height_class', True)
-        self.declare_parameter('box_height_threshold_m', 0.30)  # >= tall, < medium
+        self.declare_parameter('box_height_threshold_m', 0.32)  # >= tall, < medium
         self.declare_parameter('box_height_min_pixels', 30)
         # Optional mission-level cargo filter. Empty means retain the normal
         # detector policy. When set, SEARCH only locks pallets whose measured

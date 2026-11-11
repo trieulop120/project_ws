@@ -121,6 +121,30 @@
 .nav-badge.succeeded { background: rgba(16, 185, 129, .15); color: var(--success); border-color: rgba(16, 185, 129, .3); }
 .nav-badge.failed { background: rgba(239, 68, 68, .15); color: var(--error); border-color: rgba(239, 68, 68, .3); }
 .nav-badge.unknown { background: var(--bg-panel-secondary); color: var(--text-muted); }
+.nav-badge.muted { background: transparent; color: var(--text-muted); border-color: transparent; }
+
+/* Cột trái 280px: cho text action/target + badge ko bi tran */
+.mission-status-header { min-height: 40px; }
+.nav-task-info .info-row {
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+    min-width: 0;
+}
+.nav-task-info .info-row > span { flex: 0 0 auto; }
+.nav-task-info .info-row strong {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* Badge mission: co chiu, cat … neu doi, de card title khong bi day ra */
+.panel-card-header .nav-status-badge {
+    max-width: 60%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 
 /* Navigation Status Badge */
 .nav-status-badge {
@@ -135,6 +159,15 @@
 .nav-status-badge.active {
     background: rgba(85, 221, 187, 0.15);
     color: var(--accent);
+}
+
+.nav-status-badge.warning {
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--warning);
+}
+
+.mission-action-recovery {
+    color: var(--warning) !important;
 }
 
 /* Live Map Panel */
@@ -418,6 +451,16 @@
     padding: 8px 12px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-panel-secondary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.panel-card-header .card-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .card-title {
@@ -503,6 +546,35 @@
 
 .btn-accent:hover {
     background: #6EE7C4;
+}
+
+.btn-recovery {
+    background: transparent;
+    border: 1px solid var(--warning);
+    color: var(--warning);
+}
+
+.btn-recovery:hover {
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    border-color: var(--warning);
+    color: var(--warning);
+}
+
+.btn-recovery:active:not(:disabled) {
+    background: color-mix(in srgb, var(--warning) 20%, transparent);
+}
+
+.btn-recovery:focus-visible {
+    outline: 2px solid var(--warning);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 25%, transparent);
+}
+
+.btn-recovery:disabled {
+    background: transparent;
+    border-color: color-mix(in srgb, var(--warning) 55%, transparent);
+    color: color-mix(in srgb, var(--warning) 70%, var(--bg-panel));
+    cursor: not-allowed;
 }
 
 .btn-outline-danger {
@@ -1940,6 +2012,10 @@
   background: var(--accent);
   color: #000;
 }
+.btn-mode.pending:not(.active) {
+  color: var(--accent);
+  box-shadow: inset 0 -2px var(--accent);
+}
 
 .cargo-status {
   display: flex;
@@ -1950,6 +2026,14 @@
   font-weight: 700;
   font-size: 0.65rem;
   transition: all 0.3s ease;
+  min-width: 0;
+  overflow: hidden;
+}
+.cargo-status span,
+.cargo-status:only-child {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  text-align: center;
 }
 .cargo-status.empty {
   background: var(--bg-primary);
@@ -1960,6 +2044,16 @@
   background: rgba(16, 185, 129, 0.15);
   color: #10B981;
   border: 1px solid #10B981;
+}
+.cargo-status.detecting {
+  background: rgba(6, 182, 212, 0.12);
+  color: var(--accent-secondary);
+  border: 1px solid var(--accent-secondary);
+}
+.cargo-status.detecting.confirmed {
+  background: rgba(16, 185, 129, 0.15);
+  color: var(--success);
+  border-color: var(--success);
 }
 /* Mission not live: dim the whole badge so "EMPTY" is not read as a live state */
 .cargo-status.stale {
@@ -2177,10 +2271,13 @@
 .mission-table-wrap {
   flex: 1;
   min-height: 0;
+  max-height: 100%;
   display: flex;
   flex-direction: column;
-  overflow-y: auto;     /* nhiều mission thì cuộn, header vẫn sticky */
+  overflow-y: auto;     /* cuộn riêng khi danh sách dài */
   overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
 }
 
 /* Scrollbar tối, mảnh (Chrome / Edge / Safari) */
@@ -2203,6 +2300,13 @@
   flex-shrink: 0;
 }
 
+.mission-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-panel-secondary);
+}
+
 .mission-table .mission-name {
   font-weight: 600;
   color: var(--text-primary);
@@ -2210,6 +2314,23 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+.mission-table .mission-time {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.mission-table .mission-outcome {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mission-table .mission-outcome.completed { color: var(--success); }
+.mission-table .mission-outcome.recovery { color: var(--warning); }
+.mission-table .mission-outcome.resumed { color: var(--warning); }
+.mission-table .mission-outcome.canceled { color: var(--error); }
 
 /* Trạng thái rỗng: căn giữa ngang + dọc trong phần còn lại của card */
 .mission-empty {

@@ -224,10 +224,12 @@ class RouteGraphPublisher(Node):
 
         route_path_msg = String()
         route_path_msg.data = os.path.abspath(os.path.expanduser(self.graph_yaml_path))
+        self._route_path_msg = route_path_msg
         self.route_path_pub.publish(route_path_msg)
         self.get_logger().info(
             f'Published active route YAML path on /navigation/route_yaml_path: '
             f'{route_path_msg.data}')
+        self._route_path_timer = self.create_timer(2.0, self._republish_route_path)
 
         self.get_logger().info(
             f'Loaded {len(self.nodes)} nodes, {len(self.edges)} edges'
@@ -235,9 +237,11 @@ class RouteGraphPublisher(Node):
 
         # Publish markers
         self._publish_markers()
-
-        # Republish periodically de dam bao RViz nhan
+        # Republish markers periodically to ensure RViz receives them.
         self.timer = self.create_timer(1.0, self._publish_markers)
+
+    def _republish_route_path(self):
+        self.route_path_pub.publish(self._route_path_msg)
 
     def _publish_markers(self):
         """Publish all route graph markers"""
@@ -249,10 +253,12 @@ class RouteGraphPublisher(Node):
 
         # Nodes
         for i, (name, data) in enumerate(self.nodes.items()):
-            x = data['position']['x']
-            y = data['position']['y']
-            z = data['position']['z'] + Z_OFFSET
-            yaw = data.get('orientation', {}).get('yaw', 0)
+            # YAML may parse whole-number coordinates as int, while ROS
+            # geometry message fields require Python floats.
+            x = float(data['position']['x'])
+            y = float(data['position']['y'])
+            z = float(data['position']['z']) + Z_OFFSET
+            yaw = float(data.get('orientation', {}).get('yaw', 0))
             ntype = data.get('type', 'transit')
             is_home = (name == HOME_NODE_NAME)
             is_transit = ntype in ('transit', 'junction')
@@ -351,13 +357,13 @@ class RouteGraphPublisher(Node):
             m.action = Marker.ADD
             m.points = [
                 Point(
-                    x=from_node['position']['x'],
-                    y=from_node['position']['y'],
+                    x=float(from_node['position']['x']),
+                    y=float(from_node['position']['y']),
                     z=Z_OFFSET
                 ),
                 Point(
-                    x=to_node['position']['x'],
-                    y=to_node['position']['y'],
+                    x=float(to_node['position']['x']),
+                    y=float(to_node['position']['y']),
                     z=Z_OFFSET
                 )
             ]

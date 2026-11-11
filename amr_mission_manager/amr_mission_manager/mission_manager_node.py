@@ -37,13 +37,14 @@ import xml.etree.ElementTree as ET
 import rclpy
 from action_msgs.msg import GoalStatus
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.action import ActionClient
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor, MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import ComputeRoute, NavigateToPose
 from std_msgs.msg import String
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from std_srvs.srv import Empty
+from std_srvs.srv import Empty, Trigger
 
 
 NODE_NAME = 'mission_manager'
@@ -56,6 +57,7 @@ MISSION_BT_MAP = {
     'home_to_p2': ('NODE_HOME', 'P_2', 'home_to_p2.xml'),   # HOME -> P_2
     'p1_to_d1':   ('P_1',       'D_1', 'p1_to_d1.xml'),     # P_1 -> D_1
     'p2_to_d1':   ('P_2',       'D_1', 'p2_to_d1.xml'),     # P_2 -> D_1
+    'p1_to_p2':   ('P_1',       'P_2', 'p1_to_p2.xml'),     # P_1 -> P_2 (nhánh lấy thứ 2)
     'd1_to_p1':   ('D_1',       'P_1', 'd1_to_p1.xml'),     # D_1 -> P_1
     'd1_to_p2':   ('D_1',       'P_2', 'd1_to_p2.xml'),     # D_1 -> P_2
     'return_home': ('',          'NODE_HOME', 'return_home.xml'),
@@ -215,6 +217,8 @@ class MissionManager(Node):
         # Route graph source is announced by route_graph_publisher, which is
         # configured by nav2.launch. Do not choose a package-local graph here.
         self._loader = None
+        self._route_path_loaded = None
+        self._route_path_last_received = 0.0
         route_qos = QoSProfile(depth=1)
         route_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         route_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -223,7 +227,8 @@ class MissionManager(Node):
 
         # NavigateToPose action client
         self._nav_client = ActionClient(
-            self, NavigateToPose, 'navigate_to_pose'
+            self, NavigateToPose, 'navigate_to_pose',
+            callback_group=ReentrantCallbackGroup()
         )
 
         # ComputeRoute's BT node may fail while Nav2 is loading the custom BT
@@ -261,13 +266,17 @@ class MissionManager(Node):
 
     def _on_route_path(self, msg: String):
         """Load the route selected by the Nav2 launch."""
+        self._route_path_last_received = time.monotonic()
+        if msg.data == self._route_path_loaded:
+            return
         try:
             from amr_navigation.route_graph_loader import RouteGraphLoader
-            self._loader = RouteGraphLoader(
-                yaml_path=msg.data
-            )
+            loader = RouteGraphLoader(yaml_path=msg.data)
+            summary = loader.get_summary()
+            self._loader = loader
+            self._route_path_loaded = msg.data
             self.get_logger().info(f'Using active Nav2 route graph: {msg.data}')
-            self.get_logger().info(self._loader.get_summary())
+            self.get_logger().info(summary)
         except Exception as e:
             self._loader = None
             self.get_logger().error(f'Failed to load active Nav2 route graph {msg.data}: {e}')
@@ -291,6 +300,12 @@ class MissionManager(Node):
                 service_name,
                 lambda req, res, svc=svc_name: self._on_mission(req, res, svc)
             )
+            self.create_service(
+                Trigger,
+                service_name + '_ack',
+                lambda req, res, svc=svc_name: self._on_mission_ack(req, res, svc),
+                callback_group=ReentrantCallbackGroup()
+            )
 
         self.get_logger().info(f'Services: {", ".join(MISSION_BT_MAP.keys())}')
 
@@ -306,8 +321,21 @@ class MissionManager(Node):
         self._execute_mission(mission_name, start_node, dest_node, bt_file)
         return response
 
+    def _on_mission_ack(self, request, response, mission_name: str):
+        """Parallel Trigger endpoint: success only after Nav2 accepts the goal."""
+        if mission_name not in MISSION_BT_MAP:
+            response.success, response.message = False, f'Unknown mission: {mission_name}'
+            return response
+        start_node, dest_node, bt_file = MISSION_BT_MAP[mission_name]
+        self._active_mission = mission_name
+        accepted = self._execute_mission(
+            mission_name, start_node, dest_node, bt_file, wait_for_accept=True)
+        response.success = bool(accepted)
+        response.message = 'Nav2 accepted NavigateToPose goal' if accepted else 'Nav2 did not accept goal'
+        return response
+
     def _execute_mission(self, mission_name: str, start_node: str,
-                         destination: str, bt_file: str) -> bool:
+                         destination: str, bt_file: str, wait_for_accept: bool = False) -> bool:
         """Execute mission to destination.
 
         Chien luoc hybrid (Q1 - duyet):
@@ -348,6 +376,9 @@ class MissionManager(Node):
 
             self._nav_mode = nav_mode
             self._route_reason = route_reason
+            self.get_logger().info(
+                f'Navigation mode selected: nav_mode={nav_mode}, '
+                f'route_reason={route_reason}')
             if nav_mode == 'FREE':
                 self.get_logger().warn(
                     f'Route khong dung duoc ({route_reason}) -> '
@@ -355,9 +386,10 @@ class MissionManager(Node):
             else:
                 self.get_logger().info('  BT: %s (route)' % bt_file)
 
-            self._navigate_to_pose(pose, dst_node, bt_path,
-                                   use_home_pose=(mission_name == 'return_home'))
-            return True
+            return self._navigate_to_pose(
+                pose, dst_node, bt_path,
+                use_home_pose=(mission_name == 'return_home'),
+                wait_for_accept=wait_for_accept)
 
         except Exception as e:
             self.get_logger().error(f'Mission failed: {e}')
@@ -462,7 +494,8 @@ class MissionManager(Node):
         return self._probe.probe(start_id, dest_id,
                                   PROBE_WAIT_SERVER_S, PROBE_RESULT_TIMEOUT_S)
 
-    def _navigate_to_pose(self, pose: PoseStamped, node_name: str, bt_path: str, use_home_pose: bool = False):
+    def _navigate_to_pose(self, pose: PoseStamped, node_name: str, bt_path: str,
+                          use_home_pose: bool = False, wait_for_accept: bool = False):
         """Send NavigateToPose goal with custom BT (bt_path rong = Nav2 default BT)."""
         pose.header.stamp = self.get_clock().now().to_msg()
 
@@ -482,15 +515,33 @@ class MissionManager(Node):
 
         if not self._nav_client.server_is_ready():
             self.get_logger().error('NavigateToPose server not ready')
-            return
+            self._publish_status(self._active_mission, 'ABORTED', 'NavigateToPose server not ready')
+            return False
 
         send_future = self._nav_client.send_goal_async(
             goal,
             feedback_callback=lambda fb: None
         )
-        send_future.add_done_callback(
-            lambda f: self._on_goal_sent(f, node_name)
-        )
+        accepted_event = threading.Event() if wait_for_accept else None
+        accepted = {'value': False}
+
+        def _goal_response(future):
+            try:
+                handle = future.result()
+                accepted['value'] = bool(handle and handle.accepted)
+            except Exception:
+                accepted['value'] = False
+            self._on_goal_sent(future, node_name)
+            if accepted_event:
+                accepted_event.set()
+
+        send_future.add_done_callback(_goal_response)
+        if accepted_event:
+            if not accepted_event.wait(timeout=8.0):
+                self._publish_status(self._active_mission, 'ABORTED', 'timeout waiting for Nav2 goal acceptance')
+                return False
+            return accepted['value']
+        return True
 
     def _on_goal_sent(self, future, node_name: str):
         """Handle goal sent result."""
@@ -576,7 +627,9 @@ def main(args=None):
     rclpy.init(args=args)
     node = MissionManager()
     try:
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor(num_threads=4)
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

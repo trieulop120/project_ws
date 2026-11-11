@@ -11,6 +11,8 @@ ROS 2 Entry Point Node - Optimized for Overview Dashboard
 
 import asyncio
 import copy
+from collections import deque
+from datetime import datetime
 import json
 import math
 import os
@@ -23,12 +25,16 @@ from ament_index_python.packages import get_package_share_directory
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from action_msgs.msg import GoalStatusArray
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import BatteryState, Image, LaserScan, JointState
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
+from rcl_interfaces.srv import SetParameters
+from std_srvs.srv import Trigger
 import uvicorn
 
 # Phase B05: tf2_ros for pose re-frame (odom -> map)
@@ -82,6 +88,12 @@ class WebBridge(Node):
     Giám sát heartbeat 4 thiết bị: ESP32, LiDAR, Camera, Lift.
     """
 
+    _CYCLE_RUNNING = {
+        'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
+        'WAITING_SLOT', 'RETURN_HOME',
+    }
+    _CYCLE_BLOCKED_COMMANDS = _CYCLE_RUNNING | {'RECOVERY'}
+
     def __init__(self):
         super().__init__('web_bridge')
 
@@ -125,6 +137,8 @@ class WebBridge(Node):
         # pallet_mission status (JSON string) -> web cargo card.
         self.declare_parameter('mission_status_topic', '/pallet_mission/status')
         self._mission_status_topic = self.get_parameter('mission_status_topic').value
+        self.declare_parameter('supervisor_status_topic', '/mission_supervisor/status')
+        self._supervisor_status_topic = self.get_parameter('supervisor_status_topic').value
         self._lidar_topic = self.get_parameter('lidar_topic').value
         self._joint_topic = self.get_parameter('joint_topic').value
         self._pose_rate = self.get_parameter('pose_rate').value
@@ -150,6 +164,14 @@ class WebBridge(Node):
         # the mission node publishes; exposed to web as mission{state,cargo,
         # us_cm,lift_cm,ts} piggybacked on the 1Hz system_status broadcast.
         self._mission_status = None
+        self._mission_supervisor_status = None
+        self._recent_supervisor_missions = deque(maxlen=50)
+        self._recent_mission_baseline_pending = False
+        self._nav2_goal_active = {
+            'navigate_to_pose': False,
+            'navigate_through_poses': False,
+        }
+        self._plan_received_t = 0.0
 
         # State Managers
         self._state_bridge = StateBridge()
@@ -174,6 +196,12 @@ class WebBridge(Node):
         self._cb_map = MutuallyExclusiveCallbackGroup()
         self._cb_cam = MutuallyExclusiveCallbackGroup()
 
+        # Initialize laser callback state before starting the TF listener thread
+        # or creating subscriptions. The executor may invoke callbacks as soon
+        # as subscriptions exist, while __init__ is still running.
+        self._laser_interval = 0.1  # 10 Hz for laser scan
+        self._last_laser_convert = 0.0
+
         # Phase B05: tf2_ros buffer + listener for pose re-frame
         # spin_thread=True: /tf (tan so cao khi Nav2 chay) duoc xu ly o thread rieng,
         # khong tranh voi callback cua node nay.
@@ -196,7 +224,7 @@ class WebBridge(Node):
                 0.2, self._history_sample_pose)
 
         # Publishers cho teleop và lift
-        self._cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self._cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel_teleop', 10)
         self._esp32_cmd_pub = self.create_publisher(String, '/esp32_cmd', 10)
 
         # Laser scan subscription
@@ -240,6 +268,13 @@ class WebBridge(Node):
         self._plan_sub = self.create_subscription(
             Path, self._plan_topic, self._on_plan,
             qos_profile=plan_qos(), callback_group=self._cb_map)
+        for action_name in self._nav2_goal_active:
+            self.create_subscription(
+                GoalStatusArray,
+                f'/{action_name}/_action/status',
+                lambda msg, name=action_name: self._on_nav2_goal_status(name, msg),
+                10,
+                callback_group=self._cb_sensor)
         self._camera_sub = self.create_subscription(
             Image, self._camera_topic, self._on_camera_rgb, qos_profile=sensor_qos(),
             callback_group=self._cb_cam)
@@ -253,6 +288,15 @@ class WebBridge(Node):
         # is plain reliable (depth 10), so match it with the default profile.
         self._mission_status_sub = self.create_subscription(
             String, self._mission_status_topic, self._on_mission_status, 10)
+        self._mission_supervisor_status_sub = self.create_subscription(
+            String, self._supervisor_status_topic, self._on_mission_supervisor_status, 10)
+        self._mission_start_client = self.create_client(Trigger, '/mission/start')
+        self._mission_stop_client = self.create_client(Trigger, '/mission/stop')
+        self._mission_reset_client = self.create_client(Trigger, '/mission/reset')
+        self._mission_resume_client = self.create_client(Trigger, '/mission/resume')
+        self._mission_params_client = self.create_client(
+            SetParameters, '/mission_supervisor/set_parameters')
+        self._pallet_stop_client = self.create_client(Trigger, '/pallet_mission/stop')
         self._lidar_sub = self.create_subscription(
             LaserScan, self._lidar_topic, self._on_lidar, qos_profile=sensor_qos(),
             callback_group=self._cb_sensor)
@@ -271,12 +315,10 @@ class WebBridge(Node):
         self._pose_interval = 1.0 / self._pose_rate
         self._battery_interval = 1.0 / self._battery_rate
         self._system_status_interval = 1.0 / self._system_status_rate
-        self._laser_interval = 0.1  # 10 Hz for laser scan
         self._last_pose_send = 0.0
         self._last_battery_send = 0.0
         self._last_system_status_send = 0.0
         self._last_laser_send = 0.0
-        self._last_laser_convert = 0.0
         self._last_map_send = 0.0
         self._map_interval = 0.5  # 2 Hz for map broadcast
         self._map_pending = False
@@ -291,7 +333,6 @@ class WebBridge(Node):
         # Dedupe signatures: tranh emit lien tuc neu du lieu khong doi that su
         self._costmap_global_sig = None
         self._costmap_local_sig = None
-        self._plan_sig = None
 
         if self._verbose:
             self.get_logger().info(f'Web Bridge Running on {self._host}:{self._port}')
@@ -318,13 +359,24 @@ class WebBridge(Node):
         try:
             self._nav_bridge = NavBridge(
                 node=self,
-                ws_broadcast_callback=self.broadcast_threadsafe
+                ws_broadcast_callback=self.broadcast_threadsafe,
+                on_session_end=self._on_nav_session_end,
             )
             if self._verbose:
                 self.get_logger().info('NavBridge initialized')
         except Exception as e:
             self.get_logger().error(f'Failed to init NavBridge: {e}')
             self._nav_bridge = None
+
+    def _on_nav_session_end(self) -> None:
+        """Clear per-session dashboard caches without touching persistent history."""
+        self._mission_status = None
+        llm = getattr(self, 'llm', None)
+        if llm is not None:
+            try:
+                llm.reset()
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning(f'LLM session reset failed: {exc}')
 
     def _init_llm(self) -> None:
         """LLM bridge (lệnh tiếng Việt/giọng nói). Soft-fail: dashboard vẫn chạy nếu lỗi."""
@@ -333,12 +385,25 @@ class WebBridge(Node):
             from amr_llm.llm_bridge import LLMBridge
             self.llm = LLMBridge(
                 node=self,
-                broadcast=lambda d: self.broadcast_threadsafe(json.dumps(d)))
+                broadcast=lambda d: self.broadcast_threadsafe(json.dumps(d)),
+                precheck=self._llm_precheck)
             if self._verbose:
                 self.get_logger().info('LLMBridge initialized')
         except Exception as e:
             self.get_logger().error(f'Failed to init LLMBridge: {e}')
             self.llm = None
+
+    def _llm_precheck(self):
+        nav = self._nav_bridge.get_navigation_state() if self._nav_bridge else {}
+        if nav.get('nav2_ready') is not True:
+            return 'Nav2 chưa sẵn sàng; hãy khởi động navigation trước.'
+        status = self.get_mission_supervisor_status()
+        if status is None or status.get('stale'):
+            return 'Mission supervisor chưa có status mới.'
+        graph = status.get('route_graph') or {}
+        if graph.get('loaded') is not True:
+            return f"Route graph chưa sẵn sàng: {graph.get('error') or 'chưa được nạp'}"
+        return None
 
     def _init_history(self) -> None:
         """Initialise the operation history subsystem (additive, soft-fail)."""
@@ -423,6 +488,8 @@ class WebBridge(Node):
                         m = dict(m)
                         m['stale'] = (now - m.get('ts', 0.0)) > 3.0
                     system_status['mission'] = m
+                    supervisor = self.get_mission_supervisor_status()
+                    system_status['mission_supervisor'] = supervisor
                     await self._ws_manager.broadcast(json.dumps(system_status))
                     # [history] Feed the edge-trigger monitor (plan §6).
                     if _HISTORY_OK:
@@ -452,7 +519,7 @@ class WebBridge(Node):
 
                 # Phase C: costmap + plan broadcast (gate theo nav running)
                 nav_running = bool(self._nav_bridge and self._nav_bridge.is_nav_running())
-                goal_active = bool(self._nav_bridge and self._nav_bridge.is_goal_active())
+                goal_active = self._is_navigation_goal_active()
 
                 if nav_running and self._costmap_global_pending and \
                         (now - self._last_costmap_global_send) >= self._costmap_global_interval:
@@ -470,7 +537,7 @@ class WebBridge(Node):
                         self._last_costmap_local_send = now
                         self._costmap_local_pending = False
 
-                if nav_running and goal_active and self._plan_pending and \
+                if nav_running and self._plan_pending and \
                         (now - self._last_plan_send) >= self._plan_interval:
                     plan = self._state_bridge.get_latest_plan()
                     if plan:
@@ -494,7 +561,6 @@ class WebBridge(Node):
                         self._plan_pending = False
                         self._costmap_global_sig = None
                         self._costmap_local_sig = None
-                        self._plan_sig = None
                         # Broadcast 3 ban tin rong de frontend xoa
                         await self._ws_manager.broadcast(json.dumps(
                             {"type": "costmap", "layer": "global",
@@ -506,7 +572,8 @@ class WebBridge(Node):
                             {"type": "plan", "frame_id": "map", "points": []}))
                         if self._verbose:
                             self.get_logger().info('[PhaseC] Cleared costmap/plan (Nav2 stopped)')
-                elif nav_running and not goal_active:
+                elif nav_running and not goal_active \
+                        and (time.monotonic() - self._plan_received_t) > 1.5:
                     # Goal vua ket thuc nhung Nav2 van chay -> chi xoa plan
                     cached_plan = self._state_bridge.get_latest_plan()
                     # PhaseC fix: chi broadcast neu plan cu CO noi dung; neu da rong
@@ -515,7 +582,6 @@ class WebBridge(Node):
                         self._state_bridge.update_plan(
                             {"type": "plan", "frame_id": "map", "points": []})
                         self._plan_pending = False
-                        self._plan_sig = None
                         await self._ws_manager.broadcast(json.dumps(
                             {"type": "plan", "frame_id": "map", "points": []}))
                         if self._verbose:
@@ -586,9 +652,230 @@ class WebBridge(Node):
             'state': d.get('state'),
             'cargo': d.get('cargo'),       # None | True | False
             'us_cm': d.get('us_cm'),       # raw ultrasonic reading, cm (or None)
+            'us_fresh': d.get('us_fresh') is True,
+            'us_pick_confirmed': d.get('us_pick_confirmed') is True,
+            'mode': d.get('mode'),         # pick | drop
+            'cargo_class': d.get('cargo_class'),   # medium | tall | unknown | None
+            'cargo_type': d.get('cargo_type'),     # A | B | None
+            'cargo_h_cm': d.get('cargo_h_cm'),     # measured box height, cm (or None)
             'lift_cm': d.get('lift_cm'),
             'ts': time.time(),
         }
+
+    def _on_mission_supervisor_status(self, msg: String) -> None:
+        """Keep the full mission cycle payload for Web and LLM status views."""
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            return
+        if isinstance(data, dict):
+            previous = self._mission_supervisor_status
+            if self._recent_mission_baseline_pending:
+                self._recent_mission_baseline_pending = False
+            elif previous:
+                self._record_supervisor_mission(previous, data)
+            self._mission_supervisor_status = {**data, 'ts': time.time()}
+
+    def _clear_recent_supervisor_missions(self) -> None:
+        """Start a fresh Recent Missions view for the next navigation session."""
+        self._recent_supervisor_missions.clear()
+        # The next supervisor payload establishes the new session baseline;
+        # do not turn a transition left over from the previous map into history.
+        self._recent_mission_baseline_pending = True
+
+    @staticmethod
+    def _mission_label(name: str) -> str:
+        if name == 'return_home':
+            return 'Return to HOME'
+        nodes = {'home': 'HOME', 'p1': 'P_1', 'p2': 'P_2', 'd1': 'D_1'}
+        parts = (name or '').lower().split('_to_')
+        if len(parts) == 2:
+            return f'{nodes.get(parts[0], parts[0].upper())} → {nodes.get(parts[1], parts[1].upper())}'
+        return name or 'Mission'
+
+    def _record_supervisor_mission(self, previous: dict, current: dict) -> None:
+        old_state, new_state = previous.get('state'), current.get('state')
+        completed = {
+            ('GOTO_PICK', 'PICKING'),
+            ('GOTO_D', 'DROPPING'),
+            ('RETURN_HOME', 'DONE'),
+        }
+        active_states = {'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
+                         'WAITING_SLOT', 'RETURN_HOME'}
+        if (old_state, new_state) in completed:
+            outcome = 'Completed'
+        elif old_state in active_states and new_state == 'RECOVERY':
+            outcome = ('Canceled' if 'OPERATOR_CANCEL' in str(current.get('msg', ''))
+                       else 'Recovery Required')
+        elif old_state in active_states and new_state == 'STOPPED':
+            outcome = 'Canceled'
+        elif (old_state == 'RECOVERY' and previous.get('resume_available') is True
+              and new_state == previous.get('resume_state')):
+            outcome = 'Resumed'
+        else:
+            return
+        mission = previous.get('active_mission') or current.get('active_mission')
+        self._recent_supervisor_missions.appendleft({
+            'time': datetime.now().strftime('%H:%M:%S'),
+            'name': self._mission_label(mission),
+            'status': outcome,
+            'cycle': (previous.get('cycle') or {}).get('number', 0),
+        })
+
+    def get_mission_supervisor_status(self):
+        """Return a copy of supervisor status with transport freshness metadata."""
+        data = self._mission_supervisor_status
+        if data is None:
+            return None
+        result = dict(data)
+        result['stale'] = (time.time() - result.get('ts', 0.0)) > 3.0
+        result['recent_missions'] = list(self._recent_supervisor_missions)
+        return result
+
+    def _is_navigation_goal_active(self) -> bool:
+        """True for both Web Quick Goals and goals issued by Auto missions.
+
+        Auto-cycle goals are sent by mission_manager, so NavBridge's own action
+        client does not own their goal handle. Use fresh supervisor state to
+        recognize those navigation phases for the plan overlay.
+        """
+        if self._nav_bridge and self._nav_bridge.is_goal_active():
+            return True
+        if any(self._nav2_goal_active.values()):
+            return True
+        status = self.get_mission_supervisor_status()
+        if status is None or status.get('stale'):
+            return False
+        return status.get('state') in {'GOTO_PICK', 'GOTO_D', 'RETURN_HOME'}
+
+    def _on_nav2_goal_status(self, name: str, msg: GoalStatusArray) -> None:
+        active_statuses = (1, 2, 3)  # ACCEPTED, EXECUTING, CANCELING
+        self._nav2_goal_active[name] = any(
+            goal.status in active_statuses for goal in msg.status_list)
+
+    def mission_cycle_conflict(self):
+        """Return a reason when another web Nav2 goal would conflict with a cycle."""
+        status = self.get_mission_supervisor_status()
+        if status is None:
+            return None
+        state = status.get('state')
+        if status.get('stale') and state in self._CYCLE_BLOCKED_COMMANDS:
+            return 'Mission status is stale during an active cycle; verify the supervisor before sending another goal'
+        if status.get('stale'):
+            return None
+        if state in self._CYCLE_BLOCKED_COMMANDS:
+            return f'Mission cycle is active ({state}); stop it first'
+        return None
+
+    def _mark_supervisor_reset(self) -> None:
+        """Update the local cache before the next periodic supervisor status."""
+        data = self._mission_supervisor_status
+        if data:
+            self._mission_supervisor_status = {
+                **data,
+                'state': 'IDLE',
+                'can_start': data.get('cargo') is not True,
+                'resume_available': False,
+                'resume_state': None,
+                'ts': time.time(),
+            }
+
+    @staticmethod
+    def _call_service_wait(client, request, timeout_s=3.0):
+        """Wait for a service result from a non-ROS worker thread."""
+        if not client.wait_for_service(timeout_sec=min(timeout_s, 1.0)):
+            return None, f'Service unavailable: {client.srv_name}'
+        done = threading.Event()
+        result = {}
+
+        def _on_done(future):
+            try:
+                result['value'] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                result['error'] = str(exc)
+            done.set()
+
+        client.call_async(request).add_done_callback(_on_done)
+        if not done.wait(timeout_s):
+            return None, f'Service timed out: {client.srv_name}'
+        if 'error' in result:
+            return None, result['error']
+        return result.get('value'), ''
+
+    def mission_cycle_command(self, command: str, run_mode: str = 'auto'):
+        """Control the mission supervisor without bypassing its state machine."""
+        clients = {
+            'mission_cycle_stop': self._mission_stop_client,
+            'mission_cycle_resume': self._mission_resume_client,
+        }
+        if command == 'mission_cycle_start':
+            if run_mode != 'auto':
+                return False, 'Only Auto pallet cycles are supported'
+            current = self.get_mission_supervisor_status()
+            if current is None or current.get('stale'):
+                return False, 'No fresh mission status from the supervisor'
+            if current.get('can_start') is False:
+                return False, f"Supervisor is busy ({current.get('state', 'unknown')})"
+            if current.get('nav_status_fresh') and current.get('nav_goal_active') is True:
+                return False, 'Nav2 has another active goal; finish it before starting the cycle'
+            if self._nav_bridge:
+                self._nav_bridge.set_op_mode('AUTO')
+            req = SetParameters.Request()
+            req.parameters = [Parameter(
+                'run_mode', Parameter.Type.STRING, run_mode).to_parameter_msg()]
+            response, error = self._call_service_wait(
+                self._mission_params_client, req)
+            if response is None:
+                return False, error
+            if not response.results or not response.results[0].successful:
+                return False, f'Could not set run_mode={run_mode}'
+            client = self._mission_start_client
+        else:
+            client = clients.get(command)
+            if client is None:
+                return False, f'Invalid mission command: {command}'
+            if command == 'mission_cycle_stop':
+                stopped, stop_message = self._stop_robot_and_lift()
+                if not stopped:
+                    return False, stop_message
+        response, error = self._call_service_wait(client, Trigger.Request())
+        if response is None:
+            return False, error
+        if not response.success:
+            state = (self.get_mission_supervisor_status() or {}).get('state', 'unknown')
+            return False, f'Mission supervisor rejected the command ({state})'
+        return True, response.message or 'ok'
+
+    def set_operating_mode(self, mode: str):
+        """Entering MANUAL from AUTO stops and resets the auto mission first."""
+        if mode not in ('AUTO', 'MANUAL'):
+            return False, 'Operating mode must be AUTO or MANUAL'
+        stop_message = ''
+        if mode == 'MANUAL' and self._nav_bridge \
+                and self._nav_bridge._op_mode == 'AUTO':
+            stopped, stop_message = self._stop_robot_and_lift()
+            if not stopped:
+                return False, stop_message
+            status = self.get_mission_supervisor_status()
+            if status is None or status.get('stale'):
+                return False, 'stop not confirmed: cannot reset with missing/stale supervisor status'
+            active_states = {'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
+                             'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY'}
+            if status.get('state') in active_states:
+                response, error = self._call_service_wait(
+                    self._mission_stop_client, Trigger.Request(), timeout_s=2.0)
+                if response is None or not response.success:
+                    return False, ('stop not confirmed: supervisor stop failed: '
+                                   f'{error or getattr(response, "message", "") or "rejected"}')
+            response, error = self._call_service_wait(
+                self._mission_reset_client, Trigger.Request(), timeout_s=2.0)
+            if response is None or not response.success:
+                return False, ('Auto mission reset failed; mode remains AUTO: '
+                               f'{error or getattr(response, "message", "") or "rejected"}')
+            self._mark_supervisor_reset()
+        if self._nav_bridge:
+            self._nav_bridge.set_op_mode(mode)
+        return True, stop_message or f'Operating mode set to {mode}'
 
     def _lookup_map_tf(self, frame_id: str) -> Optional[Tuple[float, float, float]]:
         """Phase B05: tra TF map_frame -> frame_id. Tra ve (x, y, yaw) hoac None neu loi.
@@ -717,26 +1004,20 @@ class WebBridge(Node):
                 self.get_logger().warn(f'Local costmap error: {e}')
 
     def _on_plan(self, msg: Path) -> None:
-        """Phase C: nhan /plan, quy doi odom -> map neu can, giam mau, luu + pending.
-        """
+        """Cache a valid plan while Nav2 runs; route BTs may publish only once."""
         if not (self._nav_bridge and self._nav_bridge.is_nav_running()):
             return
-        if not self._nav_bridge.is_goal_active():
-            return  # plan chi quan trong khi goal ACTIVE
         try:
             tf = None
             if msg.header.frame_id != self._map_frame:
-                tf_lookup = self._lookup_map_tf(msg.header.frame_id)
-                if tf_lookup is None:
+                tf = self._lookup_map_tf(msg.header.frame_id)
+                if tf is None:
                     return
-                tf = tf_lookup
             data = plan_to_json(msg, tf=tf)
-            # Dedupe signature: hash tuple points
-            sig = tuple(tuple(p) for p in data['points'])
-            if sig == self._plan_sig:
+            if not data['points']:
                 return
-            self._plan_sig = sig
             self._state_bridge.update_plan(data)
+            self._plan_received_t = time.monotonic()
             self._plan_pending = True
         except Exception as e:
             if self._verbose:
@@ -1193,6 +1474,8 @@ class WebBridge(Node):
                 route_id=route_id
             )
 
+            if success:
+                self._clear_recent_supervisor_missions()
             if success and self._verbose:
                 self.get_logger().info(f'Navigation started: map={map_id}, route={route_id}')
 
@@ -1203,20 +1486,60 @@ class WebBridge(Node):
             return False, str(e)
 
     def stop_navigation(self) -> tuple:
-        """
-        Stop Nav2 navigation.
-
-        Returns:
-            tuple: (success: bool, message: str)
-        """
+        """Stop Nav2 and stop/reset the supervisor cycle when in AUTO."""
         if not self._nav_bridge:
             return False, "NavBridge not initialized"
+
+        warnings = []
+        motion_stop_ok = True
+        state = None
+        supervisor_stopped = False
+        if self._nav_bridge._op_mode == 'AUTO':
+            stop_ok, stop_message = self._stop_robot_and_lift()
+            motion_stop_ok = stop_ok
+            status = self.get_mission_supervisor_status()
+            state = (status.get('state')
+                     if status is not None and not status.get('stale') else None)
+            supervisor_stopped = True
+
+            if state in self._CYCLE_RUNNING:
+                response, error = self._call_service_wait(
+                    self._mission_stop_client, Trigger.Request(), timeout_s=2.0)
+                supervisor_stopped = bool(response and response.success)
+                if not supervisor_stopped:
+                    warnings.append(
+                        'supervisor stop not confirmed: '
+                        f'{error or getattr(response, "message", "") or "rejected"}')
+
+            if not stop_ok:
+                warnings.append(stop_message)
+            # Stop Navigation ends the current cycle, including any pending
+            # RECOVERY checkpoint. Only mission_cycle_stop (operator cancel)
+            # preserves a checkpoint for a later Resume.
+            if state == 'RECOVERY' or (state in self._CYCLE_RUNNING and supervisor_stopped):
+                if supervisor_stopped:
+                    response, error = self._call_service_wait(
+                        self._mission_reset_client, Trigger.Request(), timeout_s=2.0)
+                    if response and response.success:
+                        self._mark_supervisor_reset()
+                    else:
+                        warnings.append(
+                            'supervisor reset failed: '
+                            f'{error or getattr(response, "message", "") or "rejected"}')
+            elif state is None:
+                warnings.append('supervisor status unavailable/stale; mission reset not attempted')
 
         # P0-5 Fix: Clear map when stopping navigation
         self._state_bridge.clear_map()
         self._map_pending = False
-
-        return self._nav_bridge.stop_nav2()
+        self._nav2_goal_active = {key: False for key in self._nav2_goal_active}
+        nav_ok, nav_message = self._nav_bridge.stop_nav2()
+        if nav_ok:
+            self._clear_recent_supervisor_missions()
+        if warnings:
+            nav_message += '; WARNING: ' + '; '.join(warnings)
+        return (nav_ok and motion_stop_ok and self._nav_bridge._op_mode == 'MANUAL',
+                nav_message)
 
     def send_nav_goal(self, pose: dict, route_id: Optional[str] = None) -> tuple:
         """
@@ -1235,16 +1558,65 @@ class WebBridge(Node):
         return self._nav_bridge.send_navigation_goal(pose, route_id)
 
     def cancel_nav_goal(self) -> tuple:
-        """
-        Cancel active navigation goal.
-
-        Returns:
-            tuple: (success: bool, message: str)
-        """
+        """Stop Nav2, base motion and pallet lift; report any unconfirmed step."""
         if not self._nav_bridge:
-            return False, "NavBridge not initialized"
+            return False, "stop not confirmed: NavBridge not initialized"
+        stopped, message = self._stop_robot_and_lift()
+        if not stopped:
+            return False, message
+        if self._nav_bridge._op_mode == 'AUTO':
+            status = self.get_mission_supervisor_status()
+            if status is None or status.get('stale'):
+                return False, 'stop not confirmed: Auto supervisor state is unavailable/stale'
+            active_states = {'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
+                             'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY'}
+            if status.get('state') in active_states:
+                response, error = self._call_service_wait(
+                    self._mission_stop_client, Trigger.Request(), timeout_s=2.0)
+                if response is None:
+                    return False, f'stop not confirmed: supervisor Recovery transition failed: {error}'
+                if not response.success:
+                    return False, ('stop not confirmed: supervisor rejected Recovery transition: '
+                                   f'{response.message or "rejected"}')
+                message += '; supervisor Recovery acknowledged'
+        return True, message
 
-        return self._nav_bridge.cancel_navigation()
+    def _stop_robot_and_lift(self) -> tuple:
+        failures = []
+        try:
+            self._nav_bridge._emergency_stop()
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f'zero velocity not confirmed: {exc}')
+        try:
+            nav_ok, nav_msg = self._nav_bridge.cancel_navigation(emergency_stop=False)
+            if not nav_ok:
+                failures.append(nav_msg)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f'Nav2 cancel unconfirmed: {exc}')
+
+        pallet_note = ''
+        try:
+            response, error = self._call_service_wait(
+                self._pallet_stop_client, Trigger.Request(), timeout_s=2.0)
+        except Exception as exc:  # noqa: BLE001
+            response, error = None, str(exc)
+        if response is None and error.startswith('Service unavailable'):
+            if self._esp32_cmd_pub.get_subscription_count() == 0:
+                failures.append('lift stop not confirmed: no subscriber on /esp32_cmd')
+            else:
+                for _ in range(2):
+                    self._esp32_cmd_pub.publish(String(data='M0'))
+                pallet_note = 'pallet_mission offline; lift M0 sent directly'
+        elif response is None:
+            failures.append(f'pallet stop not confirmed: {error}')
+        elif not response.success:
+            failures.append(f'pallet stop not confirmed: {response.message or "rejected"}')
+        else:
+            pallet_note = f'pallet stop confirmed: {response.message or "stopped"}'
+
+        if failures:
+            return False, 'stop not confirmed: ' + '; '.join(failures)
+        return True, f'{nav_msg}; {pallet_note}; zero velocity published'
 
     def set_nav_initial_pose(self, pose: dict) -> tuple:
         """
@@ -1303,16 +1675,16 @@ class WebBridge(Node):
 
     def emergency_stop_robot(self) -> tuple:
         """
-        Emergency stop - publish zero velocity immediately.
+        Cancel Nav2, publish zero velocity and stop the pallet lift.
 
         Returns:
             tuple: (success: bool, message: str)
         """
         if not self._nav_bridge:
-            return False, "NavBridge not initialized"
+            return False, "stop not confirmed: NavBridge not initialized"
 
         try:
-            self._nav_bridge._emergency_stop()
+            success, message = self._stop_robot_and_lift()
             # [history] Flag the open run (if any) so its result reflects the E-stop.
             if _HISTORY_OK:
                 try:
@@ -1320,10 +1692,10 @@ class WebBridge(Node):
                     _history_runs.mark_estop()
                 except Exception:
                     pass
-            return True, "Emergency stop applied"
+            return success, message
         except Exception as e:
             self.get_logger().error(f'Emergency stop failed: {e}')
-            return False, str(e)
+            return False, f'stop not confirmed: {e}'
 
 
 def main(args=None):

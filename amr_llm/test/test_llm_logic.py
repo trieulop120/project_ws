@@ -212,6 +212,12 @@ def test_is_stop():
         ok &= check(f'"{w}" -> True', L.is_stop(w))
     ok &= check('"STOP" (hoa) -> True', L.is_stop('STOP'))
     ok &= check('"dừng lại" -> True', L.is_stop('dừng lại'))
+    ok &= check('"dừng lại, rồi chuyển Manual" vẫn STOP tức thì',
+                L.is_stop('dừng lại, rồi chuyển sang Manual'))
+    ok &= check('"stop the robot and switch to manual" vẫn STOP tức thì',
+                L.is_stop('stop the robot and switch to manual'))
+    ok &= check('"đừng dừng" không phải lệnh STOP',
+                not L.is_stop('đừng dừng'))
     ok &= check('"di lay pallet o P1" -> False',
                 not L.is_stop('đi lấy pallet ở P1'))
     ok &= check('len > 30 chua "dung" -> False',
@@ -230,10 +236,20 @@ def test_prompt():
     ok &= check('co vi tri robot', 'home' in p)
     ok &= check('co hanh dong drop_pallet', 'drop_pallet' in p)
     ok &= check('co hanh dong lift_to', 'lift_to' in p)
-    ok &= check('go_mission co tap 7 mieu',
+    ok &= check('go_mission co tap day du cac mission',
                 all(m in p for m in L.MISSIONS))
-    ok &= check('MISSIONS khop 7 mieu', len(L.MISSIONS) == 7)
-    ok &= check('TOOLS co 4 hanh dong', len(L.TOOLS) == 4)
+    expected_missions = {
+        'home_to_p1', 'home_to_p2', 'p1_to_d1', 'p2_to_d1',
+        'p1_to_p2', 'd1_to_p1', 'd1_to_p2', 'return_home',
+    }
+    ok &= check('MISSIONS khop 8 mission tren Mission Manager',
+                set(L.MISSIONS) == expected_missions)
+    expected_tools = {
+        'set_mode', 'quick_goal', 'start_auto_cycle', 'start_single_cycle',
+        'stop_cycle', 'cancel_navigation', 'resume_cycle', 'go_mission',
+        'pick_pallet', 'drop_pallet', 'lift_to',
+    }
+    ok &= check('TOOLS khop du 11 action da tich hop', set(L.TOOLS) == expected_tools)
     ok &= check('TOOLS co drop_pallet', 'drop_pallet' in L.TOOLS)
     ok &= check('drop_pallet khong tham so', L.TOOLS['drop_pallet']['params'] == {})
     return ok

@@ -203,8 +203,14 @@ class SupervisorGUI(tk.Tk):
         self._msg_var = tk.StringVar(value='Doi du lieu status...')
         self._run_var = tk.StringVar(value='Mode: -   Chu ky: 0')
         self._detector_var = tk.StringVar(value='Detector: -')
-        for var in (self._slot_sel_var, self._pm_var, self._state_var,
-                    self._msg_var, self._run_var, self._detector_var):
+        self._pick_queue_var = tk.StringVar(value='Điểm lấy: -')
+        for var in (self._slot_sel_var, self._pm_var):
+            ttk.Label(main, textvariable=var, font=('Arial', 10)).pack(anchor='w')
+        self._state_label = ttk.Label(main, textvariable=self._state_var,
+                                      font=('Arial', 10, 'bold'))
+        self._state_label.pack(anchor='w')
+        for var in (self._msg_var, self._run_var, self._detector_var,
+                    self._pick_queue_var):
             ttk.Label(main, textvariable=var, font=('Arial', 10)).pack(anchor='w')
 
         ttk.Label(main,
@@ -269,10 +275,18 @@ class SupervisorGUI(tk.Tk):
     def _poll_status(self):
         d = self._node.last_status
         if d:
-            self._state_var.set(str(d.get('state', '-')))
+            state = str(d.get('state', '-'))
+            self._state_var.set(state)
+            self._state_label.configure(
+                foreground='#b77900' if state == 'WAITING_SLOT'
+                else '#c62828' if state == 'RECOVERY' else '#222222')
             self._msg_var.set(str(d.get('msg', '')))
             cyc = d.get('cycle') or {}
             self._run_var.set(f"Mode: {cyc.get('run_mode', '-')}   Chu ky: {cyc.get('number', 0)}")
+            queue = d.get('pick_queue') or []
+            queue_text = ' → '.join(str(x) for x in queue) or 'đã hết điểm lấy'
+            waiting = ' · đang chờ ô kệ trống' if d.get('waiting_slot') else ''
+            self._pick_queue_var.set(f'Điểm lấy còn lại: {queue_text}{waiting}')
             pm_state = d.get('pm_state') or '-'
             pm_phase = d.get('pm_phase') or '-'
             n, nmin = d.get('pm_samples', 0), d.get('pm_min_samples', 0)

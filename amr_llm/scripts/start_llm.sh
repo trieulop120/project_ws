@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Bật node LLM (llm_command_node). Giao diện giọng nói nằm trong dashboard có sẵn (llm_voice.js).
 #
-#   ./start_llm.sh                  # an toàn: dry_run (robot KHÔNG chạy thật)
-#   DRY_RUN=false ./start_llm.sh    # chạy thật
+#   ./start_llm.sh                  # chạy thật
+#   DRY_RUN=true ./start_llm.sh     # chỉ xem trước kế hoạch
 #
 # Cần: ~/.gemini_env chứa dòng  export GEMINI_API_KEY="..."
 #
@@ -11,7 +11,7 @@
 
 WS="${WS:-$HOME/project_ws}"
 PKG="$WS/src/amr_llm/amr_llm"
-DRY_RUN="${DRY_RUN:-true}"
+DRY_RUN="${DRY_RUN:-false}"
 
 source /opt/ros/humble/setup.bash
 [ -f "$WS/install/setup.bash" ] && source "$WS/install/setup.bash"
@@ -23,7 +23,7 @@ if [ -z "$GEMINI_API_KEY" ]; then
 fi
 
 echo "== LLM node | dry_run=$DRY_RUN =="
-[ "$DRY_RUN" = "false" ] && echo "!! CHẾ ĐỘ CHẠY THẬT - giữ nút dừng cứng trong tầm tay !!"
+[ "$DRY_RUN" = "false" ] && echo "!! CHẾ ĐỘ CHẠY THẬT - lệnh đã xác nhận có thể điều khiển robot !!"
 
 python3 "$PKG/llm_command_node.py" --ros-args \
   -p dry_run:="$DRY_RUN" -p require_confirm:=true -p backends:="['gemini']" &

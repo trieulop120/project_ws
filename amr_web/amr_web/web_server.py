@@ -217,6 +217,8 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
     async def handle_command(cmd: dict, websocket: WebSocket) -> dict:
         command = cmd.get('command', '')
         result = {"type": "command_response", "command": command}
+        if cmd.get('request_id') is not None:
+            result['request_id'] = cmd['request_id']
 
         # [history] Record incoming command (plan §6). Soft-fail: any error
         # is swallowed inside the helper; we never raise from here.
@@ -307,7 +309,11 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             map_id = cmd.get('map_id', '')
             route_id = cmd.get('route_id')
             if bridge_node:
-                if bridge_node.get_slam_state():
+                conflict = bridge_node.mission_cycle_conflict()
+                if conflict:
+                    result["status"] = "failed"
+                    result["message"] = conflict
+                elif bridge_node.get_slam_state():
                     result["status"] = "failed"
                     result["message"] = "SLAM is running – stop it first"
                 else:
@@ -336,9 +342,14 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             pose = cmd.get('pose', {})
             route_id = cmd.get('route_id')
             if bridge_node:
-                success, msg = await asyncio.to_thread(bridge_node.send_nav_goal, pose, route_id)
-                result["status"] = "sent" if success else "failed"
-                result["message"] = msg
+                conflict = bridge_node.mission_cycle_conflict()
+                if conflict:
+                    result["status"] = "failed"
+                    result["message"] = conflict
+                else:
+                    success, msg = await asyncio.to_thread(bridge_node.send_nav_goal, pose, route_id)
+                    result["status"] = "sent" if success else "failed"
+                    result["message"] = msg
             else:
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
@@ -375,9 +386,14 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             waypoints = cmd.get('waypoints', [])
             mission_type = cmd.get('mission_type', 'waypoints')
             if bridge_node:
-                success, msg = await asyncio.to_thread(bridge_node.send_waypoint_mission, waypoints, mission_type)
-                result["status"] = "started" if success else "failed"
-                result["message"] = msg
+                conflict = bridge_node.mission_cycle_conflict()
+                if conflict:
+                    result["status"] = "failed"
+                    result["message"] = conflict
+                else:
+                    success, msg = await asyncio.to_thread(bridge_node.send_waypoint_mission, waypoints, mission_type)
+                    result["status"] = "started" if success else "failed"
+                    result["message"] = msg
             else:
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
@@ -397,12 +413,28 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
         elif command == "set_op_mode":
             mode = cmd.get('mode', 'MANUAL')
             if bridge_node and bridge_node._nav_bridge:
-                bridge_node._nav_bridge.set_op_mode(mode)
-                result["status"] = "ok"
+                success, message = await asyncio.to_thread(
+                    bridge_node.set_operating_mode, mode)
+                result["status"] = "ok" if success else "error"
                 result["mode"] = mode
+                result["message"] = message
             else:
                 result["status"] = "error"
                 result["message"] = "NavBridge not available"
+
+        elif command in ("mission_cycle_start", "mission_cycle_stop",
+                         "mission_cycle_resume"):
+            if bridge_node:
+                run_mode = cmd.get('run_mode', 'auto')
+                success, message = await asyncio.to_thread(
+                    bridge_node.mission_cycle_command, command, run_mode)
+                result['status'] = 'started' if success and command == 'mission_cycle_start' else (
+                    'ok' if success else 'error')
+                result['message'] = message
+                result['run_mode'] = run_mode if command == 'mission_cycle_start' else None
+            else:
+                result['status'] = 'error'
+                result['message'] = 'Bridge node not available'
 
         elif command == "start_camera":
             mode = cmd.get('mode', 'rgb')
@@ -426,10 +458,15 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             linear = cmd.get('linear', 0.0)
             angular = cmd.get('angular', 0.0)
             if bridge_node:
-                bridge_node.publish_cmd_vel(linear, angular)
-                result["status"] = "ok"
-                result["linear"] = linear
-                result["angular"] = angular
+                conflict = bridge_node.mission_cycle_conflict()
+                if conflict:
+                    result["status"] = "error"
+                    result["message"] = conflict
+                else:
+                    bridge_node.publish_cmd_vel(linear, angular)
+                    result["status"] = "ok"
+                    result["linear"] = linear
+                    result["angular"] = angular
             else:
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
@@ -438,10 +475,15 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             action = cmd.get('action', '')
             target_mm = cmd.get('target_mm', 0)
             if bridge_node:
-                bridge_node.publish_lift(action, target_mm)
-                result["status"] = "ok"
-                result["action"] = action
-                result["target_mm"] = target_mm
+                conflict = bridge_node.mission_cycle_conflict()
+                if conflict:
+                    result["status"] = "error"
+                    result["message"] = conflict
+                else:
+                    bridge_node.publish_lift(action, target_mm)
+                    result["status"] = "ok"
+                    result["action"] = action
+                    result["target_mm"] = target_mm
             else:
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
@@ -500,7 +542,10 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             for _, data in state_bridge.get_all_state().items():
                 await ws_manager.send(websocket, json.dumps(data))
 
-            await ws_manager.send(websocket, json.dumps(state_bridge.get_system_overview_state()))
+            initial_system = state_bridge.get_system_overview_state()
+            if bridge_node:
+                initial_system['mission_supervisor'] = bridge_node.get_mission_supervisor_status()
+            await ws_manager.send(websocket, json.dumps(initial_system))
 
             if bridge_node:
                 await ws_manager.send(websocket, json.dumps({
@@ -529,6 +574,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                         if node_logger:
                             node_logger.error(f"Command '{cmd.get('command')}' failed: {e}\n{traceback.format_exc()}")
                         response = {"type": "command_response", "command": cmd.get('command'),
+                                    "request_id": cmd.get('request_id'),
                                     "status": "error", "message": str(e)}
                     await ws_manager.send(websocket, json.dumps(response))
                 except WebSocketDisconnect:

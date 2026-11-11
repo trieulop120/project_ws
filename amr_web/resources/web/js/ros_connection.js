@@ -8,6 +8,8 @@ let ws = null;
 let reconnectDelay = 1000;
 let reconnectTimer = null;
 const maxReconnectDelay = 30000;
+let commandRequestSeq = 0;
+const pendingCommandRequests = new Map();
 
 function setWsConnected(c) {
     if (typeof isWsConnected !== 'undefined') {
@@ -189,6 +191,9 @@ function connect() {
                         if (typeof window.updateCargo === 'function') {
                             window.updateCargo(d.mission);
                         }
+                        if (typeof window.updateMissionCycle === 'function') {
+                            window.updateMissionCycle(d.mission_supervisor);
+                        }
                         break;
 
                     case 'laser':
@@ -221,6 +226,11 @@ function connect() {
                         break;
 
                     case 'command_response':
+                        if (d.request_id && pendingCommandRequests.has(d.request_id)) {
+                            const resolve = pendingCommandRequests.get(d.request_id);
+                            pendingCommandRequests.delete(d.request_id);
+                            resolve(d);
+                        }
                         if (typeof handleCommandResponse === 'function') {
                             handleCommandResponse(d);
                         }
@@ -284,6 +294,31 @@ function sendCommand(cmd) {
         return false;
     }
 }
+
+function sendCommandAndWait(cmd, timeoutMs = 15000) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return Promise.resolve({ status: 'error', message: 'WebSocket not connected' });
+    }
+    const requestId = `web-${Date.now()}-${++commandRequestSeq}`;
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            pendingCommandRequests.delete(requestId);
+            resolve({ status: 'error', message: `${cmd.command} timed out` });
+        }, timeoutMs);
+        pendingCommandRequests.set(requestId, (response) => {
+            clearTimeout(timer);
+            resolve(response);
+        });
+        try {
+            ws.send(JSON.stringify({ ...cmd, request_id: requestId }));
+        } catch (e) {
+            clearTimeout(timer);
+            pendingCommandRequests.delete(requestId);
+            resolve({ status: 'error', message: e.message || 'WebSocket send failed' });
+        }
+    });
+}
+window.sendCommandAndWait = sendCommandAndWait;
 
 // Tự động kết nối WebSocket khi file JS này được nạp
 if (document.readyState === 'loading') {

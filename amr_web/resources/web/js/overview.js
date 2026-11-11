@@ -175,12 +175,74 @@ function updateDeviceStatuses(devices) {
  */
 function updateSystemStatus(status) {
     systemStatus = status;
-    const badge = document.getElementById('cardNavBadge');
-    if (!badge) return;
-
-    badge.className = 'nav-badge ' + status.toLowerCase();
-    badge.innerHTML = '<span>' + status + '</span>';
 }
+
+window.updateOverviewNavigationState = function (nav, mission) {
+    const value = document.getElementById('cardNavState');
+    const badge = document.getElementById('cardNavBadge');
+    if (!value || !badge) return;
+
+    const navState = nav?.state || 'IDLE';
+    const cycleState = mission && !mission.stale ? mission.state : null;
+    const cycleLabels = {
+        IDLE: 'Ready for pallet cycle', GOTO_PICK: `Going to ${mission?.active_dest || 'pickup'}`,
+        PICKING: `Picking at ${mission?.active_dest || 'pickup'}`,
+        GOTO_D: 'Transporting to D_1', DROPPING: 'Placing pallet',
+        WAITING_SLOT: 'Waiting for shelf space', RETURN_HOME: 'Returning to HOME',
+        RECOVERY: 'Recovery required', DONE: 'Pallet cycle completed',
+        FAILED: 'Pallet cycle failed', STOPPED: 'Mission stopped'
+    };
+    const cycleActive = ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
+        'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY'].includes(cycleState);
+    const navLabels = {
+        IDLE: nav?.nav2_running ? 'Navigation ready' : 'Navigation not started',
+        ACTIVE: 'Navigating', SUCCEEDED: 'Navigation completed',
+        FAILED: 'Navigation failed', CANCELED: 'Navigation canceled'
+    };
+    let label, badgeText, badgeClass, muted = false;
+    if (nav && nav.nav2_running !== true) {
+        label = '--';
+        badgeText = '--';
+        badgeClass = 'idle';
+        muted = true;
+    } else if (cycleState && cycleActive) {
+        label = cycleLabels[cycleState] || 'Mission unavailable';
+        badgeText = cycleState === 'RECOVERY' ? 'Recovery' :
+            ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING', 'WAITING_SLOT', 'RETURN_HOME'].includes(cycleState)
+                ? 'Active' : cycleState === 'DONE' ? 'Completed' :
+                    cycleState === 'FAILED' ? 'Failed' : 'Idle';
+        badgeClass = cycleState === 'RECOVERY' ? 'recovery' :
+            ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING', 'WAITING_SLOT', 'RETURN_HOME'].includes(cycleState)
+                ? 'navigating' : cycleState === 'DONE' ? 'succeeded' :
+                    cycleState === 'FAILED' ? 'failed' : 'idle';
+    } else if (cycleState && ['DONE', 'FAILED', 'STOPPED'].includes(cycleState)) {
+        // Chu ky moi chi ket thuc (khong dang chay) -> hien ket qua, khong hien "navigation not started".
+        label = cycleLabels[cycleState];
+        badgeText = cycleState === 'DONE' ? 'Completed' :
+            cycleState === 'FAILED' ? 'Failed' : 'Stopped';
+        badgeClass = cycleState === 'DONE' ? 'succeeded' :
+            cycleState === 'FAILED' ? 'failed' : 'idle';
+    } else if (['ACTIVE', 'SUCCEEDED', 'FAILED', 'CANCELED'].includes(navState)) {
+        label = navLabels[navState] || '--';
+        badgeText = navState === 'ACTIVE' ? 'Active' :
+            navState === 'SUCCEEDED' ? 'Completed' :
+                navState === 'FAILED' ? 'Failed' : 'Canceled';
+        badgeClass = navState === 'ACTIVE' ? 'navigating' :
+            navState === 'SUCCEEDED' ? 'succeeded' :
+                navState === 'FAILED' ? 'failed' : 'idle';
+    } else {
+        // Khong co chu ky, khong co nav dang chay -> placeholder tro.
+        label = '--';
+        badgeText = '--';
+        badgeClass = 'idle';
+        muted = true;
+    }
+    value.textContent = label;
+    value.className = 'metric-value' + (badgeClass === 'navigating' ? ' accent' : '')
+        + (muted ? ' muted' : '');
+    badge.className = 'nav-badge ' + badgeClass + (muted ? ' muted' : '');
+    badge.textContent = badgeText;
+};
 
 /**
  * Cập nhật Lift height và trạng thái

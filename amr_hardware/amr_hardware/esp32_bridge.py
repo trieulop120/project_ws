@@ -26,6 +26,8 @@ class ESP32Bridge(Node):
         self.declare_parameter('wheelbase', 0.4813)         
         self.declare_parameter('counts_per_rev', 3960.0)  # 3960 xung/vòng
         self.declare_parameter('max_rpm', 110.0)           # Tốc độ tối đa 110 RPM
+        self.declare_parameter('drive_command_timeout', 0.30)
+        self.declare_parameter('lift_velocity_timeout', 0.30)
         self.declare_parameter('gyro_scale_z', 0.977)
         # He so hieu chinh quang duong cho ODOMETRY (thuc/do, trung binh 11 lan chay = 1.054).
         # Chi ap len dc (tinh tien); KHONG dung cho lenh cmd_vel->RPM va KHONG dung cho yaw
@@ -53,6 +55,8 @@ class ESP32Bridge(Node):
         self.wheelbase = self.get_parameter('wheelbase').value
         self.cpr = self.get_parameter('counts_per_rev').value
         self.max_rpm = float(self.get_parameter('max_rpm').value)
+        self.drive_command_timeout = float(self.get_parameter('drive_command_timeout').value)
+        self.lift_velocity_timeout = float(self.get_parameter('lift_velocity_timeout').value)
         self.gyro_scale_z = float(self.get_parameter('gyro_scale_z').value)
         self.odom_scale = float(self.get_parameter('odom_scale').value)
         self.publish_tf = self.get_parameter('publish_tf').value
@@ -82,6 +86,15 @@ class ESP32Bridge(Node):
         self._sh_raw_t = [0.0] * 4      # thoi diem gia tri tho doi lan cuoi
         self._sh_acc = [None] * 4       # gia tri da duoc nhan (None = chua on dinh lan nao)
         self.data_lock = threading.Lock()
+        # All host-to-controller writes must remain whole protocol commands.
+        self.serial_tx_lock = threading.Lock()
+        self.command_lock = threading.Lock()
+        self.last_drive_command_time = 0.0
+        self.last_lift_velocity_command_time = 0.0
+        self.lift_velocity_active = False
+        self._lift_stop_pending = False
+        self._lift_stop_last_attempt = 0.0
+        self._drive_timeout_reported = False
 
         self.ser = None
         if not self.connect_serial():
@@ -117,12 +130,13 @@ class ESP32Bridge(Node):
         self.first_run = True
         self.last_time = self.get_clock().now()
 
-        # (5) Lưu last commanded RPM để gửi liên tục mỗi 30Hz
+        # Retain targets only while a fresh velocity command is arriving.
         self.last_rpm_left = 0.0
         self.last_rpm_right = 0.0
 
         # Luồng đọc Serial riêng biệt
-        threading.Thread(target=self.read_loop, daemon=True).start()
+        self.reader_thread = threading.Thread(target=self.read_loop, daemon=True)
+        self.reader_thread.start()
 
         # Timer cố định 30Hz
         self.timer = self.create_timer(1.0 / 100.0, self.publish_loop_100hz)
@@ -177,7 +191,7 @@ class ESP32Bridge(Node):
                 # (3) Chờ ESP32 báo sẵn sàng bằng cách đợi PKT telemetry
                 if self.wait_for_esp32_ready(timeout=10.0):
                     # Sync buffer sau khi ESP32 sẵn sàng
-                    self.ser.write(b'L0\nR0\n')
+                    self._serial_write(b'L0\nR0\n')
                     time.sleep(0.2)
                     if self.ser.in_waiting > 0:
                         self.ser.read(self.ser.in_waiting)
@@ -237,44 +251,119 @@ class ESP32Bridge(Node):
         """(5) Chỉ lưu target RPM, KHÔNG gửi ngay.
         Commands sẽ được gửi liên tục trong publish_loop_30hz."""
         vx, wz = msg.linear.x, msg.angular.z
+        if not math.isfinite(vx) or not math.isfinite(wz):
+            self.get_logger().error('Rejecting non-finite drive command')
+            return
         v_left = vx - wz * self.wheelbase / 2.0
         v_right = vx + wz * self.wheelbase / 2.0
 
         rpm_left = (v_left / (2.0 * math.pi * self.wheel_radius)) * 60.0
         rpm_right = (v_right / (2.0 * math.pi * self.wheel_radius)) * 60.0
 
-        self.last_rpm_left = max(min(rpm_left, self.max_rpm), -self.max_rpm)
-        self.last_rpm_right = max(min(rpm_right, self.max_rpm), -self.max_rpm)
+        with self.command_lock:
+            self.last_rpm_left = max(min(rpm_left, self.max_rpm), -self.max_rpm)
+            self.last_rpm_right = max(min(rpm_right, self.max_rpm), -self.max_rpm)
+            self.last_drive_command_time = time.monotonic()
+            self._drive_timeout_reported = False
+
+    def _serial_write(self, data: bytes) -> bool:
+        """Write serial bytes atomically with respect to other ROS callbacks."""
+        with self.serial_tx_lock:
+            if not self.ser or not self.ser.is_open:
+                return False
+            try:
+                return self.ser.write(data) == len(data)
+            except Exception as e:
+                self.get_logger().error(f'Serial TX failed: {e}')
+                return False
 
     def _send_drive_commands(self):
         """Gửi lệnh L/R liên tục mỗi 30Hz (từ publish_loop)."""
-        if not self.ser or not self.ser.is_open:
-            return
+        now = time.monotonic()
+        with self.command_lock:
+            if (self.last_drive_command_time == 0.0 or
+                    now - self.last_drive_command_time > self.drive_command_timeout):
+                self.last_rpm_left = 0.0
+                self.last_rpm_right = 0.0
+                if not self._drive_timeout_reported:
+                    self.get_logger().warn('Drive command timeout: forcing both wheel RPMs to zero')
+                    self._drive_timeout_reported = True
+            left, right = self.last_rpm_left, self.last_rpm_right
+        self._serial_write(f'L{left:.2f}\nR{right:.2f}\n'.encode('utf-8'))
+
+    def _track_lift_velocity_command(self, command: str) -> bool:
+        """Track continuous M± commands; H<cm>/HOME are bounded target commands."""
+        value = command.strip().upper()
+        if not value.startswith('M'):
+            return True
         try:
-            self.ser.write(f"L{self.last_rpm_left:.2f}\n".encode('utf-8'))
-            self.ser.write(f"R{self.last_rpm_right:.2f}\n".encode('utf-8'))
-        except Exception as e:
-            self.get_logger().error(f'Failed to send drive cmd: {e}')
+            speed = float(value[1:])
+        except ValueError:
+            return False
+        if not math.isfinite(speed):
+            return False
+        with self.command_lock:
+            self.lift_velocity_active = abs(speed) >= 1e-6
+            self.last_lift_velocity_command_time = (
+                time.monotonic() if self.lift_velocity_active else 0.0)
+            if self.lift_velocity_active:
+                self._lift_stop_pending = False
+            else:
+                self._lift_stop_pending = False
+        return True
+
+    def _enforce_lift_deadman(self) -> None:
+        now = time.monotonic()
+        with self.command_lock:
+            expired = (self.lift_velocity_active and
+                       now - self.last_lift_velocity_command_time > self.lift_velocity_timeout)
+            if expired:
+                self.lift_velocity_active = False
+                self.last_lift_velocity_command_time = 0.0
+                self._lift_stop_pending = True
+            retry_stop = (self._lift_stop_pending and
+                          now - self._lift_stop_last_attempt >= 0.25)
+            if retry_stop:
+                # Keep command_lock through the stop write so a new M± command
+                # cannot be overwritten by a late timeout M0.
+                self._lift_stop_last_attempt = now
+                sent = self._serial_write(b'M0\n')
+                if sent:
+                    self._lift_stop_pending = False
+        if expired:
+            self.get_logger().error('Lift velocity command timeout: sending M0')
 
     def lift_cb(self, msg: Twist):
-        if not self.ser or not self.ser.is_open:
-            return
         try:
+            if not math.isfinite(msg.angular.z) or not math.isfinite(msg.linear.z):
+                self.get_logger().error('Rejecting non-finite lift command')
+                return
             if abs(msg.angular.z) > 0.01:
-                self.ser.write(f'M{msg.angular.z:.1f}\n'.encode('utf-8'))
+                command = f'M{msg.angular.z:.1f}'
+                self._track_lift_velocity_command(command)
+                self._serial_write(f'{command}\n'.encode('utf-8'))
             elif abs(msg.linear.z) > 0.001:
-                self.ser.write(f'H{msg.linear.z * 100:.1f}\n'.encode('utf-8'))
+                with self.command_lock:
+                    self._lift_stop_pending = False
+                self._serial_write(f'H{msg.linear.z * 100:.1f}\n'.encode('utf-8'))
         except Exception as e:
             self.get_logger().error(f'Failed to send lift cmd: {e}')
 
     def raw_cb(self, msg: String):
-        if self.ser and self.ser.is_open:
-            try:
-                cmd = msg.data.strip().upper() + '\n'
-                self.ser.write(cmd.encode('utf-8'))
-                self.get_logger().info(f"Sent Serial Raw Command: {cmd.strip()}")
-            except Exception as e:
-                self.get_logger().error(f'Failed to send raw cmd: {e}')
+        command = msg.data.strip().upper()
+        if not self._track_lift_velocity_command(command):
+            self.get_logger().error(f'Rejecting invalid lift velocity command: {command!r}')
+            return
+        if command.startswith('H') or command == 'HOME':
+            with self.command_lock:
+                self._lift_stop_pending = False
+        sent = self._serial_write((command + '\n').encode('utf-8'))
+        if command == 'M0':
+            with self.command_lock:
+                self._lift_stop_pending = not sent
+                self._lift_stop_last_attempt = time.monotonic()
+        if sent:
+            self.get_logger().info(f'Sent Serial Raw Command: {command}')
 
     def read_loop(self):
         buf = ""
@@ -380,6 +469,7 @@ class ESP32Bridge(Node):
 
         # Gửi lệnh drive liên tục mỗi 100Hz
         self._send_drive_commands()
+        self._enforce_lift_deadman()
 
         with self.data_lock:
             el = self.curr_el
@@ -511,12 +601,15 @@ class ESP32Bridge(Node):
 
     def destroy_node(self):
         self.running = False
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.write(b'L0\nR0\nM0\n')
-                self.ser.close()
-            except Exception:
-                pass
+        with self.serial_tx_lock:
+            if self.ser and self.ser.is_open:
+                try:
+                    self.ser.write(b'L0\nR0\nM0\n')
+                    self.ser.close()
+                except Exception:
+                    pass
+        if hasattr(self, 'reader_thread') and self.reader_thread.is_alive():
+            self.reader_thread.join(timeout=0.5)
         super().destroy_node()
 
 

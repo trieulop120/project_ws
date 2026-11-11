@@ -13,12 +13,12 @@ kế hoạch JSON được validate rồi gọi các service/action có sẵn.
 - `test/test_llm_logic.py` — test đơn vị (chạy không cần ROS)
 
 ## Build
-    colcon build --packages-select amr_llm --symlink-install
+    colcon build --packages-select amr_llm
     source install/setup.bash
 
 ## Chạy
-    ros2 launch amr_llm llm_system.launch.py                 # dry_run:=true (mặc định, an toàn)
-    ros2 launch amr_llm llm_system.launch.py dry_run:=false   # CHẠY THẬT
+    ros2 launch amr_llm llm_system.launch.py                 # CHẠY THẬT (mặc định)
+    ros2 launch amr_llm llm_system.launch.py dry_run:=true   # chỉ xem trước kế hoạch
 
 ## Test
     python3 src/amr_llm/test/test_llm_logic.py

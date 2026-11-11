@@ -208,6 +208,19 @@ def generate_launch_description():
         }],
     )
 
+    # All ROS velocity sources are arbitrated here before reaching the
+    # splitter/hardware bridge. The bridge keeps its own independent deadman.
+    twist_mux_config = os.path.join(
+        get_package_share_directory('amr_hardware'), 'config', 'twist_mux.yaml')
+    twist_mux = Node(
+        package='twist_mux',
+        executable='twist_mux',
+        name='twist_mux',
+        output='screen',
+        parameters=[twist_mux_config, {'use_sim_time': False}],
+        remappings=[('/cmd_vel_out', '/cmd_vel')],
+    )
+
     # ============================================
     # LiDAR Driver (Sllidar A1M8)
     # ============================================
@@ -466,6 +479,7 @@ def generate_launch_description():
         static_transforms,
 
         esp32_bridge,
+        twist_mux,
         cmd_vel_splitter,
         lidar_node,
         scan_filter_node,

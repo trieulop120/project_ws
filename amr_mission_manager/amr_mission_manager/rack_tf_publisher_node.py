@@ -40,6 +40,7 @@ Hoac thuc nghiem:
 
 import math
 import os
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -88,6 +89,8 @@ class RackTfPublisher(Node):
             self.declare_parameter(k, v)
         self.p = {k: self.get_parameter(k).value for k in DEFAULTS}
         self._active_graph_path = None
+        self._route_path_loaded = None
+        self._route_path_last_received = 0.0
 
         # Nap moi hinh ke tu shelf.yaml (1 lan, tai khoi dong)
         from amr_mission_manager.shelf_model import ShelfModel, ShelfError
@@ -150,12 +153,23 @@ class RackTfPublisher(Node):
 
     def _on_route_path(self, msg: String):
         """Use the route YAML announced by the active Nav2 launch."""
-        self._active_graph_path = msg.data
-        self._last_tf_key = None
-        self._warned_no_anchor = False
-        self.get_logger().info(f'Using active Nav2 route graph: {msg.data}')
-        if self._model is not None:
-            self._publish_if_anchor()
+        self._route_path_last_received = time.monotonic()
+        if msg.data == self._route_path_loaded:
+            return
+        try:
+            from amr_navigation.route_graph_loader import RouteGraphLoader
+            loader = RouteGraphLoader(yaml_path=msg.data)
+            loader.get_all_node_names()
+            self._active_graph_path = msg.data
+            self._route_path_loaded = msg.data
+            self._last_tf_key = None
+            self._warned_no_anchor = False
+            self.get_logger().info(f'Using active Nav2 route graph: {msg.data}')
+            if self._model is not None:
+                self._publish_if_anchor()
+        except Exception as e:
+            self._active_graph_path = None
+            self.get_logger().error(f'Failed to load active Nav2 route graph {msg.data}: {e}')
 
     # ------------------------------------------------------------------
     # Kiem tra + phat

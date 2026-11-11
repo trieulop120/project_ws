@@ -7,7 +7,7 @@ class CmdVelSplitter(Node):
     def __init__(self):
         super().__init__('cmd_vel_splitter')
         
-        # Subscriber lắng nghe topic tổng /cmd_vel
+        # Chỉ nhận lệnh đã được twist_mux phân xử.
         self.sub = self.create_subscription(
             Twist, 
             '/cmd_vel', 

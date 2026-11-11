@@ -64,7 +64,7 @@ class TeleopAMR(Node):
 
         self.pub_cmd_vel = self.create_publisher(
             Twist,
-            '/cmd_vel',
+            '/cmd_vel_teleop',
             10
         )
 

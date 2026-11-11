@@ -165,6 +165,7 @@ def generate_launch_description():
         name='behavior_server',
         output='screen',
         parameters=[params_file],
+        remappings=[('/cmd_vel', '/cmd_vel_nav_mux')],
     )
 
     # ============================================
@@ -200,7 +201,7 @@ def generate_launch_description():
         parameters=[params_file],
         remappings=[
             ('/cmd_vel', '/cmd_vel_nav'),
-            ('/cmd_vel_smoothed', '/cmd_vel'),
+            ('/cmd_vel_smoothed', '/cmd_vel_nav_mux'),
         ]
     )
 

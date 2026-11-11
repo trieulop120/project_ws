@@ -15,7 +15,9 @@ Usage:
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, TimerAction, ExecuteProcess, OpaqueFunction, LogInfo
+from launch.actions import (
+    DeclareLaunchArgument, TimerAction, ExecuteProcess, OpaqueFunction, LogInfo,
+)
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -178,6 +180,7 @@ def generate_launch_description():
         name='behavior_server',
         output='screen',
         parameters=[params_file],
+        remappings=[('/cmd_vel', '/cmd_vel_nav_mux')],
     )
 
     # ============================================
@@ -213,7 +216,7 @@ def generate_launch_description():
         parameters=[params_file],
         remappings=[
             ('/cmd_vel', '/cmd_vel_nav'),
-            ('/cmd_vel_smoothed', '/cmd_vel'),
+            ('/cmd_vel_smoothed', '/cmd_vel_nav_mux'),
         ]
     )
 
@@ -259,24 +262,34 @@ def generate_launch_description():
     # ============================================
     # Route Server Lifecycle
     # ============================================
+    route_server_lifecycle_script = (
+        'state=""; '
+        'for attempt in 1 2 3 4 5 6 7 8 9 10; do '
+        'state=$(timeout 3s ros2 lifecycle get /route_server 2>&1) && break; '
+        'echo "[route_server] waiting for lifecycle service ($attempt/10)"; '
+        'sleep 0.5; done; '
+        'case "$state" in *"unconfigured [1]"*) '
+        'timeout 5s ros2 lifecycle set /route_server configure; '
+        'state=$(timeout 3s ros2 lifecycle get /route_server 2>&1) ;; '
+        '*"inactive [2]"*) ;; '
+        '*"active [3]"*) echo "[route_server] already active"; exit 0 ;; '
+        '*) echo "[route_server] lifecycle unavailable: $state" >&2; exit 1 ;; esac; '
+        'echo "[route_server] after configure: $state"; '
+        'case "$state" in *"inactive [2]"*) ;; *) '
+        'echo "[route_server] configure did not reach inactive; skip activate" >&2; '
+        'exit 1 ;; esac; '
+        'timeout 5s ros2 lifecycle set /route_server activate; '
+        'state=$(timeout 3s ros2 lifecycle get /route_server 2>&1); '
+        'echo "[route_server] after activate: $state"; '
+        'case "$state" in *"active [3]"*) ;; *) '
+        'echo "[route_server] activation failed" >&2; exit 1 ;; esac'
+    )
     route_server_configure = TimerAction(
         period=3.0,
-        actions=[
-            ExecuteProcess(
-                cmd=['ros2', 'lifecycle', 'set', '/route_server', 'configure'],
-                output='screen',
-            ),
-        ],
-    )
-
-    route_server_activate = TimerAction(
-        period=5.0,
-        actions=[
-            ExecuteProcess(
-                cmd=['ros2', 'lifecycle', 'set', '/route_server', 'activate'],
-                output='screen',
-            ),
-        ],
+        actions=[ExecuteProcess(
+            cmd=['bash', '-c', route_server_lifecycle_script],
+            output='screen',
+        )],
     )
 
     # ============================================
@@ -329,7 +342,6 @@ def generate_launch_description():
         # Route Server
         route_server,
         route_server_configure,
-        route_server_activate,
 
         # Route Graph Publisher
         route_graph_publisher,

@@ -2,20 +2,27 @@
 """
 web_bridge.launch.py
 
-Launch the AMR Web Bridge HTTP server and optionally rosbridge.
+Launch the AMR Web Bridge HTTP server, the headless mission supervisor,
+and optionally rosbridge. Nav2 is started from the web Navigation page after
+the operator selects a map and route.
 
 Usage:
     ros2 launch amr_web web_bridge.launch.py
 
     # Or for full functionality with rosbridge:
     ros2 launch amr_web web_bridge.launch.py launch_rosbridge:=true
+
+    # If mission_supervisor is already running elsewhere:
+    ros2 launch amr_web web_bridge.launch.py launch_mission_supervisor:=false
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -48,6 +55,11 @@ def generate_launch_description():
         description='Rosbridge WebSocket port'
     )
 
+    mission_supervisor_arg = DeclareLaunchArgument(
+        'launch_mission_supervisor', default_value='true',
+        description='Start the mission supervisor and pallet workflow with the web dashboard'
+    )
+
     # HTTP server node (non-ROS executable)
     web_bridge_node = Node(
         package='amr_web',
@@ -73,13 +85,24 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('launch_rosbridge')),
     )
 
+    mission_supervisor = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(PathJoinSubstitution([
+            FindPackageShare('amr_mission_manager'),
+            'launch', 'mission_supervisor.launch.py',
+        ])),
+        launch_arguments={'gui': 'false'}.items(),
+        condition=IfCondition(LaunchConfiguration('launch_mission_supervisor')),
+    )
+
     return LaunchDescription([
         host_arg,
         port_arg,
         verbose_arg,
         rosbridge_arg,
         rosbridge_port_arg,
+        mission_supervisor_arg,
         web_bridge_node,
         rosbridge_node,
+        mission_supervisor,
     ])
 
