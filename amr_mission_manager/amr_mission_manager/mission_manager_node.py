@@ -306,6 +306,13 @@ class MissionManager(Node):
                 lambda req, res, svc=svc_name: self._on_mission_ack(req, res, svc),
                 callback_group=ReentrantCallbackGroup()
             )
+            self.create_service(
+                Trigger,
+                service_name + '_free_ack',
+                lambda req, res, svc=svc_name: self._on_mission_ack(
+                    req, res, svc, force_free=True),
+                callback_group=ReentrantCallbackGroup()
+            )
 
         self.get_logger().info(f'Services: {", ".join(MISSION_BT_MAP.keys())}')
 
@@ -321,7 +328,8 @@ class MissionManager(Node):
         self._execute_mission(mission_name, start_node, dest_node, bt_file)
         return response
 
-    def _on_mission_ack(self, request, response, mission_name: str):
+    def _on_mission_ack(self, request, response, mission_name: str,
+                        force_free: bool = False):
         """Parallel Trigger endpoint: success only after Nav2 accepts the goal."""
         if mission_name not in MISSION_BT_MAP:
             response.success, response.message = False, f'Unknown mission: {mission_name}'
@@ -329,13 +337,15 @@ class MissionManager(Node):
         start_node, dest_node, bt_file = MISSION_BT_MAP[mission_name]
         self._active_mission = mission_name
         accepted = self._execute_mission(
-            mission_name, start_node, dest_node, bt_file, wait_for_accept=True)
+            mission_name, start_node, dest_node, bt_file, wait_for_accept=True,
+            force_free=force_free)
         response.success = bool(accepted)
         response.message = 'Nav2 accepted NavigateToPose goal' if accepted else 'Nav2 did not accept goal'
         return response
 
     def _execute_mission(self, mission_name: str, start_node: str,
-                         destination: str, bt_file: str, wait_for_accept: bool = False) -> bool:
+                         destination: str, bt_file: str, wait_for_accept: bool = False,
+                         force_free: bool = False) -> bool:
         """Execute mission to destination.
 
         Chien luoc hybrid (Q1 - duyet):
@@ -371,8 +381,11 @@ class MissionManager(Node):
             self.get_logger().info(f'  Goal: x={pose.pose.position.x:.3f}, y={pose.pose.position.y:.3f}')
 
             # --- Quyet dinh che do: ROUTE hay FREE ---
-            bt_path, nav_mode, route_reason = self._select_navigation_mode(
-                mission_name, start_node, dst_node, bt_file)
+            if force_free:
+                bt_path, nav_mode, route_reason = '', 'FREE', 'resume fallback after aborted goal'
+            else:
+                bt_path, nav_mode, route_reason = self._select_navigation_mode(
+                    mission_name, start_node, dst_node, bt_file)
 
             self._nav_mode = nav_mode
             self._route_reason = route_reason

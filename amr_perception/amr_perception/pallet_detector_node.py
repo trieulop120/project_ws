@@ -109,11 +109,11 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.time import Time
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from geometry_msgs.msg import PoseStamped, TransformStamped, Quaternion
 from sensor_msgs.msg import Image, CameraInfo
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
@@ -270,6 +270,9 @@ class PalletDetectorNode(Node):
         # (sync / camera_info) are still running. Default False keeps the
         # legacy single-threaded behaviour.
         self.declare_parameter('mt_executor', False)
+        # Keep model loading separate from active inference. pallet_mission
+        # preloads the model at startup and toggles this topic for each detect.
+        self.declare_parameter('detection_enabled', True)
         self.declare_parameter('roi_bottom_frac', 0.7)
         self.declare_parameter('roi_side_margin_px', 0)
 
@@ -318,6 +321,7 @@ class PalletDetectorNode(Node):
         self.roi_bottom_frac = min(1.0, max(0.1, float(
             self.get_parameter('roi_bottom_frac').value)))
         self.roi_side_margin_px = int(self.get_parameter('roi_side_margin_px').value)
+        self._detection_enabled = bool(self.get_parameter('detection_enabled').value)
         # Loaded-pallet filtering: SEARCH mode only accepts pallets with at
         # least one 2D-associated box; TRACKING skips the check (a brief box
         # miss must not drop a healthy lock). Set require_loaded:=false to
@@ -463,6 +467,11 @@ class PalletDetectorNode(Node):
         # ============================================================
         self.pose_pub = self.create_publisher(
             PoseStamped, '/pallet/pose', QoSProfile(depth=10))
+        enable_qos = QoSProfile(depth=1)
+        enable_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        enable_qos.reliability = ReliabilityPolicy.RELIABLE
+        self.enable_sub = self.create_subscription(
+            Bool, '/pallet_detector/enable', self._on_detection_enable, enable_qos)
         self.pose_base_pub = self.create_publisher(
             PoseStamped, '/pallet/pose_base', QoSProfile(depth=10))
         self.pose_camera_pub = self.create_publisher(
@@ -682,8 +691,17 @@ class PalletDetectorNode(Node):
                 f'cx={self.cx:.1f}, cy={self.cy:.1f}'
             )
 
+    def _on_detection_enable(self, msg: Bool):
+        enabled = bool(msg.data)
+        if enabled != self._detection_enabled:
+            self._detection_enabled = enabled
+            self.get_logger().info(
+                'Pallet inference ' + ('enabled' if enabled else 'paused; model kept warm'))
+
     def synced_callback(self, color_msg: Image, depth_msg: Image):
         """Synchronized callback for color and depth images."""
+        if not self._detection_enabled:
+            return
         try:
             color = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
@@ -1583,6 +1601,8 @@ class PalletDetectorNode(Node):
     # ==================================================================
     def timer_callback(self):
         """Process the newest frame: detect, localize, publish."""
+        if not self._detection_enabled:
+            return
         with self.lock:
             if self.latest_color is None or self.latest_depth is None:
                 return

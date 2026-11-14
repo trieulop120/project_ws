@@ -79,11 +79,16 @@ class SupervisorGUINode(Node):
     def call_set_mode(self, mode: str) -> bool:
         if not self._cli_param.wait_for_service(timeout_sec=2.0):
             return False
-        p = Parameter('run_mode', Parameter.Type.STRING, mode)
         req = SetParameters.Request()
-        req.parameters = [p.to_parameter_msg()]
+        req.parameters = [
+            Parameter('run_mode', Parameter.Type.STRING, mode).to_parameter_msg(),
+            Parameter('target_cargo_class', Parameter.Type.STRING, '').to_parameter_msg(),
+            Parameter('target_quantity', Parameter.Type.INTEGER, 1).to_parameter_msg(),
+            Parameter('target_drop_slot', Parameter.Type.STRING, '').to_parameter_msg(),
+        ]
         res = self._call(self._cli_param, req)
-        return bool(res and res.results and res.results[0].successful)
+        return bool(res and len(res.results) == len(req.parameters)
+                    and all(item.successful for item in res.results))
 
     def _call(self, cli, req, timeout: float = 3.0):
         """Goi service tu thread GUI va CHO ket qua (ROS spin chay thread khac).

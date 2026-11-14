@@ -26,6 +26,7 @@
     let missionElapsedMs = 0;
     let missionElapsedTimer = null;
     let autoStartPending = false;
+    let lastSupervisorNotice = '';
     let pendingGoalName = '';
     let mapReqTimer = null;
     let lastManualTarget = '--';
@@ -1252,7 +1253,9 @@
         st.classList.toggle('stale', !!m.stale);
     };
 
-    function missionStateLabel(state) {
+    function missionStateLabel(state, mission) {
+        if (state === 'PICKING' && mission?.pm_state === 'DETECTING') return 'Detecting pallet';
+        if (state === 'PICKING' && mission?.pm_state === 'READY') return 'Pallet detected';
         return ({
             IDLE: 'Ready', GOTO_PICK: 'To pickup', PICKING: 'Picking',
             GOTO_D: 'To drop-off', DROPPING: 'Placing',
@@ -1265,6 +1268,9 @@
     function missionMessageEnglish(m) {
         const state = m?.state;
         const dest = m?.active_dest || 'pickup';
+        const cycle = m?.cycle || {};
+        const missionCount = Number.isFinite(cycle.target_quantity)
+            ? ` (${cycle.placed || 0}/${cycle.target_quantity} placed)` : '';
         if (state === 'RECOVERY') {
             const raw = String(m?.msg || '').toLowerCase();
             if (raw.includes('operator_cancel')) return 'Canceled by operator';
@@ -1280,6 +1286,9 @@
             if (raw.includes('pose')) return 'Robot pose unavailable';
             if (raw.includes('return_home') || raw.includes('ve home')) return 'Return home failed';
             if (raw.includes('drop failed')) return 'Drop failed; inspect pallet and lift';
+            if (raw.includes('nav2 aborted') || raw.includes('nav2 canceled')) {
+                return 'Navigation goal ended; inspect the robot, then Resume';
+            }
             if (raw.includes('pallet_mission') || raw.includes('pallet mission') ||
                 raw.includes('lift') || raw.includes('cargo')) return 'Pallet or lift needs check';
             if (raw.includes('mission_manager') || raw.includes('navigation service')) {
@@ -1298,14 +1307,23 @@
             return 'Ready';
         }
         if (state === 'STOPPED') return 'Ready';
-        if (state === 'DONE') return 'Cycle complete';
-        if (state === 'FAILED') return 'Cycle failed';
+        if (state === 'DONE') return `Mission complete (${cycle.placed || 0} placed)`;
+        if (state === 'FAILED') {
+            if (String(m?.msg || '').includes('Mission incomplete')) return m.msg;
+            return 'Mission failed';
+        }
         if (state === 'WAITING_SLOT') return 'Waiting for free slot';
-        if (state === 'GOTO_PICK') return `To ${dest}`;
-        if (state === 'PICKING') return `Picking at ${dest}`;
-        if (state === 'GOTO_D') return `To ${m.active_dest || 'drop-off'}`;
-        if (state === 'DROPPING') return `Placing at ${m.active_dest || 'drop-off'}`;
-        if (state === 'RETURN_HOME') return 'To HOME';
+        if (state === 'GOTO_PICK') return `To ${dest}${missionCount}`;
+        if (state === 'PICKING' && m?.pm_state === 'DETECTING') {
+            return `Detecting pallet at ${dest}${missionCount}`;
+        }
+        if (state === 'PICKING' && m?.pm_state === 'READY') {
+            return `Pallet detected at ${dest}; starting pickup${missionCount}`;
+        }
+        if (state === 'PICKING') return `Picking pallet at ${dest}${missionCount}`;
+        if (state === 'GOTO_D') return `To shelf at ${m.active_dest || 'D_1'}${missionCount}`;
+        if (state === 'DROPPING') return `Placing pallet on shelf${missionCount}`;
+        if (state === 'RETURN_HOME') return `Returning to HOME${missionCount}`;
         return 'Waiting';
     }
 
@@ -1351,13 +1369,27 @@
         const action = document.getElementById('navActionText');
         const target = document.getElementById('navTargetText');
 
+        if (fresh && state === 'RECOVERY' &&
+            !String(m?.msg || '').includes('OPERATOR_CANCEL')) {
+            const notice = `${m.resume_state || ''}|${m.msg || ''}`;
+            if (notice && notice !== lastSupervisorNotice) {
+                lastSupervisorNotice = notice;
+                if (typeof window.showToast === 'function') {
+                    window.showToast(m.msg || 'Mission needs recovery; inspect the robot, then Resume.', 'error');
+                }
+                if (typeof addActivity === 'function') addActivity('error', m.msg || 'Mission requires recovery');
+            }
+        } else if (state !== 'RECOVERY') {
+            lastSupervisorNotice = '';
+        }
+
         if (currentOpMode === 'AUTO') {
             if (badge) {
                 badge.style.display = 'inline-flex';
                 const operatorCanceled = state === 'RECOVERY' &&
                     String(m?.msg || '').includes('OPERATOR_CANCEL');
                 badge.textContent = fresh
-                    ? (operatorCanceled ? 'Canceled' : missionStateLabel(state))
+                    ? (operatorCanceled ? 'Canceled' : missionStateLabel(state, m))
                     : 'Unavailable';
                 badge.className = 'nav-status-badge' + (state === 'RECOVERY' ? ' warning' :
                     ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING', 'WAITING_SLOT', 'RETURN_HOME'].includes(state)
@@ -1407,7 +1439,7 @@
         const text = document.getElementById('navProgressText');
         const label = document.getElementById('navProgressLabel');
         const auto = currentOpMode === 'AUTO';
-        if (label) label.textContent = auto ? 'Current cycle progress' : 'Navigation progress';
+        if (label) label.textContent = auto ? 'Mission progress' : 'Navigation progress';
 
         let percent = null;
         if (auto && supervisorFresh && Number.isFinite(m?.progress_percent)) {

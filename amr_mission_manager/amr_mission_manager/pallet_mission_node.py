@@ -6,8 +6,9 @@ pallet_mission_node.py
 Pallet approach mission for amr_mission_manager.
 
 Luong:
-    [Detect ON]  -> chay pallet_detector (tien trinh con), gom /pallet/pose
-    [Detect OFF] -> tat detector, chot x, y, yaw (map). DONG BANG pallet vao khung odom
+    [Detect ON]  -> bat inference cua pallet_detector, gom /pallet/pose
+    [Detect OFF] -> dung inference, chot x, y, yaw (map). Model van duoc nap san
+                    nhung khong xu ly camera khi dang idle. DONG BANG pallet vao khung odom
                     ngay luc nay (xe dang dung yen) -> sai so AMCL sau do khong con anh huong.
     [Go to pallet] -> Nav2 toi diem dem (staging) cach MAT TRUOC pallet `staging` m
                       (cat Nav2 som khi con <= handoff_m de tranh "nhich tung ti")
@@ -21,7 +22,7 @@ Luong:
                    -> HOMING  : Nav2 ve HOME trong graph do Nav2 launch chon (hoac set_home)
                    -> LOWERING: ha lift ve 0 (lenh HOME)
                    -> DONE    : xong 1 chu trinh
-    [STOP]       -> huy Nav2, dung xe, DUNG LIFT (M0), tat detector
+    [STOP]       -> huy Nav2, dung xe, DUNG LIFT (M0), pause detector inference
 
 Bo dieu khien (class ApproachController) la python thuan, khong phu thuoc ROS,
 da duoc mo phong kiem tra rieng.
@@ -37,7 +38,7 @@ la diem tren MAT TRUOC pallet (detector dung depth mat truoc). Neu thuc te la TA
 dat face_offset_m = -(nua chieu sau pallet), vi du -0.5.
 
 Services (std_srvs):
-    pallet_mission/detect        SetBool  true: bat | false: tat + chot
+    pallet_mission/detect        SetBool  true: bat inference | false: tat + chot
     pallet_mission/go_to_pallet  Trigger
     pallet_mission/lift_home     Trigger
     pallet_mission/stop          Trigger
@@ -69,7 +70,7 @@ from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import PoseStamped, Twist, Point
 from nav2_msgs.action import NavigateToPose
 from sensor_msgs.msg import JointState, Range
-from std_msgs.msg import String, ColorRGBA, Int8MultiArray
+from std_msgs.msg import String, ColorRGBA, Int8MultiArray, Bool
 from std_srvs.srv import SetBool, Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
@@ -105,6 +106,8 @@ DEFAULTS = {
     # detector
     'detector_package': 'amr_perception',
     'detector_executable': 'pallet_detector_ov',   # OpenVINO; 'pallet_detector' = best.pt
+    'detector_prewarm': True,       # preload weights at startup; inference stays paused until Detect ON
+    'detector_prewarm_retry_s': 5.0,
     'detector_camera_info_in': '/camera/color/camera_info',
     'detector_camera_info_out': '/color/camera_info',
     # Giong pallet_detector_ov.launch.py: da luong + 15 Hz + TF timeout 50 ms
@@ -191,7 +194,7 @@ DEFAULTS = {
     'lock_lat_abort_cm': 3.0,
     'lock_yaw_abort_deg': 4.0,
     # dung (sieu am)
-    'stop_dist_cm': 5.0,
+    'stop_dist_cm': 7.0,
     'confirm_count': 10,
     'us_arm_m': 0.10,               # chi tin sieu am sau khi da di vao >= 10 cm tu cong
     'us_below_min_is_close': True,  # doc < min_range cung tinh la "sat"
@@ -682,6 +685,7 @@ class PalletMission(Node):
         self._line = None
         self._det_proc = None
         self._det_kill_at = None
+        self._det_prewarm_retry_t = 0.0
 
         self._goal_handle = None
         self._settle_t0 = 0.0
@@ -763,6 +767,11 @@ class PalletMission(Node):
         self.pub_pre = self.create_publisher(PoseStamped, f'/{NODE_NAME}/pre_pose', latched)
         self.pub_cmd = self.create_publisher(Twist, self.p['cmd_vel_topic'], 10)
         self.pub_esp32 = self.create_publisher(String, self.p['esp32_cmd_topic'], 10)
+        detector_enable_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                         reliability=ReliabilityPolicy.RELIABLE)
+        self.pub_detector_enable = self.create_publisher(
+            Bool, '/pallet_detector/enable', detector_enable_qos)
+        self.pub_detector_enable.publish(Bool(data=False))
 
         self.create_subscription(PoseStamped, self.p['pose_topic'], self._on_pose, 10)
         self.create_subscription(Range, self.p['range_topic'], self._on_range, 10)
@@ -972,7 +981,7 @@ class PalletMission(Node):
             return res
 
         cargo = self._cargo
-        self._terminate_detector()
+        self.pub_detector_enable.publish(Bool(data=False))
         self._goal_handle = None
         self._samples.clear()
         self._tf_hist.clear()
@@ -1081,10 +1090,12 @@ class PalletMission(Node):
             return True, 'detector dang chay'
         if shutil.which('ros2') is None:
             return False, "khong tim thay lenh 'ros2' (chua source workspace?)"
+        self.pub_detector_enable.publish(Bool(data=False))
         cmd = ['ros2', 'run', self.p['detector_package'], self.p['detector_executable'],
-               '--ros-args',
-               '-r', f"{self.p['detector_camera_info_in']}:={self.p['detector_camera_info_out']}"]
+               '--ros-args', '-r',
+               f"{self.p['detector_camera_info_in']}:={self.p['detector_camera_info_out']}"]
         cmd += [a for a in (self.p['detector_extra_args'] or []) if a]
+        cmd += ['-p', 'detection_enabled:=false']
         env = os.environ.copy()
         n_thr = int(self.p['detector_omp_threads'])
         if n_thr > 0:
@@ -1194,7 +1205,8 @@ class PalletMission(Node):
         if self.p['lower_on_detect']:
             self._esp32(self.p['lift_home_cmd'])        # ha lift ve Home truoc khi di vao pallet
         self._cargo = False               # chu ky moi: chua co box tren thang
-        self._set_state(DETECTING, 'Dang detect + ha lift ve Home... (xe phai DUNG YEN, cho detector nap model)')
+        self._set_state(DETECTING, 'Dang detect + ha lift ve Home... (xe phai DUNG YEN, cho detector lay mau)')
+        self.pub_detector_enable.publish(Bool(data=True))
         return True, 'detect ON'
 
     def _tf_spread(self, window_s: float):
@@ -1214,7 +1226,8 @@ class PalletMission(Node):
     def _stop_detect(self) -> Tuple[bool, str]:
         if self._state != DETECTING:
             return False, 'khong o trang thai detect'
-        self._terminate_detector()
+        # Pause inference but keep the loaded model resident for the next cycle.
+        self.pub_detector_enable.publish(Bool(data=False))
         self._reload_params(recompute_stage=True)
         est, why = estimate_pallet(
             list(self._samples), time.monotonic(),
@@ -2019,7 +2032,7 @@ class PalletMission(Node):
                 pass
             self._goal_handle = None
         self._cancel_all_nav()
-        self._terminate_detector()
+        self.pub_detector_enable.publish(Bool(data=False))
         self._halt()
         self._lift_stop()
         missing = []
@@ -2058,6 +2071,14 @@ class PalletMission(Node):
         # HOMING: do callback cua Nav2 xu ly, khong can lam gi trong tick
 
     def _slow_tick(self):
+        if (self.p.get('detector_prewarm', True)
+                and not self._detector_alive()
+                and time.monotonic() >= self._det_prewarm_retry_t):
+            ok, why = self._start_detector()
+            self._det_prewarm_retry_t = (
+                time.monotonic() + float(self.p.get('detector_prewarm_retry_s', 5.0)))
+            if not ok:
+                self.get_logger().warn(f'Detector prewarm deferred: {why}')
         if self._state == DETECTING:
             tf = self._tf_pose(self.p['insertion_frame'], self.p['map_frame'])
             if tf is not None:

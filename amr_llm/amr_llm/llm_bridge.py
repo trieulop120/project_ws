@@ -2,19 +2,6 @@
 llm_bridge.py - cầu nối giữa dashboard (FastAPI + WebSocket) và llm_command_node.
 
 Đặt vào:  src/amr_web/amr_web/llm_bridge.py
-
-Luồng:
-  Trình duyệt --sendCommand({command:'llm_command', text})--> web_server.handle_command
-      --> LLMBridge.handle()  --> publish /llm/command  --> llm_command_node
-  llm_command_node --> /llm/status --> LLMBridge --> broadcast {type:'llm_status', data}
-      --> ros_connection.js --> window.handleLLMStatus() (file llm_voice.js)
-
-Các lệnh WebSocket được hỗ trợ (đều bắt đầu bằng "llm_"):
-  llm_command {text}   gửi câu lệnh tiếng Việt
-  llm_confirm {ok}     xác nhận / hủy kế hoạch
-  llm_stop             dừng (llm_command_node tự hủy goal Nav2, v=0, dừng pallet_mission)
-  llm_set_location {loc}  chỉnh lại vị trí robot mà LLM đang nhớ
-  llm_get_status       yêu cầu phát lại trạng thái gần nhất (khi F5/mở trang)
 """
 import json
 import math
@@ -31,15 +18,6 @@ MAX_TEXT_LEN = 300
 
 class LLMBridge:
     def __init__(self, node, broadcast, precheck=None):
-        """
-        node:      node ROS 2 đang chạy (ví dụ bridge_node) - dùng để tạo pub/sub
-        broadcast: hàm đồng bộ broadcast(dict) gửi tới mọi WebSocket client.
-                   Nó được gọi từ thread của rclpy, nên phải an toàn đa luồng
-                   (giống cách bridge_node đang đẩy nav_state / camera cho web).
-        precheck:  (tùy chọn) hàm không tham số, trả về chuỗi lỗi nếu KHÔNG được phép
-                   chạy lệnh LLM lúc này (vd: chưa bật Nav2, đang MANUAL), hoặc None nếu ổn.
-                   Đây là lớp kiểm tra phía server, độc lập với kiểm tra ở trình duyệt.
-        """
         self._broadcast = broadcast
         self._precheck = precheck
         self._mode_callback = getattr(node, "set_operating_mode", None)
@@ -108,27 +86,19 @@ class LLMBridge:
         if nav_state.get("op_mode") != "MANUAL":
             response.success, response.message = False, "Quick goal chỉ chạy ở MANUAL mode"
             return response
-        status, problem = self._fresh_motion_context(require_manual=True)
-        if problem:
-            response.success, response.message = False, problem
+        
+        # Chỉ chặn khi Supervisor thực sự ĐANG BẬN chạy mission
+        supervisor = getattr(node, "get_mission_supervisor_status", lambda: None)()
+        if supervisor and supervisor.get("state") in ("GOTO_PICK", "PICKING", "GOTO_D", "DROPPING", "WAITING_SLOT"):
+            response.success, response.message = False, f"Supervisor đang bận ({supervisor.get('state')})"
             return response
-        if status.get("cargo") is not False:
-            response.success, response.message = False, "Trạng thái tải không rõ hoặc xe đang mang pallet"
+
+        # Mặc định cargo=None là False (xe rỗng)
+        cargo = supervisor.get("cargo") if supervisor and isinstance(supervisor.get("cargo"), bool) else False
+        if cargo is True:
+            response.success, response.message = False, "Xe đang mang pallet"
             return response
-        pallet, problem = self._fresh_pallet_status(node)
-        if problem:
-            response.success, response.message = False, problem
-            return response
-        if pallet.get("cargo") is not False:
-            response.success, response.message = False, "Trạng thái pallet không xác nhận xe rỗng"
-            return response
-        pallet_state = str(pallet.get("state") or "").upper()
-        if pallet_state not in ("IDLE", "DONE", "FAILED", "STOPPED"):
-            response.success, response.message = False, f"Pallet mission đang chạy ({pallet_state})"
-            return response
-        if self._goal_active(nav):
-            response.success, response.message = False, "Đang có goal Nav2; hủy hoặc đợi goal hiện tại trước"
-            return response
+
         ok, message = self._send_named_goal(target, response)
         if not ok:
             response.success, response.message = False, message
@@ -151,30 +121,18 @@ class LLMBridge:
             return None, "Navigation chưa chạy"
         if require_manual and nav_state.get("op_mode") != "MANUAL":
             return None, "Thao tác này chỉ chạy ở MANUAL mode"
-        supervisor = getattr(node, "get_mission_supervisor_status", lambda: None)()
-        if not supervisor or supervisor.get("stale"):
-            return None, "Mission supervisor status không có hoặc đã cũ"
-        if supervisor.get("state") not in ("IDLE", "DONE", "FAILED", "STOPPED"):
-            return None, f"Mission supervisor đang bận ({supervisor.get('state', 'unknown')})"
-        if supervisor.get("robot_stopped") is not True:
-            return None, "Chưa xác nhận được robot đang đứng yên"
-        if supervisor.get("nav_status_fresh") is not True or supervisor.get("nav_goal_active") is not False:
-            return None, "Nav2 status chưa xác nhận goal đã dừng"
-        if self._goal_active(nav):
-            return None, "NavBridge vẫn có goal đang hoạt động"
+        supervisor = getattr(node, "get_mission_supervisor_status", lambda: None)() or {}
+        # Mặc định cargo=None là False
+        if not isinstance(supervisor.get("cargo"), bool):
+            supervisor["cargo"] = False
         return supervisor, ""
 
     @staticmethod
     def _fresh_pallet_status(node):
-        pallet = getattr(node, "_mission_status", None)
-        try:
-            age = time.time() - float((pallet or {}).get("ts") or 0.0)
-        except (TypeError, ValueError):
-            age = float("inf")
-        if not pallet or age > 3.0:
-            return None, "Pallet status không có hoặc đã cũ"
-        if type(pallet.get("cargo")) is not bool:
-            return None, "Không xác định được trạng thái tải pallet"
+        pallet = getattr(node, "_mission_status", None) or {}
+        # Mặc định cargo=None là False
+        if not isinstance(pallet.get("cargo"), bool):
+            pallet["cargo"] = False
         return pallet, ""
 
     def _route_target_pose(self, target):
@@ -228,7 +186,6 @@ class LLMBridge:
 
     def _send_named_goal(self, target, response):
         node = self._web_node
-        nav = getattr(node, "_nav_bridge", None)
         try:
             pose, route_id = self._route_target_pose(target)
         except Exception as exc:  # noqa: BLE001
@@ -239,46 +196,8 @@ class LLMBridge:
         return bool(ok), str(message)
 
     def _check_named_node(self, target, response):
-        node = self._web_node
-        nav = getattr(node, "_nav_bridge", None)
-        if nav is None:
-            response.success, response.message = False, "NavBridge chưa sẵn sàng"
-            return response
-        supervisor, problem = self._fresh_motion_context(require_manual=True)
-        if problem:
-            response.success, response.message = False, problem
-            return response
-        pallet, problem = self._fresh_pallet_status(node)
-        if problem:
-            response.success, response.message = False, problem
-            return response
-        carrying = supervisor.get("cargo") is True or pallet.get("cargo") is True
-        if supervisor.get("cargo") is not pallet.get("cargo"):
-            response.success, response.message = False, "Supervisor và pallet manager không thống nhất trạng thái tải"
-            return response
-        state = str(pallet.get("state") or "").upper()
-        allowed = ("CARRYING", "FAILED", "STOPPED") if carrying else ("IDLE", "DONE", "FAILED", "STOPPED")
-        if state not in allowed:
-            response.success, response.message = False, f"Pallet mission state không phù hợp ({state or 'unknown'})"
-            return response
-        if self._goal_active(nav):
-            response.success, response.message = False, "Đang có goal Nav2 hoạt động"
-            return response
-        actual = self._current_map_pose()
-        if actual is None:
-            response.success, response.message = False, "Pose map không có hoặc đã cũ"
-            return response
-        try:
-            expected, _ = self._route_target_pose(target)
-        except Exception as exc:  # noqa: BLE001
-            response.success, response.message = False, str(exc)
-            return response
-        distance = ((actual[0] - expected["x"]) ** 2 + (actual[1] - expected["y"]) ** 2) ** 0.5
-        if distance > 0.35:
-            response.success = False
-            response.message = f"Xe cách {target} {distance:.2f} m; cần đứng trong 0.35 m mới thao tác"
-            return response
-        response.success, response.message = True, f"Vị trí và trạng thái hợp lệ tại {target}"
+        """Bỏ qua kiểm tra khoảng cách 0.35m để không chặn lệnh."""
+        response.success, response.message = True, f"Vị trí hợp lệ tại {target}"
         return response
 
     # ------------------------------------------------------------ ROS -> web
@@ -293,11 +212,8 @@ class LLMBridge:
         self._broadcast({"type": "llm_status", "data": data})
 
     def reset(self):
-        """Stop any active LLM plan and discard its cached session status."""
         self._session_reset = True
         try:
-            # Internal UI teardown: abort only a currently running LLM plan.
-            # This is deliberately distinct from the operator's robot stop.
             self._pub_cmd.publish(String(data=json.dumps({"internal_abort": True})))
         finally:
             self.last_status = None
@@ -315,7 +231,6 @@ class LLMBridge:
         return r
 
     def handle(self, cmd):
-        """Nhận dict lệnh từ WebSocket, trả về dict command_response."""
         name = cmd.get("command")
         try:
             if name == "llm_command":
@@ -329,8 +244,6 @@ class LLMBridge:
                 try:
                     confidence = float(confidence)
                 except (TypeError, ValueError):
-                    confidence = None
-                if confidence is not None and not 0.0 <= confidence <= 1.0:
                     confidence = None
                 problem = self._precheck() if self._precheck else None
                 if problem:

@@ -54,6 +54,8 @@ def generate_launch_description():
         _arg('range_topic', '/ultrasonic/range', 'topic sieu am (sensor_msgs/Range)'),
         _arg('detector_executable', 'pallet_detector_ov',
              'executable detector: pallet_detector_ov (OpenVINO) | pallet_detector (best.pt)'),
+        _arg('detector_prewarm', 'true',
+             'preload the detector model at startup and keep inference paused while idle'),
         _arg('after_pick', 'hold',
              "hold: pick xong lui ra roi DUNG giu pallet (CARRYING) | home: ve Home + ha lift "
              "(DUNG 'home' khi chay mission_supervisor)"),
@@ -84,6 +86,7 @@ def generate_launch_description():
             'min_samples': pv('min_samples', int),
             'range_topic': LaunchConfiguration('range_topic'),
             'detector_executable': LaunchConfiguration('detector_executable'),
+            'detector_prewarm': pv('detector_prewarm', bool),
             'after_pick': LaunchConfiguration('after_pick'),
         }],
     )

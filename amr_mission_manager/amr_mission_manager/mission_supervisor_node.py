@@ -4,7 +4,8 @@ mission_supervisor_node.py
 ==========================
 Mission Supervisor: integrates existing mission_manager and pallet_mission services.
 
-    single: HOME -> P_1 -> adaptive detect -> pick -> D_1 -> drop -> HOME -> DONE
+    single: HOME -> P_1/P_2 -> adaptive detect -> pick -> D_1 -> drop, repeat
+            until the requested quantity is placed, then HOME -> DONE
     auto:   repeat the cycle until no pallet is detected at P_1 or no compatible
             known-empty shelf slot remains; then return HOME.
 
@@ -77,7 +78,12 @@ DEFAULTS = {
     # node nao do (xem _p2_available). P_1 het pallet -> di P_1 -> P_2.
     'pick_dest_2': 'P_2',
     'pick_mission_2_from_p1': 'p1_to_p2',
-    'run_mode': 'single',          # single: 1 pallet + HOME; auto: loop until source/compatible slots empty
+    'run_mode': 'single',          # bounded quantity + HOME; auto: loop until source/slots empty
+    # Bounded LLM mission: require exactly N successfully placed items of the
+    # requested detector class. Empty class means any shelf-compatible cargo.
+    'target_cargo_class': '',      # '' | 'medium' | 'tall'
+    'target_quantity': 1,          # applied to run_mode=single
+    'target_drop_slot': '',        # '' = supervisor priority | exact A1/A2/B1/B2 for one LLM cycle
     # W4 (loi 2 ESP serial -> /shelf/occupancy): 4 bit o ke, 1 = co hang;
     # -1 = mat lien lac. Anh xa bit -> o va thiet ke ke: config/shelf.yaml
     # (doc bang shelf_model). KHONG CON drop_bin_fallback: khong ro (mat
@@ -212,6 +218,14 @@ class MissionSupervisor(Node):
         self._odom_angular_speed = None
         self._nav_status_t = 0.0
         self._nav_goal_active = None
+        self._mission_nav_status = None
+        self._mission_nav_status_t = 0.0
+        self._mission_nav_attempt_t = 0.0
+        self._mission_nav_expected = None
+        self._mission_nav_consumed_t = 0.0
+        self._resume_free_nav = False
+        self._terminal_after_home = DONE
+        self._terminal_reason = ''
         # WAITING_SLOT: lan cuoi tham do /shelf/occupancy, va ly do khong co o
         self._last_slot_poll = 0.0
         self._slot_wait_why = ''
@@ -237,6 +251,10 @@ class MissionSupervisor(Node):
         self.create_subscription(Odometry, self.p['odom_topic'], self._on_odom, 10)
         self.create_subscription(
             GoalStatusArray, self.p['nav_status_topic'], self._on_nav_status, 10)
+        # mission_manager reports the actual NavigateToPose result here. The
+        # action status array only says whether a goal is active, so it cannot
+        # explain ABORTED or give the reason needed by web/recovery.
+        self.create_subscription(String, '/mission/status', self._on_mission_nav_status, 10)
 
         # W4 (loi 2 ESP serial -> /shelf/occupancy): 4 bit o ke, 1 = co hang;
         # [-1]*4 = mat ket noi. Doc truc tiep tu esp32_bridge. Anh xa
@@ -279,6 +297,7 @@ class MissionSupervisor(Node):
         # O da chon cho drop (id, frame_tf) tu chu trinh goc - null khi
         # chua chu trinh nao chon duoc o (GUI hien o dang chon)
         self._drop_slot_chosen = None
+        self._reserved_drop_slots = set()
 
         self.get_logger().info(
             f'Mission Supervisor ready: pick={self.p["pick_mission"]} '
@@ -367,11 +386,17 @@ class MissionSupervisor(Node):
     def _call_service(self, cli, req) -> bool:
         return self._call_service_result(cli, req) is not None
 
-    def _trigger_mission(self, mission: str) -> bool:
+    def _trigger_mission(self, mission: str, force_free: bool = False) -> bool:
         """Call the acknowledged mission trigger; success means Nav2 accepted its goal."""
         if self._cancel_requested:
             return False
-        svc = f'/{self.p["mission_manager_node"]}/trigger_{mission}_ack'
+        self._mission_nav_expected = mission
+        self._mission_nav_status = None
+        self._mission_nav_status_t = 0.0
+        self._mission_nav_attempt_t = time.time()
+        self._mission_nav_consumed_t = 0.0
+        suffix = '_free_ack' if force_free else '_ack'
+        svc = f'/{self.p["mission_manager_node"]}/trigger_{mission}{suffix}'
         cli = self._service_client(Trigger, svc)
         req = Trigger.Request()
         result = self._call_service_result(cli, req, timeout=12.0)
@@ -379,6 +404,23 @@ class MissionSupervisor(Node):
             return False
         self.get_logger().info(f'Da goi {svc}')
         return True
+
+    def _on_mission_nav_status(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            mission = str(data.get('mission') or '')
+            state = str(data.get('state') or '').upper()
+            stamp = float(data.get('timestamp') or time.time())
+            if mission != self._mission_nav_expected or stamp + 0.05 < self._mission_nav_attempt_t:
+                return
+            self._mission_nav_status = {
+                'mission': mission, 'state': state,
+                'reason': str(data.get('reason') or ''),
+                'nav_mode': data.get('nav_mode'),
+            }
+            self._mission_nav_status_t = stamp
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
 
     # ==================================================================
     # Services
@@ -415,6 +457,7 @@ class MissionSupervisor(Node):
         # ros2 param set mission_supervisor ... TRƯỚC khi gọi /mission/start)
         # - override hot, không cần restart.
         for k in ('pick_mission', 'drop_mission', 'pick_dest', 'run_mode',
+                  'target_cargo_class', 'target_quantity', 'target_drop_slot',
                   'pick_dest_2', 'pick_mission_2_from_p1',
                   'pm_final_window_s', 'pm_min_samples', 'pm_max_pos_std_m',
                   'pm_max_yaw_std_deg', 'pm_max_sample_age_s',
@@ -423,6 +466,48 @@ class MissionSupervisor(Node):
                 self.p[k] = self.get_parameter(k).value
             except Exception:
                 pass
+
+        target_class = str(self.p.get('target_cargo_class') or '').strip().lower()
+        target_quantity = self.p.get('target_quantity', 1)
+        target_drop_slot = str(self.p.get('target_drop_slot') or '').strip().upper()
+        if requested_mode == 'auto':
+            target_class, target_quantity, target_drop_slot = '', 1, ''
+        if target_class not in ('', 'medium', 'tall'):
+            res.success = False
+            res.message = 'target_cargo_class must be empty, medium, or tall'
+            return res
+        if (isinstance(target_quantity, bool) or not isinstance(target_quantity, int)
+                or not 1 <= target_quantity <= 10):
+            res.success = False
+            res.message = 'target_quantity must be an integer from 1 to 10'
+            return res
+        if target_drop_slot and target_drop_slot not in ('A1', 'A2', 'B1', 'B2'):
+            res.success = False
+            res.message = 'target_drop_slot must be empty, A1, A2, B1, or B2'
+            return res
+        if target_drop_slot and target_quantity != 1:
+            res.success = False
+            res.message = 'A fixed shelf slot only accepts one pallet per mission'
+            return res
+        if target_drop_slot and self._shelf_model is not None:
+            slot_cfg = self._shelf_model._slot_by_id.get(target_drop_slot)
+            slot_class = ('medium' if slot_cfg and slot_cfg.product_type == 'A'
+                          else 'tall' if slot_cfg and slot_cfg.product_type == 'B' else None)
+            if slot_class is None or (target_class and target_class != slot_class):
+                res.success = False
+                res.message = f'target_drop_slot {target_drop_slot} is incompatible with {target_class or "any"}'
+                return res
+            target_class = slot_class
+        self.p['target_cargo_class'] = target_class
+        self.p['target_quantity'] = target_quantity
+        self.p['target_drop_slot'] = target_drop_slot
+        if target_class and (target_drop_slot or self._shelf_ok() and self._shelf_bits is not None):
+            cargo_type = 'A' if target_class == 'medium' else 'B'
+            slot, _, why = self._select_drop_slot_for(cargo_type)
+            if slot is None:
+                res.success = False
+                res.message = f'No compatible shelf slot for {target_class}: {why}'
+                return res
 
         # Canh bao nhat quan: `pick_dest` va `pick_mission` phai tro cung mot
         # diem. Khong tu sua (nguoi van hanh can thay), chi bao ro.
@@ -455,6 +540,12 @@ class MissionSupervisor(Node):
         self._active_mission = self._mission_for_pick_dest(self._current_pick_dest())
         self._active_dest = self._current_pick_dest()
         self._cycle = 0
+        self._terminal_after_home = DONE
+        self._terminal_reason = ''
+        self._mission_nav_expected = None
+        self._mission_nav_status = None
+        self._mission_nav_status_t = 0.0
+        self._resume_free_nav = False
         self._empty_scans = 0
         self._resume_state = None
         self._cancel_requested = False
@@ -498,12 +589,18 @@ class MissionSupervisor(Node):
             return res
         state = self._resume_state
         self._resume_state = None
+        self._resume_free_nav = bool(
+            self._mission_nav_status and self._mission_nav_status.get('state') == 'ABORTED')
         self._approach_retries = 0
         self._drop_retries = 0
         self._detector_restarts = 0
         self._triggered = False
         self._go_called = False
         self._cancel_requested = False
+        self._mission_nav_status = None
+        self._mission_nav_status_t = 0.0
+        self._mission_nav_expected = None
+        self._mission_nav_consumed_t = 0.0
         self._set_state(state, 'Resume tu checkpoint; da kiem tra an toan truoc khi bam')
         res.success, res.message = True, 'resumed'
         return res
@@ -609,8 +706,13 @@ class MissionSupervisor(Node):
             classes.append('medium')
         if self._select_drop_slot_for('B')[0] is not None:
             classes.append('tall')
+        requested = str(self.p.get('target_cargo_class') or '').strip().lower()
+        if requested:
+            classes = [requested] if requested in classes else []
         if not classes:
-            self.get_logger().warn('[detector] no compatible shelf class is available')
+            self.get_logger().warn(
+                '[detector] no compatible shelf class is available for requested '
+                f'class {requested or "any"}')
             return False
 
         get_cli = self._service_client(GetParameters, f'/{pm}/get_parameters')
@@ -728,6 +830,29 @@ class MissionSupervisor(Node):
         # GoalStatus constants: ACCEPTED=1, EXECUTING=2, CANCELING=3.
         self._nav_goal_active = any(s.status in (1, 2, 3) for s in msg.status_list)
         self._nav_status_t = time.monotonic()
+
+    def _handle_mission_nav_result(self):
+        result = self._mission_nav_status
+        if not result or self._mission_nav_status_t <= self._mission_nav_consumed_t:
+            return
+        if result.get('state') not in ('ABORTED', 'CANCELED'):
+            return
+        if self._state not in (GOTO_PICK, GOTO_D, 'RETURN_HOME'):
+            return
+        if result.get('mission') != self._active_mission:
+            return
+        if self._cancel_requested:
+            return
+        checkpoint = self._state
+        self._mission_nav_consumed_t = self._mission_nav_status_t
+        self._triggered = False
+        reason = result.get('reason') or result['state']
+        mode = result.get('nav_mode') or 'unknown'
+        self._set_state(
+            'RECOVERY',
+            f'Nav2 {result["state"]} for {result["mission"]} '
+            f'(mode={mode}): {reason}')
+        self._resume_state = checkpoint
 
     def _on_detector_status(self, msg: String):
         try:
@@ -859,10 +984,35 @@ class MissionSupervisor(Node):
         return self._shelf_model is not None and any(
             v == EMPTY for v in self._shelf_states().values())
 
+    def _requested_slot_available(self):
+        requested = str(self.p.get('target_cargo_class') or '').strip().lower()
+        if requested == 'medium':
+            return self._select_drop_slot_for('A')[0] is not None
+        if requested == 'tall':
+            return self._select_drop_slot_for('B')[0] is not None
+        return (self._select_drop_slot_for('A')[0] is not None
+                or self._select_drop_slot_for('B')[0] is not None)
+
     def _select_drop_slot_for(self, cargo_type):
         if self._shelf_model is None:
             return None, None, 'Khong doc duoc shelf.yaml'
-        states = self._shelf_states()
+        states = dict(self._shelf_states())
+        for sid in tuple(self._reserved_drop_slots):
+            if states.get(sid) == FULL:
+                self._reserved_drop_slots.discard(sid)
+        # A just-placed box can take a sensor update cycle to appear. Reserve
+        # confirmed drop slots for this mission so a multi-item request cannot
+        # select the same apparently-empty slot twice.
+        for sid in self._reserved_drop_slots:
+            states[sid] = FULL
+        requested = str(self.p.get('target_drop_slot') or '').strip().upper()
+        if requested:
+            slot = self._shelf_model._slot_by_id.get(requested)
+            if slot is None or slot.product_type != cargo_type:
+                return None, None, f'O ke {requested} khong phu hop loai hang {cargo_type}'
+            if states.get(requested) != EMPTY:
+                return None, None, f'O ke {requested} khong duoc xac nhan la trong'
+            return requested, slot.tf_frame, ''
         sid, why = self._shelf_model.select_drop_slot(cargo_type, states)
         if sid is None:
             return None, None, why
@@ -944,6 +1094,14 @@ class MissionSupervisor(Node):
         return d1_missions.get(dest, '')
 
     def _start_return_home(self, why):
+        incomplete = (self.p.get('run_mode') == 'single'
+                      and self._cycle < int(self.p.get('target_quantity', 1)))
+        self._terminal_after_home = FAILED if incomplete else DONE
+        if incomplete:
+            requested = self.p.get('target_cargo_class') or 'any'
+            why = (f'Mission incomplete: placed {self._cycle}/'
+                   f'{self.p.get("target_quantity", 1)} {requested}; {why}')
+        self._terminal_reason = why
         self._active_mission, self._active_dest = 'return_home', 'NODE_HOME'
         self._triggered, self._near_t0 = False, None
         self._set_state('RETURN_HOME', why + ' -> tu dong ve HOME')
@@ -1043,9 +1201,11 @@ class MissionSupervisor(Node):
                 # lam lech pose truoc khi vao ke).
                 self.get_logger().info('[GOTO_D] Xe da o D_1 -> bo qua gui lai mission Nav2')
                 self._triggered = True
+                self._resume_free_nav = False
                 return
-            if self._trigger_mission(self.p['drop_mission']):
+            if self._trigger_mission(self.p['drop_mission'], self._resume_free_nav):
                 self._triggered = True
+                self._resume_free_nav = False
             elif now - self._t_state > 30.0:
                 self._set_state('RECOVERY', 'Khong goi duoc mission toi D_1')
                 self._resume_state = GOTO_D
@@ -1165,12 +1325,18 @@ class MissionSupervisor(Node):
             self._t_state = now
             return
         if self._pm_state == DONE and self._pm_cargo is False:
+            if self._drop_slot_chosen:
+                self._reserved_drop_slots.add(self._drop_slot_chosen[0])
             self._cycle += 1
             self._drop_retries = 0
             self._go_called = False
             if self.p.get('run_mode') == 'auto' and (not self._shelf_ok() or self._shelf_bits is None):
                 self._start_return_home('Da dat pallet; cam bien ke mat ket noi nen dung Auto')
-            elif self.p.get('run_mode') == 'auto' and self._any_slot_available():
+            elif (self.p.get('run_mode') == 'auto'
+                  or self._cycle < int(self.p.get('target_quantity', 1))):
+                if not self._requested_slot_available():
+                    self._start_return_home('Da het o ke phu hop voi loai hang can lay')
+                    return
                 self._pick_queue = self._build_pick_queue()
                 self._pick_idx = 0
                 self._active_dest = self._current_pick_dest()
@@ -1202,8 +1368,9 @@ class MissionSupervisor(Node):
 
     def _do_return_home(self, now):
         if not self._triggered:
-            if self._trigger_mission('return_home'):
+            if self._trigger_mission('return_home', self._resume_free_nav):
                 self._triggered = True
+                self._resume_free_nav = False
                 self._active_dest = 'NODE_HOME'
                 self._near_t0 = None
             elif now - self._t_state > 30.0:
@@ -1234,10 +1401,18 @@ class MissionSupervisor(Node):
                     self._enter_waiting_slot(
                         'Da ve HOME nhung van giu pallet; ke chua co o trong de dat')
                 else:
-                    self._set_state(DONE, f'Ve HOME xong sau {self._cycle} chu ky')
+                    terminal = self._terminal_after_home
+                    if terminal == FAILED:
+                        self._set_state(FAILED, self._terminal_reason or
+                                        f'Mission incomplete: placed {self._cycle}/'
+                                        f'{self.p.get("target_quantity", 1)}')
+                    else:
+                        self._set_state(DONE, f'Ve HOME xong; da dat {self._cycle} pallet len ke')
 
     def _tick(self):
         now = time.monotonic()
+
+        self._handle_mission_nav_result()
 
         if self._state == GOTO_PICK:
             self._do_goto_pick(now)
@@ -1262,8 +1437,8 @@ class MissionSupervisor(Node):
             self._resume_state = GOTO_PICK
             return
         if (self._shelf_ok() and self._shelf_bits is not None
-                and not self._any_slot_available()):
-            self._start_return_home('Khong con o ke trong')
+                and not self._requested_slot_available()):
+            self._start_return_home('Khong con o ke trong phu hop')
             return
         if not self._triggered:
             d0, p0 = self._dest_pose(), self._base_pose()
@@ -1272,9 +1447,11 @@ class MissionSupervisor(Node):
                     and self._nav_goal_active is not True):
                 self.get_logger().info('[GOTO_PICK] Xe da o diem pick -> bo qua gui lai mission Nav2')
                 self._triggered = True
+                self._resume_free_nav = False
                 return
-            if self._trigger_mission(self._active_mission):
+            if self._trigger_mission(self._active_mission, self._resume_free_nav):
                 self._triggered = True
+                self._resume_free_nav = False
             if now - self._t_state > 30.0:
                 self._set_state('RECOVERY', 'Service mission_manager khong san sang')
                 self._resume_state = GOTO_PICK
@@ -1307,7 +1484,7 @@ class MissionSupervisor(Node):
                         self._set_state('RECOVERY', 'Du lieu cam bien ke stale/mat ket noi tai P_1')
                         self._resume_state = GOTO_PICK
                     # else: cho du lieu ke tuoi tro lai, thu lai o nhip sau
-                elif not self._any_slot_available():
+                elif not self._requested_slot_available():
                     self._start_return_home('Khong con o ke trong hoac du lieu ke khong hop le')
                 else:
                     self._enter_picking()
@@ -1623,6 +1800,13 @@ class MissionSupervisor(Node):
             'cycle': {
                 'run_mode': self.p.get('run_mode', 'single'),
                 'number': self._cycle,
+                'placed': self._cycle,
+                'target_quantity': (int(self.p.get('target_quantity', 1))
+                                    if self.p.get('run_mode') == 'single' else None),
+                'target_cargo_class': (self.p.get('target_cargo_class') or 'any'
+                                       if self.p.get('run_mode') == 'single' else None),
+                'target_drop_slot': (self.p.get('target_drop_slot') or 'auto'
+                                     if self.p.get('run_mode') == 'single' else None),
                 'pick_mission': self.p['pick_mission'],
                 'drop_mission': self.p['drop_mission'],
             },
@@ -1686,6 +1870,8 @@ class MissionSupervisor(Node):
             'pm_lift_cm': self._pm_lift,
             'nav_status_fresh': nav_fresh,
             'nav_goal_active': self._nav_goal_active if nav_fresh else None,
+            'nav_mission': dict(self._mission_nav_status)
+                if self._mission_nav_status else None,
             'odom_fresh': self._odom_t > 0.0 and now - self._odom_t <= 0.5,
             'robot_stopped': self._robot_stopped(now),
             'resume_available': self._state == 'RECOVERY' and bool(self._resume_state),

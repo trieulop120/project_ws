@@ -684,43 +684,85 @@ class WebBridge(Node):
         self._recent_mission_baseline_pending = True
 
     @staticmethod
-    def _mission_label(name: str) -> str:
-        if name == 'return_home':
+    def _mission_label(name: str, phase: str = '', destination: str = '') -> str:
+        """Operator-facing name for a navigation or pallet-handling step."""
+        phase = (phase or '').upper()
+        dest = (destination or '').upper()
+        if phase == 'GOTO_PICK':
+            return {'P_1': 'Go to Pick 1', 'P_2': 'Go to Pick 2'}.get(
+                dest, 'Go to pickup')
+        if phase == 'PICKING':
+            return 'Pick pallet'
+        if phase == 'GOTO_D':
+            return 'Go to shelf (D_1)'
+        if phase == 'DROPPING':
+            return 'Place pallet on shelf'
+        if phase == 'WAITING_SLOT':
+            return 'Wait for shelf space'
+        if phase == 'RETURN_HOME':
             return 'Return to HOME'
-        nodes = {'home': 'HOME', 'p1': 'P_1', 'p2': 'P_2', 'd1': 'D_1'}
-        parts = (name or '').lower().split('_to_')
-        if len(parts) == 2:
-            return f'{nodes.get(parts[0], parts[0].upper())} → {nodes.get(parts[1], parts[1].upper())}'
-        return name or 'Mission'
+        mission = (name or '').lower()
+        if mission == 'return_home':
+            return 'Return to HOME'
+        if mission in {'p1_to_d1', 'p2_to_d1'}:
+            return 'Go to shelf (D_1)'
+        if mission in {'home_to_p1', 'home_to_p2', 'd1_to_p1', 'd1_to_p2',
+                        'p1_to_p2'}:
+            return 'Go to pickup'
+        return 'Pallet mission'
 
     def _record_supervisor_mission(self, previous: dict, current: dict) -> None:
         old_state, new_state = previous.get('state'), current.get('state')
         completed = {
-            ('GOTO_PICK', 'PICKING'),
-            ('GOTO_D', 'DROPPING'),
-            ('RETURN_HOME', 'DONE'),
+            ('GOTO_PICK', 'PICKING'): ('GOTO_PICK', 'Completed'),
+            ('PICKING', 'GOTO_D'): ('PICKING', 'Completed'),
+            ('GOTO_D', 'DROPPING'): ('GOTO_D', 'Completed'),
+            ('DROPPING', 'RETURN_HOME'): ('DROPPING', 'Completed'),
+            ('DROPPING', 'GOTO_PICK'): ('DROPPING', 'Completed'),
+            ('DROPPING', 'DONE'): ('DROPPING', 'Completed'),
+            ('RETURN_HOME', 'DONE'): ('RETURN_HOME', 'Completed'),
         }
         active_states = {'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
                          'WAITING_SLOT', 'RETURN_HOME'}
-        if (old_state, new_state) in completed:
-            outcome = 'Completed'
+        transition = completed.get((old_state, new_state))
+        if transition:
+            phase, outcome = transition
         elif old_state in active_states and new_state == 'RECOVERY':
             outcome = ('Canceled' if 'OPERATOR_CANCEL' in str(current.get('msg', ''))
                        else 'Recovery Required')
+            phase = old_state
         elif old_state in active_states and new_state == 'STOPPED':
             outcome = 'Canceled'
+            phase = old_state
         elif (old_state == 'RECOVERY' and previous.get('resume_available') is True
               and new_state == previous.get('resume_state')):
             outcome = 'Resumed'
+            phase = previous.get('resume_state')
         else:
-            return
-        mission = previous.get('active_mission') or current.get('active_mission')
-        self._recent_supervisor_missions.appendleft({
-            'time': datetime.now().strftime('%H:%M:%S'),
-            'name': self._mission_label(mission),
-            'status': outcome,
-            'cycle': (previous.get('cycle') or {}).get('number', 0),
-        })
+            phase = None
+        # Detection reaches READY before the physical approach/pick starts.
+        # Record this as its own completed task rather than hiding it under the
+        # navigation leg to the pickup point.
+        events = []
+        if phase:
+            mission = previous.get('active_mission') or current.get('active_mission')
+            dest = previous.get('active_dest') or current.get('active_dest') or ''
+            task_name = self._mission_label(mission, phase, dest)
+            if phase == 'PICKING' and previous.get('pm_state') == 'DETECTING':
+                task_name = 'Detect pallet'
+            events.append((task_name, outcome,
+                           previous.get('cycle') or {}))
+        if (new_state == 'PICKING' and current.get('pm_state') == 'READY'
+                and previous.get('pm_state') != 'READY'):
+            events.append(('Detect pallet', 'Completed', current.get('cycle') or {}))
+        # appendleft reverses insertion order, so emit older events first.
+        for label, event_status, cycle in events:
+            self._recent_supervisor_missions.appendleft({
+                'time': datetime.now().strftime('%H:%M:%S'),
+                'name': label,
+                'status': event_status,
+                'cycle': cycle.get('number', 0),
+            })
 
     def get_mission_supervisor_status(self):
         """Return a copy of supervisor status with transport freshness metadata."""
@@ -821,14 +863,19 @@ class WebBridge(Node):
             if self._nav_bridge:
                 self._nav_bridge.set_op_mode('AUTO')
             req = SetParameters.Request()
-            req.parameters = [Parameter(
-                'run_mode', Parameter.Type.STRING, run_mode).to_parameter_msg()]
+            req.parameters = [
+                Parameter('run_mode', Parameter.Type.STRING, run_mode).to_parameter_msg(),
+                Parameter('target_cargo_class', Parameter.Type.STRING, '').to_parameter_msg(),
+                Parameter('target_quantity', Parameter.Type.INTEGER, 1).to_parameter_msg(),
+                Parameter('target_drop_slot', Parameter.Type.STRING, '').to_parameter_msg(),
+            ]
             response, error = self._call_service_wait(
                 self._mission_params_client, req)
             if response is None:
                 return False, error
-            if not response.results or not response.results[0].successful:
-                return False, f'Could not set run_mode={run_mode}'
+            if (len(response.results) != len(req.parameters) or
+                    not all(item.successful for item in response.results)):
+                return False, f'Could not set mission parameters for run_mode={run_mode}'
             client = self._mission_start_client
         else:
             client = clients.get(command)
