@@ -75,6 +75,9 @@ class ShelfModel:
                          for k, lst in (cfg.get('priority') or {}).items()}
         self.slots = [Slot(s) for s in cfg['slots']]
         self._slot_by_id = {s.id: s for s in self.slots}
+        self.levels = cfg.get('levels') or {}
+        self.slot_level = cfg.get('slot_level') or {}
+        self.retrieval = cfg.get('retrieval') or {}
         self._validate()
 
     # ------------------------------------------------------------------
@@ -229,3 +232,48 @@ class ShelfModel:
             skips.append(f"{s_.id}={st}")
         return None, (f"khong co o co hang de lay (chi lay tu o "
                       f'"co hàng"; "empty"/"unknown" deu kho lay): {", ".join(skips)}')
+
+    def retrieval_height_m(self, slot_id: str):
+        """Return the provisional pallet reference height for manual retrieval."""
+        level = self.slot_level.get(str(slot_id).upper())
+        level_cfg = self.levels.get(level, self.levels.get(str(level), {}))
+        if not level_cfg or 'release_lift_cm' not in level_cfg:
+            return None
+        # Candidate pose z is the pallet face center; release_lift_cm is the
+        # fork/support plane.
+        center_offset = float(self.retrieval.get('pallet_center_offset_m', 0.10))
+        return float(level_cfg['release_lift_cm']) / 100.0 + center_offset
+
+    def retrieval_pose_match(self, slot_id: str, pallet_pose,
+                             shelf_front_pose) -> tuple:
+        """Match one detected (x,y,z,yaw) pallet pose to a selected rack slot.
+
+        This selector is retrieval-only. It uses local rack coordinates so the
+        column is matched laterally and A1/A2 are distinguished by height.
+        """
+        slot = self._slot_by_id.get(str(slot_id).upper())
+        if slot is None or len(pallet_pose) < 4 or len(shelf_front_pose) < 3:
+            return False, 'invalid slot or pose'
+        expected_z = self.retrieval_height_m(slot.id)
+        if expected_z is None:
+            return False, f'missing retrieval height for {slot.id}'
+
+        px, py, pz, pyaw = map(float, pallet_pose[:4])
+        fx, fy, fyaw = map(float, shelf_front_pose[:3])
+        dx, dy = px - fx, py - fy
+        c, s = math.cos(fyaw), math.sin(fyaw)
+        local_x = c * dx + s * dy
+        local_y = -s * dx + c * dy
+        expected_y = self._slot_local_y(slot)
+        cfg = self.retrieval
+        if not (float(cfg.get('normal_min_m', 0.0)) <= local_x <=
+                float(cfg.get('normal_max_m', 0.90))):
+            return False, f'{slot.id}: pallet outside rack depth window'
+        if abs(local_y - expected_y) > float(cfg.get('lateral_tolerance_m', 0.24)):
+            return False, f'{slot.id}: pallet does not align with selected column'
+        if abs(pz - expected_z) > float(cfg.get('height_tolerance_m', 0.14)):
+            return False, f'{slot.id}: pallet height does not match selected level'
+        yaw_error = math.atan2(math.sin(pyaw - fyaw), math.cos(pyaw - fyaw))
+        if abs(math.degrees(yaw_error)) > float(cfg.get('yaw_tolerance_deg', 25.0)):
+            return False, f'{slot.id}: pallet yaw does not align with shelf'
+        return True, ''

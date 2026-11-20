@@ -109,9 +109,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.time import Time
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
+                       qos_profile_sensor_data)
 
-from geometry_msgs.msg import PoseStamped, TransformStamped, Quaternion
+from geometry_msgs.msg import PoseArray, PoseStamped, TransformStamped, Quaternion
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import String, Bool
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
@@ -222,6 +223,9 @@ class PalletDetectorNode(Node):
 
     MIN_DEPTH_M = 0.1
     MAX_DEPTH_M = 10.0
+    # BGR colors shared by normal pallet and retrieval debug views.
+    DETECTION_COLORS = {'pallet': (0, 255, 0), 'box': (255, 0, 0),
+                        'hole': (0, 165, 255)}  # orange in OpenCV BGR
 
     def __init__(self):
         super().__init__('pallet_detector_node')
@@ -238,6 +242,8 @@ class PalletDetectorNode(Node):
         self.declare_parameter('pallet_frame_id', 'pallet_frame')
         self.declare_parameter('tf_timeout', 0.2)
         self.declare_parameter('debug_image', True)
+        self.declare_parameter('show_detection_table', False)
+        self.declare_parameter('idle_preview_enabled', True)
         # percentile of depth inside the OBB (low = nearest = pallet front face)
         self.declare_parameter('depth_percentile', 25.0)
         self.declare_parameter('use_depth_yaw', True)
@@ -275,6 +281,14 @@ class PalletDetectorNode(Node):
         self.declare_parameter('detection_enabled', True)
         self.declare_parameter('roi_bottom_frac', 0.7)
         self.declare_parameter('roi_side_margin_px', 0)
+        # Retrieval runs on a central vertical strip instead of the whole frame:
+        # keep the full height (upper-shelf slots are not cut) but trim the
+        # horizontal sides, since the aligned robot's target pallet sits near
+        # the vertical centerline. 1.0 side = full width (previous behaviour).
+        self.declare_parameter('retrieval_roi_side_frac', 0.75)
+        self.declare_parameter('retrieval_roi_bottom_frac', 1.0)
+        self.declare_parameter('inference_device', 'cpu')
+        self.inference_device = str(self.get_parameter('inference_device').value)
 
         self.model_path = self.get_parameter('model_path').value
         self.conf_threshold = self.get_parameter('conf_threshold').value
@@ -285,6 +299,8 @@ class PalletDetectorNode(Node):
         self.pallet_frame_id = self.get_parameter('pallet_frame_id').value
         self.tf_timeout = self.get_parameter('tf_timeout').value
         self.publish_debug = self.get_parameter('debug_image').value
+        self.show_detection_table = bool(self.get_parameter('show_detection_table').value)
+        self.idle_preview_enabled = bool(self.get_parameter('idle_preview_enabled').value)
         self.depth_percentile = self.get_parameter('depth_percentile').value
         self.use_depth_yaw = self.get_parameter('use_depth_yaw').value
         self.pallet_face_width = float(self.get_parameter('pallet_face_width').value)
@@ -321,6 +337,10 @@ class PalletDetectorNode(Node):
         self.roi_bottom_frac = min(1.0, max(0.1, float(
             self.get_parameter('roi_bottom_frac').value)))
         self.roi_side_margin_px = int(self.get_parameter('roi_side_margin_px').value)
+        self.retrieval_roi_side_frac = min(1.0, max(0.1, float(
+            self.get_parameter('retrieval_roi_side_frac').value)))
+        self.retrieval_roi_bottom_frac = min(1.0, max(0.1, float(
+            self.get_parameter('retrieval_roi_bottom_frac').value)))
         self._detection_enabled = bool(self.get_parameter('detection_enabled').value)
         # Loaded-pallet filtering: SEARCH mode only accepts pallets with at
         # least one 2D-associated box; TRACKING skips the check (a brief box
@@ -332,15 +352,13 @@ class PalletDetectorNode(Node):
         # (overhang, OBB inaccuracy, depth jitter).
         self.declare_parameter('box_pallet_margin_px', 15)
         self.box_pallet_margin_px = int(self.get_parameter('box_pallet_margin_px').value)
-        # Box-height classification from depth (NO re-training). Measures the box
-        # top's Z MINUS the pallet top's Z, both back-projected in the SAME frame
-        # / TF, so the camera's fixed vertical offset (mechanical install error)
-        # cancels out. A box only gets a height_class when it is detected,
-        # 2D-associated with the pallet (is_pallet_loaded), and its depth is
-        # measurable; otherwise 'unknown' -- never a guess.
+        # Cargo height is the max/min base-frame Z span of valid depth
+        # inside the associated carton masks; no model retraining is needed.
         self.declare_parameter('use_box_height_class', True)
         self.declare_parameter('box_height_threshold_m', 0.32)  # >= tall, < medium
         self.declare_parameter('box_height_min_pixels', 30)
+        # Empirical correction: reported Z-span bias is +7 cm. This adjusts
+        # cargo height only, never camera TF, depth, pallet pose or yaw.
         # Optional mission-level cargo filter. Empty means retain the normal
         # detector policy. When set, SEARCH only locks pallets whose measured
         # tallest carried box belongs to one of these classes.
@@ -442,6 +460,15 @@ class PalletDetectorNode(Node):
         self.cy = self.DEFAULT_CY
         self.camera_info_received = False
 
+        # Process CPU load is shared by both inference modes; each mode gets
+        # its own completed-inference Hz and model.predict latency.
+        self._perf_frames = {'normal': deque(maxlen=60), 'retrieval': deque(maxlen=60)}
+        self._perf_ms = {'normal': 0.0, 'retrieval': 0.0}
+        self._cpu_sample_wall = time.monotonic()
+        self._cpu_sample_process = time.process_time()
+        self._perf_last_publish = 0.0
+        self._process_cpu_pct = 0.0
+
         self.bridge = CvBridge()
 
         # TF2
@@ -449,8 +476,10 @@ class PalletDetectorNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
 
-        # YOLO model
+        # YOLO model. Warn once if an exported detect-only model supplies
+        # axis-aligned xyxy rather than genuine OBB corners / segmentation.
         self.model = None
+        self._aabb_fallback_warned = False
         self._load_model()
 
         # Thread-safe latest data
@@ -474,6 +503,20 @@ class PalletDetectorNode(Node):
             Bool, '/pallet_detector/enable', self._on_detection_enable, enable_qos)
         self.pose_base_pub = self.create_publisher(
             PoseStamped, '/pallet/pose_base', QoSProfile(depth=10))
+        # Retrieval gets an independent, unfiltered stream of pallet-only
+        # candidates. It is opt-in and does not alter /pallet/pose selection
+        # or the Auto/inbound detector gates.
+        self.retrieval_candidates_pub = self.create_publisher(
+            PoseArray, '/pallet_retrieval/candidates', QoSProfile(depth=10))
+        self.retrieval_detection_status_pub = self.create_publisher(
+            String, '/pallet_retrieval/detection_status', QoSProfile(depth=10))
+        self._retrieval_candidates_enabled = False
+        retrieval_enable_qos = QoSProfile(depth=1)
+        retrieval_enable_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        retrieval_enable_qos.reliability = ReliabilityPolicy.RELIABLE
+        self.retrieval_candidates_enable_sub = self.create_subscription(
+            Bool, '/pallet_retrieval/enable', self._on_retrieval_candidates_enable,
+            retrieval_enable_qos)
         self.pose_camera_pub = self.create_publisher(
             PoseStamped, '/pallet/pose_camera', QoSProfile(depth=10))
         self.detections_pub = self.create_publisher(
@@ -488,17 +531,28 @@ class PalletDetectorNode(Node):
             String, '/pallet/target_status', QoSProfile(depth=10))
 
         if self.publish_debug:
+            debug_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+            # Legacy debug topic remains unchanged for existing consumers.
             self.debug_image_pub = self.create_publisher(
-                Image,
-                '/perception/pallet_debug_image',
-                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-            )
+                Image, '/perception/pallet_debug_image', debug_qos)
+            # Two independent ROI visualizations for rqt_image_view (no Web UI change).
+            self.normal_debug_pub = self.create_publisher(
+                Image, '/perception/pallet_normal_debug_image', debug_qos)
+            self.retrieval_debug_pub = self.create_publisher(
+                Image, '/perception/pallet_retrieval_debug_image', debug_qos)
+        self.perf_pub = self.create_publisher(
+            String, '/pallet_detector/performance', 10)
 
         # ============================================================
         # Subscribers with Time Synchronizer
         # ============================================================
-        self.color_sub = Subscriber(self, Image, '/color/image_raw')
-        self.depth_sub = Subscriber(self, Image, '/depth/image_raw')
+        # RGB-D camera publishers commonly use BEST_EFFORT sensor QoS. The
+        # message_filters default is RELIABLE, which is incompatible with a
+        # BEST_EFFORT publisher and silently yields zero synchronized frames.
+        self.color_sub = Subscriber(
+            self, Image, '/color/image_raw', qos_profile_sensor_data)
+        self.depth_sub = Subscriber(
+            self, Image, '/depth/image_raw', qos_profile_sensor_data)
 
         self.ts = ApproximateTimeSynchronizer(
             [self.color_sub, self.depth_sub],
@@ -511,7 +565,7 @@ class PalletDetectorNode(Node):
             CameraInfo,
             '/color/camera_info',
             self.camera_info_callback,
-            QoSProfile(depth=1)
+            qos_profile_sensor_data
         )
 
         self.timer = self.create_timer(
@@ -666,11 +720,15 @@ class PalletDetectorNode(Node):
             self.model = YOLO(self.model_path)
             task = getattr(self.model, 'task', None)
             if task == 'obb':
-                self.get_logger().info('YOLO model loaded successfully (OBB)')
+                self.get_logger().info('YOLO model loaded successfully (OBB): using rotated 4-point boxes')
+            elif task == 'segment':
+                self.get_logger().info('YOLO model loaded successfully (segment): OBB from mask contours')
             else:
-                self.get_logger().info(
-                    f'YOLO model loaded successfully (task={task}) — detections '
-                    f'will be derived from mask contours via minAreaRect')
+                self.get_logger().warning(
+                    f'YOLO model task={task!r}: true rotated outlines need '
+                    'result.obb or segmentation masks. If the model returns '
+                    'only xyxy, pallet AND box will be axis-aligned; '
+                    'load OBB/segment weights to restore rotated outlines.')
         except Exception as e:
             self.get_logger().error(f'Failed to load model: {e}')
             self.model = None
@@ -700,7 +758,7 @@ class PalletDetectorNode(Node):
 
     def synced_callback(self, color_msg: Image, depth_msg: Image):
         """Synchronized callback for color and depth images."""
-        if not self._detection_enabled:
+        if not self._detection_enabled and not self.idle_preview_enabled:
             return
         try:
             color = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
@@ -789,6 +847,52 @@ class PalletDetectorNode(Node):
         if cam_corr and self.camera_pitch_deg != 0.0:
             R = R @ self.R_cam_corr
         return R, np.array([t.x, t.y, t.z])
+
+    def _on_retrieval_candidates_enable(self, msg: Bool):
+        self._retrieval_candidates_enabled = bool(msg.data)
+
+    def _publish_retrieval_candidates(self, pallets, depth_img,
+                                      depth_encoding: str, header):
+        """Publish poses for every pallet detection for the isolated retrieval flow."""
+        if not self._retrieval_candidates_enabled:
+            return
+        rt_map_base = self.lookup_rt(self.target_frame, self.base_frame)
+        if rt_map_base is None:
+            return
+        R_mb, t_mb = rt_map_base
+        msg = PoseArray()
+        msg.header.stamp = header.stamp
+        msg.header.frame_id = self.target_frame
+        for det in pallets:
+            p_base, _cost = self.evaluate_candidate(
+                det, depth_img, depth_encoding, header)
+            if p_base is None:
+                continue
+            yaw_base = self.estimate_yaw_from_depth(
+                depth_img, det, depth_encoding, 0.0,
+                header.frame_id or self.camera_frame_param, p_base)
+            if yaw_base is None:
+                continue
+            p_map = R_mb @ p_base + t_mb
+            yaw_map = math.atan2(R_mb[1, 0], R_mb[0, 0]) + yaw_base
+            # HUD-only metadata on this frame; does not change the pose.
+            depth = self.extract_depth_in_obb(depth_img, det['box'], depth_encoding)
+            if depth <= 0.0:
+                depth = self.extract_depth_at_point(
+                    depth_img, det['u'], det['v'], depth_encoding)
+            p_cam = self.pixel_to_3d(float(det['u']), float(det['v']), depth)
+            det.update(depth_m=float(depth), x_3d=float(p_cam[0]),
+                       y_3d=float(p_cam[1]), z_3d=float(p_cam[2]),
+                       x_base=float(p_base[0]), y_base=float(p_base[1]),
+                       z_base=float(p_base[2]), x_map=float(p_map[0]),
+                       y_map=float(p_map[1]), yaw_deg=math.degrees(yaw_base))
+            pose = PoseStamped().pose
+            pose.position.x, pose.position.y, pose.position.z = map(float, p_map)
+            pose.orientation.z = math.sin(yaw_map / 2.0)
+            pose.orientation.w = math.cos(yaw_map / 2.0)
+            msg.poses.append(pose)
+        self.retrieval_candidates_pub.publish(msg)
+        return len(msg.poses)
 
     def estimate_yaw_from_depth(self, depth_img: np.ndarray, det: dict,
                                 depth_encoding: str, center_depth: float,
@@ -913,29 +1017,52 @@ class PalletDetectorNode(Node):
     # ==================================================================
     # Detection
     # ==================================================================
-    def _roi_crop(self, h: int, w: int) -> Optional[Tuple[int, int, int, int]]:
+    def _roi_crop(self, h: int, w: int,
+                  retrieval: bool = False) -> Optional[Tuple[int, int, int, int]]:
         """Return (x0, x1, y0, y1) of the YOLO ROI, or None (full frame)."""
         if not self.use_roi:
             return None
-        top = int(math.floor(h * (1.0 - self.roi_bottom_frac)))
-        side = self.roi_side_margin_px
+        if retrieval:
+            # Central vertical strip: keep `retrieval_roi_bottom_frac` of the
+            # height (full by default so upper shelves survive) and the middle
+            # `retrieval_roi_side_frac` of the width.
+            top = int(math.floor(h * (1.0 - self.retrieval_roi_bottom_frac)))
+            side = int(math.floor((w * (1.0 - self.retrieval_roi_side_frac)) / 2.0))
+        else:
+            top = int(math.floor(h * (1.0 - self.roi_bottom_frac)))
+            side = self.roi_side_margin_px
         x0, x1 = max(0, side), min(w, w - side)
         y0, y1 = top, h
         if x1 <= x0 or y1 <= y0:
             return None
         return x0, x1, y0, y1
 
-    def detect_pallets(self, color_img: np.ndarray) -> List[dict]:
+    def detect_pallets(self, color_img: np.ndarray,
+                       use_full_frame: bool = False,
+                       retrieval: bool = False) -> List[dict]:
         """Run YOLO OBB detection on the (optionally ROI-cropped) color image.
 
         With use_roi the model only sees the lower band of the frame with a
         side margin trimmed off; detection coordinates are shifted back to
         full-frame pixels so depth sampling / intrinsics are unaffected.
+
+        Retrieval mode (retrieval=True) uses a central vertical strip: the
+        full height, so upper-shelf pallets are not cut by the floor-pick ROI,
+        but the horizontal sides are trimmed (the aligned robot's target
+        pallet sits near the vertical centerline). use_full_frame falls back
+        to the whole image when no ROI is configured.
         """
         if self.model is None:
             return []
 
-        roi = self._roi_crop(*color_img.shape[:2])
+        # Retrieval sees the central vertical strip so upper-shelf pallets are
+        # not cut by the floor-pick ROI; the regular detector path keeps its
+        # configured lower-band ROI.
+        roi = None
+        if retrieval:
+            roi = self._roi_crop(*color_img.shape[:2], retrieval=True)
+        elif not use_full_frame:
+            roi = self._roi_crop(*color_img.shape[:2])
         if roi is not None:
             x0, x1, y0, y1 = roi
             roi_img = color_img[y0:y1, x0:x1]
@@ -944,11 +1071,12 @@ class PalletDetectorNode(Node):
             roi_img, off_x, off_y = color_img, 0, 0
 
         try:
+            infer_start = time.monotonic()
             results = self.model.predict(
                 roi_img,
                 conf=self.conf_threshold,
                 iou=self.iou_threshold,
-                device='cpu',
+                device=self.inference_device,
                 verbose=False
             )
 
@@ -963,14 +1091,39 @@ class PalletDetectorNode(Node):
                     clss = obb.cls.cpu().numpy().astype(int)
                     seg_xy = None
                 else:
-                    # Instance-segment model (task='segment'): no result.obb —
-                    # derive oriented boxes from the mask contours instead.
+                    # Segmentation contours preserve orientation for every
+                    # class (pallet, box, hole); only detect-only exports lack it.
                     corners_arr = None
                     xywhr = None
                     masks = result.masks
-                    if masks is None or len(masks) == 0:
-                        continue
                     boxes = result.boxes
+                    if masks is None or len(masks) == 0:
+                        if boxes is None or len(boxes) == 0:
+                            continue
+                        if not self._aabb_fallback_warned:
+                            self._aabb_fallback_warned = True
+                            self.get_logger().warning(
+                                'YOLO returned only boxes.xyxy (AABB), not OBB or masks. '
+                                'Cannot rotate pallet/box outlines from this output; '
+                                'check model_path and the loaded model task. '
+                                'This warning is informational: mission geometry is unchanged.')
+                        xyxy = boxes.xyxy.cpu().numpy()
+                        confs = boxes.conf.cpu().numpy()
+                        clss = boxes.cls.cpu().numpy().astype(int)
+                        for i, (x1, y1, x2, y2) in enumerate(xyxy):
+                            box = np.array([[x1, y1], [x2, y1],
+                                            [x2, y2], [x1, y2]], dtype=np.float32)
+                            box[:, 0] += off_x
+                            box[:, 1] += off_y
+                            cx, cy = float((x1 + x2) * 0.5 + off_x), float((y1 + y2) * 0.5 + off_y)
+                            detections.append({
+                                'center': (cx, cy), 'angle': 0.0,
+                                'conf': float(confs[i]),
+                                'class': result.names[int(clss[i])],
+                                'class_id': int(clss[i]), 'box': box,
+                                'u': int(cx), 'v': int(cy),
+                            })
+                        continue
                     confs = (boxes.conf.cpu().numpy()
                               if boxes is not None and len(boxes) else np.zeros(0))
                     clss = (boxes.cls.cpu().numpy().astype(int)
@@ -1006,7 +1159,7 @@ class PalletDetectorNode(Node):
                         box = cv2.boxPoints((center_r, wh_r, ang_deg))
                         box[:, 0] += off_x
                         box[:, 1] += off_y
-                        detections.append({
+                        det = {
                             'center': (center_r[0] + off_x, center_r[1] + off_y),
                             'angle': math.radians(ang_deg),
                             'conf': float(confs[i]) if i < len(confs) else 0.0,
@@ -1015,8 +1168,18 @@ class PalletDetectorNode(Node):
                             'box': box,
                             'u': int(center_r[0] + off_x),
                             'v': int(center_r[1] + off_y),
-                        })
+                        }
+                        if det['class'] == 'box':
+                            mask = pts.copy()
+                            mask[:, 0] += off_x
+                            mask[:, 1] += off_y
+                            det['mask'] = mask
+                        detections.append(det)
 
+            mode_name = 'retrieval' if retrieval else 'normal'
+            completed_at = time.monotonic()
+            self._perf_frames[mode_name].append(completed_at)
+            self._perf_ms[mode_name] = (completed_at - infer_start) * 1000.0
             return detections
 
         except Exception as e:
@@ -1157,123 +1320,108 @@ class PalletDetectorNode(Node):
     # ==================================================================
     # Box height classification (depth only, no re-training)
     # ==================================================================
-    def _obb_z_base(self, det: dict, depth_img: np.ndarray,
-                    depth_encoding: str, header, kind: str,
-                    shrink: float = 0.90) -> Optional[float]:
-        """Height of an OBB's surface in the base frame, from depth.
+    def _box_z_limits(self, det, depth_img, depth_encoding, R_bc, t_bc):
+        """Legacy box-height estimate: P90 top-band Z minus P1 whole-OBB Z.
 
-        Same principle the pallet pose uses (extract_depth_in_obb /
-        estimate_yaw_from_depth): back-project the valid depth pixels inside
-        the shrunken OBB to the base frame with the same TF, then read the Z.
-
-        kind='top'    -> 90th percentile of Z in the top band of the OBB
-                         (the top face of a box, seen from the downward tilt).
-        kind='bottom' -> 1st percentile of Z over the whole OBB (the lowest
-                         visible surface, i.e. where the box meets the pallet
-                         top; the pallet top is the box's support surface).
-
-        Returns None when there are too few valid depth pixels, so the caller
-        can mark the box 'unknown' instead of guessing.
+        Keep the previous estimator's OBB region and robust percentiles. This
+        avoids letting mask-edge/background extrema inflate the height.
         """
+        box = np.asarray(det['box'], dtype=np.float32).reshape(-1, 2)
+        if len(box) < 3 or not np.isfinite(box).all():
+            return None
+        center = box.mean(axis=0)
+        polygon = center + (box - center) * 0.90
+        h, w = depth_img.shape[:2]
+        x0, x1 = max(0, int(np.floor(polygon[:, 0].min()))), min(w, int(np.ceil(polygon[:, 0].max())) + 1)
+        y0, y1 = max(0, int(np.floor(polygon[:, 1].min()))), min(h, int(np.ceil(polygon[:, 1].max())) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        mask = np.zeros((y1-y0, x1-x0), np.uint8)
+        cv2.fillPoly(mask, [np.rint(polygon - [x0, y0]).astype(np.int32)], 1)
+        v, u = np.nonzero(mask)
+        depth = depth_img[y0:y1, x0:x1][v, u].astype(np.float64)
+        if depth_encoding in ('16UC1', 'mono16'):
+            depth *= 0.001
+        elif depth_encoding != '32FC1':
+            return None
+        valid = np.isfinite(depth) & (depth > self.MIN_DEPTH_M) & (depth < self.MAX_DEPTH_M)
+        if valid.sum() < self.box_height_min_pixels:
+            return None
+        depth, u, v = depth[valid], u[valid]+x0, v[valid]+y0
+        # Only the Z row is needed; this is R_bc @ P_camera + t_bc.
+        z = (R_bc[2, 0] * (u-self.cx) * depth/self.fx +
+             R_bc[2, 1] * (v-self.cy) * depth/self.fy +
+             R_bc[2, 2] * depth + t_bc[2])
+        band = polygon[:, 1].max() - (polygon[:, 1].min() +
+                                      0.35 * (polygon[:, 1].max() - polygon[:, 1].min()))
+        in_top = v <= polygon[:, 1].min() + band
+        if int(in_top.sum()) < self.box_height_min_pixels:
+            return None
+        z_top = float(np.percentile(z[in_top], 90))
+        z_bottom = float(np.percentile(z, 1))
+        return z_bottom, z_top
+
+    def measure_box_heights(self, pallet, boxes, depth_img, depth_encoding, header,
+                            all_pallets=None):
+        """Cargo height is Z_max - Z_min over boxes assigned to one pallet."""
+        if not self.use_box_height_class:
+            return
+        pallet.pop('max_box_height_m', None)
+        pallet.pop('max_box_height_raw_m', None)
+        pallet.pop('max_box_class', None)
+        pallet.pop('cargo_z_min', None)
+        pallet.pop('cargo_z_max', None)
+        pallets = all_pallets if all_pallets is not None else [pallet]
+        # Start at cartons touching a pallet, then propagate ownership upward
+        # through touching cartons. Do not mix components spanning two pallets.
+        owners = [{i for i, p in enumerate(pallets) if self.is_pallet_loaded(p, [box])}
+                  for box in boxes]
+        bounds = [np.array([box['box'][:, 0].min(), box['box'][:, 1].min(),
+                            box['box'][:, 0].max(), box['box'][:, 1].max()]) for box in boxes]
+        links = []
+        for i, a in enumerate(bounds):
+            for j in range(i):
+                b = bounds[j]
+                overlap = min(a[2], b[2]) - max(a[0], b[0])
+                width = max(1., min(a[2]-a[0], b[2]-b[0]))
+                if overlap >= 0.35*width and min(abs(a[3]-b[1]), abs(b[3]-a[1])) <= self.box_pallet_margin_px:
+                    links.append((i, j))
+        for _ in boxes:
+            changed = False
+            for i, j in links:
+                combined = owners[i] | owners[j]
+                if owners[i] != combined or owners[j] != combined:
+                    owners[i], owners[j] = combined.copy(), combined.copy()
+                    changed = True
+            if not changed:
+                break
+        target = next(i for i, p in enumerate(pallets) if p is pallet)
+        associated = [box for box, owner in zip(boxes, owners) if owner == {target}]
+        for box in associated:
+            box['height_class'], box['height_m'] = 'unknown', None
+            box.pop('height_raw_m', None)
         camera_frame = header.frame_id or self.camera_frame_param
         rt = self.lookup_rt(self.base_frame, camera_frame, cam_corr=True)
         if rt is None:
-            return None
-        R_bc, t_bc = rt
-
-        h_img, w_img = depth_img.shape[:2]
-        box = det['box']
-        center = box.mean(axis=0)
-        shr = center + (box - center) * shrink
-
-        x0 = max(0, int(np.floor(shr[:, 0].min())))
-        x1 = min(w_img, int(np.ceil(shr[:, 0].max())) + 1)
-        y0 = max(0, int(np.floor(shr[:, 1].min())))
-        y1 = min(h_img, int(np.ceil(shr[:, 1].max())) + 1)
-        if x1 <= x0 or y1 <= y0:
-            return None
-
-        sub = depth_img[y0:y1, x0:x1]
-        mask = np.zeros(sub.shape[:2], dtype=np.uint8)
-        poly = (shr - np.array([x0, y0])).astype(np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(mask, [poly], 1)
-        vv, uu = np.nonzero(mask)
-        if vv.size == 0:
-            return None
-
-        z = sub[vv, uu].astype(np.float32)
-        if depth_encoding in ('16UC1', 'mono16'):      # mm -> m
-            z = z / 1000.0
-        valid = np.isfinite(z) & (z > self.MIN_DEPTH_M) & (z < self.MAX_DEPTH_M)
-        z = z[valid].astype(np.float64)
-        uu = uu[valid]
-        vv = vv[valid]
-        if z.size < self.box_height_min_pixels:
-            return None
-
-        # Back-project to base frame (identical to estimate_yaw_from_depth).
-        u = uu + x0
-        v = vv + y0
-        P_cam = np.stack([(u - self.cx) * z / self.fx,
-                          (v - self.cy) * z / self.fy, z], axis=1)
-        z_base = (P_cam @ R_bc.T + t_bc)[:, 2]
-
-        if kind == 'bottom':
-            # Lowest visible surface -> the support the box sits on.
-            return float(np.percentile(z_base, 1))
-
-        # Top face: top band of the OBB (where the downward camera sees the lid).
-        band = shr[:, 1].max() - (shr[:, 1].min() + 0.35 *
-                                  (shr[:, 1].max() - shr[:, 1].min()))
-        in_top = (v <= shr[:, 1].min() + band)
-        if int(in_top.sum()) < self.box_height_min_pixels:
-            return None
-        return float(np.percentile(z_base[in_top], 90))
-
-    def measure_box_heights(self, pallet: dict, boxes: List[dict],
-                            depth_img: np.ndarray, depth_encoding: str,
-                            header) -> None:
-        """Classify each detected box on `pallet` as 'medium' / 'tall'.
-
-        Prerequisite (per the loaded-pallet gating in timer_callback): a box
-        only gets a height_class when it is DETECTED and 2D-associated with
-        the pallet (is_pallet_loaded). Otherwise it is left 'unknown' -- the
-        system never guesses a height.
-
-        Height principle (same depth machinery as the pallet pose, so the
-        fixed camera install offset cancels out of the difference):
-            h_box = Z_top(box) - Z_bottom(box)   both in the base frame
-        'medium' when h_box < box_height_threshold_m, 'tall' at/above it.
-        The tallest box on the pallet is surfaced on the pallet itself
-        (`pallet['max_box_height_m']`, `pallet['max_box_class']`) for the
-        lifting logic.
-        """
-        if not self.use_box_height_class:
             return
-
-        max_h: Optional[float] = None
-        max_class = 'unknown'
-        for b in boxes:
-            b['height_class'] = 'unknown'
-            b['height_m'] = None
-            if not self.is_pallet_loaded(pallet, [b]):
-                continue                       # not sitting on this pallet
-            z_top = self._obb_z_base(b, depth_img, depth_encoding, header,
-                                     kind='top')
-            z_bot = self._obb_z_base(b, depth_img, depth_encoding, header,
-                                     kind='bottom')
-            if z_top is None or z_bot is None:
-                continue                       # not enough depth pixels
-            h = z_top - z_bot
-            b['height_m'] = float(h)
-            b['height_class'] = ('tall' if h >= self.box_height_threshold_m
-                                else 'medium')
-            if max_h is None or h > max_h:
-                max_h = h
-                max_class = b['height_class']
-        if max_h is not None:
-            pallet['max_box_height_m'] = max_h
-            pallet['max_box_class'] = max_class
+        ranges = [self._box_z_limits(box, depth_img, depth_encoding, *rt) for box in associated]
+        ranges = [limits for limits in ranges if limits is not None]
+        if not ranges:
+            return
+        z_min = min(limits[0] for limits in ranges)
+        z_max = max(limits[1] for limits in ranges)
+        raw_height = z_max - z_min
+        # Remove floating-point residue at the 0.32 m class boundary.
+        height = round(raw_height, 9)
+        if not np.isfinite(height) or height <= 0:
+            return
+        cargo_class = 'tall' if height >= self.box_height_threshold_m else 'medium'
+        pallet.update(max_box_height_m=height, max_box_height_raw_m=raw_height,
+                      max_box_class=cargo_class,
+                      cargo_z_min=z_min, cargo_z_max=z_max)
+        for box in associated:
+            box['height_m'], box['height_class'] = height, cargo_class
+            box['height_raw_m'] = raw_height
 
     # ==================================================================
     # Publishing helpers
@@ -1448,6 +1596,153 @@ class PalletDetectorNode(Node):
                             cy - float(p['center'][1])) for p in inside]
         return inside[int(dists.index(min(dists)))] is pallet
 
+    def _draw_detection_table(self, debug_img: np.ndarray, det: dict,
+                              title: str) -> None:
+        """Optional X/Y/Yaw HUD for both normal and retrieval debug frames."""
+        if not self.show_detection_table:
+            return
+        x, y, box_w, box_h = 10, 90, 310, 200
+        cv2.rectangle(debug_img, (x, y), (x + box_w, y + box_h), (0, 0, 0), -1)
+        cv2.rectangle(debug_img, (x, y), (x + box_w, y + box_h), (0, 255, 0), 2)
+
+        def val(key, digits=2):
+            raw = det.get(key)
+            return f'{raw:.{digits}f}' if isinstance(raw, (int, float)) and math.isfinite(raw) else '--'
+
+        rows = [
+            f'=== {title} ===',
+            f"Class: {det.get('class', '?')}  Conf: {val('conf')}",
+            f"Depth: {val('depth_m', 3)} m",
+            f"Cam  X:{val('x_3d')} Y:{val('y_3d')} Z:{val('z_3d')}",
+            f"Base X:{val('x_base')} Y:{val('y_base')} Z:{val('z_base')}",
+            f"Map  X:{val('x_map')} Y:{val('y_map')}",
+            f"Yaw(base): {val('yaw_deg', 1)} deg",
+        ]
+        if self.use_box_height_class and 'max_box_class' in det:
+            h = det.get('max_box_height_m')
+            hcm = f'{h * 100:.0f}cm' if h is not None else '?'
+            rows.append(f"Cargo: {det['max_box_class']} ({hcm}) th={self.box_height_threshold_m * 100:.0f}cm")
+        for i, row in enumerate(rows):
+            cv2.putText(debug_img, row, (x + 10, y + 25 + i * 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 255, 0), 1)
+
+    def _publish_detector_performance(self):
+        now = time.monotonic()
+        if now - self._perf_last_publish < 1.0:
+            return
+        self._perf_last_publish = now
+        process_clock = time.process_time()
+        dt = now - self._cpu_sample_wall
+        if dt > 0.0:
+            # 100% is one logical CPU core, 200% is two cores, etc.
+            self._process_cpu_pct = max(0.0, 100.0 *
+                (process_clock - self._cpu_sample_process) / dt)
+        self._cpu_sample_wall = now
+        self._cpu_sample_process = process_clock
+
+        def hz(mode):
+            samples = self._perf_frames[mode]
+            if not samples or now - samples[-1] > 2.0:
+                return 0.0
+            if len(samples) < 2:
+                return 0.0
+            return (len(samples) - 1) / max(0.001, samples[-1] - samples[0])
+
+        msg = String()
+        msg.data = json.dumps({
+            'cpu_process_percent': round(self._process_cpu_pct, 1),
+            'normal_hz': round(hz('normal'), 2),
+            'retrieval_hz': round(hz('retrieval'), 2),
+            'normal_inference_ms': round(self._perf_ms['normal'], 1),
+            'retrieval_inference_ms': round(self._perf_ms['retrieval'], 1),
+            'model_loaded': self.model is not None,
+            'mission_detection_enabled': self._detection_enabled,
+            'idle_preview_enabled': self.idle_preview_enabled,
+        })
+        self.perf_pub.publish(msg)
+
+    def _roi_visual_target(self, detections: List[dict], width: int):
+        """Select ONE pallet for debug drawing only (never for mission control).
+
+        The preview has no retrieval-slot decision yet. The pallet closest to
+        the camera centre is shown, with confidence used only as a tie-break.
+        All raw detections/candidates still reach the existing ROS consumers.
+        """
+        pallets = [d for d in detections if d.get('class') == 'pallet']
+        return min(pallets, key=lambda p: (
+            abs(float(p['center'][0]) - width / 2.0),
+            -float(p.get('conf', 0.0)))) if pallets else None
+
+    @staticmethod
+    def _draw_detection_outline(debug_img: np.ndarray, det: dict,
+                                color: tuple, thickness: int = 2) -> None:
+        """Show box segmentation when available, otherwise detector corners.
+
+        An OBB model supplies these points directly; a segment model supplies
+        cv2.minAreaRect(mask). A detect-only model supplies an AABB instead,
+        which cannot be made into a real OBB without new model information.
+        Shared by Normal, Retrieval, and mission debug views.
+        """
+        # Display the actual box silhouette instead of its enclosing rectangle.
+        mask = det.get('mask') if det.get('class') == 'box' else None
+        if mask is not None:
+            contour = np.asarray(mask, dtype=np.float32).reshape(-1, 2)
+            if len(contour) >= 3 and np.isfinite(contour).all():
+                contour = np.rint(contour).astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(debug_img, [contour], True, color,
+                              thickness, lineType=cv2.LINE_AA)
+                return
+        corners = np.asarray(det['box'], dtype=np.float32).reshape(4, 2)
+        if not np.isfinite(corners).all():
+            return
+        pts = np.rint(corners).astype(np.int32).reshape((-1, 1, 2))
+        cv2.polylines(debug_img, [pts], True, color, thickness,
+                      lineType=cv2.LINE_AA)
+
+    @staticmethod
+    def _detection_label(det):
+        label = f"{det.get('class', 'object')}: {det.get('conf', 0.0):.2f}"
+        height = det.get('height_m')
+        if det.get('class') == 'box' and height is not None and math.isfinite(height):
+            label += f" [{det.get('height_class', '')} {height * 100:.1f}cm]"
+        return label
+
+    def _draw_roi_target(self, debug_img: np.ndarray,
+                         detections: List[dict], target: Optional[dict]) -> None:
+        """Display just the visual target and its associated box/hole labels."""
+        if target is None:
+            return
+        pallets = [d for d in detections if d.get('class') == 'pallet']
+        for det in detections:
+            if det is not target and not (
+                    det.get('class') in ('box', 'hole') and
+                    self._belongs_to_pallet(det, target, pallets)):
+                continue
+            color = self.DETECTION_COLORS.get(det.get('class'), (180, 180, 180))
+            self._draw_detection_outline(debug_img, det, color)
+            cx, cy = map(int, det['center'])
+            cv2.circle(debug_img, (cx, cy), 4, color, -1)
+            cv2.putText(debug_img,
+                        self._detection_label(det),
+                        (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    def create_idle_normal_debug_image(self, color_img: np.ndarray,
+                                       detections: List[dict]):
+        """Normal ROI for RQT (visual-only, no mission target publishing)."""
+        debug_img = color_img.copy()
+        h, w = debug_img.shape[:2]
+        roi = self._roi_crop(h, w)
+        if roi is not None:
+            x0, x1, y0, y1 = roi
+            cv2.rectangle(debug_img, (x0, y0), (x1, y1), (0, 255, 255), 2)
+            cv2.putText(debug_img, 'ROI', (x0 + 6, y0 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        target = self._roi_visual_target(detections, w)
+        self._draw_roi_target(debug_img, detections, target)
+        if target is not None:
+            self._draw_detection_table(debug_img, target, 'PALLET DETECTION')
+        return debug_img
+
     def create_debug_image(self, color_img: np.ndarray,
                            detections: List[dict],
                            best_detection: Optional[dict] = None,
@@ -1455,7 +1750,7 @@ class PalletDetectorNode(Node):
         """Create debug image with OBB overlays, ROI box and HUD.
 
         Draws the chosen pallet (best_detection, green) plus its associated
-        box/hole detections (blue, via _belongs_to_pallet). While the search
+        box (blue) and hole (orange) detections via _belongs_to_pallet. While the search
         target is still being confirmed (best_detection None, _pend_det set)
         the pending candidate and its boxes/holes are drawn in yellow with a
         "(confirm n/N)" label. With a lock still held but no confirmed
@@ -1499,20 +1794,14 @@ class PalletDetectorNode(Node):
 
             all_boxes = [d for d in detections if d['class'] == 'box']
             for det in to_draw:
-                box = det['box']
-                # Confirming: everything yellow. Chosen: green pallet /
-                # blue companions (existing convention).
-                if confirming:
-                    color = (0, 255, 255)
-                else:
-                    color = (0, 255, 0) if det['class'] == 'pallet' else (255, 0, 0)
+                # Same class colors in normal and retrieval views.
+                color = self.DETECTION_COLORS.get(det['class'], (180, 180, 180))
 
-                pts = box.astype(np.int32).reshape((-1, 1, 2))
-                cv2.polylines(debug_img, [pts], True, color, 2)
+                self._draw_detection_outline(debug_img, det, color)
                 cv2.circle(debug_img, (int(det['center'][0]), int(det['center'][1])),
                            5, color, -1)
 
-                label = f"{det['class']}: {det['conf']:.2f}"
+                label = self._detection_label(det)
                 if det['class'] == 'pallet':
                     if confirming:
                         label = f"{label} (confirm {min(self._pend_n, self.lock_confirm_frames)}/{self.lock_confirm_frames})"
@@ -1522,46 +1811,15 @@ class PalletDetectorNode(Node):
                         load_tag = '[LOADED]' if self.is_pallet_loaded(det, all_boxes) \
                             else '[EMPTY]'
                         label = f"{label} {load_tag}"
-                elif det['class'] == 'box' and self.use_box_height_class:
-                    # Height class only when measured this frame (confirmed target).
-                    if det.get('height_class') in ('medium', 'tall'):
-                        label += f" [{det['height_class']} {det['height_m'] * 100:.0f}cm]"
-                    else:
-                        label += ' [h?]'
                 cv2.putText(debug_img, label,
                             (int(det['center'][0]) + 10, int(det['center'][1]) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        if best_detection and 'x_3d' in best_detection:
-            hud_x, hud_w, hud_h = 10, 300, 200
-            hud_y = 10
-
-            cv2.rectangle(debug_img, (hud_x, hud_y),
-                          (hud_x + hud_w, hud_y + hud_h), (0, 0, 0), -1)
-            cv2.rectangle(debug_img, (hud_x, hud_y),
-                          (hud_x + hud_w, hud_y + hud_h), (0, 255, 0), 2)
-
-            b = best_detection
-            lines = [
-                "=== PALLET DETECTION ===",
-                f"Class: {b['class']}  Conf: {b['conf']:.2f}",
-                f"Depth: {b.get('depth_m', 0):.3f} m",
-                f"Cam  X:{b.get('x_3d', 0):.2f} Y:{b.get('y_3d', 0):.2f} Z:{b.get('z_3d', 0):.2f}",
-                f"Base X:{b.get('x_base', 0):.2f} Y:{b.get('y_base', 0):.2f} Z:{b.get('z_base', 0):.2f}",
-                f"Map  X:{b.get('x_map', float('nan')):.2f} Y:{b.get('y_map', float('nan')):.2f}",
-                f"Yaw(base): {b.get('yaw_deg', 0):.1f} deg",
-            ]
-            if self.use_box_height_class and 'max_box_class' in b:
-                hcm = f"{b['max_box_height_m'] * 100:.0f}cm" if b.get('max_box_height_m') is not None else "?"
-                lines.append(f"MaxBox: {b['max_box_class']} ({hcm}) th={self.box_height_threshold_m * 100:.0f}cm")
-            for i, line in enumerate(lines):
-                cv2.putText(debug_img, line,
-                            (hud_x + 10, hud_y + 25 + i * 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-        else:
-            # No HUD: either nothing confirmed yet (the pending candidate is
-            # drawn yellow above, no pose to show) or a frame miss while a
-            # lock is still held.
+        if self.show_detection_table and best_detection and 'x_3d' in best_detection:
+            self._draw_detection_table(debug_img, best_detection, 'PALLET DETECTION')
+        if best_detection is None:
+            # Keep the original lost/empty warning for actual missing targets,
+            # independent of whether the statistics table is shown.
             if self.locked_target_base is not None:
                 # Holding the lock through a frame miss (nearest candidate
                 # farther than track_hold_m). Text only; the lock logic is
@@ -1578,7 +1836,30 @@ class PalletDetectorNode(Node):
 
         return debug_img
 
-    def publish_debug_image(self, debug_img: np.ndarray, header):
+    def create_retrieval_debug_image(self, color_img: np.ndarray,
+                                     detections: List[dict], localized_count: int):
+        """Retrieval ROI for RQT: just one visual pallet and its companions.
+
+        Drawing does NOT filter /pallet_retrieval/candidates or alter the
+        coordinator's independent shelf-slot matching and target selection.
+        """
+        debug_img = color_img.copy()
+        h, w = debug_img.shape[:2]
+        roi = self._roi_crop(h, w, retrieval=True)
+        if roi is not None:
+            x0, x1, y0, y1 = roi
+            cv2.rectangle(debug_img, (x0, y0), (x1, y1), (0, 255, 255), 2)
+            cv2.putText(debug_img, 'RETRIEVAL ROI', (x0 + 6, y0 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+                        cv2.LINE_AA)
+        target = self._roi_visual_target(detections, w)
+        self._draw_roi_target(debug_img, detections, target)
+        if target is not None:
+            self._draw_detection_table(debug_img, target, 'PALLET RETRIEVAL')
+        return debug_img
+
+    def publish_debug_image(self, debug_img: np.ndarray, header,
+                            stream: str = 'normal', legacy: bool = True):
         try:
             if len(debug_img.shape) == 2:
                 debug_img = cv2.cvtColor(debug_img, cv2.COLOR_GRAY2BGR)
@@ -1592,16 +1873,26 @@ class PalletDetectorNode(Node):
             msg.is_bigendian = 0
             msg.step = debug_img.shape[1] * 3
             msg.data = debug_img.tobytes()
-            self.debug_image_pub.publish(msg)
+            # Legacy consumers still receive active mission frames.
+            if legacy:
+                self.debug_image_pub.publish(msg)
+            if stream == 'retrieval':
+                self.retrieval_debug_pub.publish(msg)
+            else:
+                self.normal_debug_pub.publish(msg)
         except Exception:
-            self.get_logger().error(f'Debug image error: {traceback.format_exc()}')
+            # Detector shutdown can race an in-flight frame. Avoid reporting
+            # a destroyed publisher context as a perception failure.
+            if rclpy.ok():
+                self.get_logger().error(f'Debug image error: {traceback.format_exc()}')
 
     # ==================================================================
     # Main loop
     # ==================================================================
     def timer_callback(self):
         """Process the newest frame: detect, localize, publish."""
-        if not self._detection_enabled:
+        self._publish_detector_performance()
+        if not self._detection_enabled and not self.idle_preview_enabled:
             return
         with self.lock:
             if self.latest_color is None or self.latest_depth is None:
@@ -1615,6 +1906,44 @@ class PalletDetectorNode(Node):
             depth_encoding = self.latest_depth_encoding or '16UC1'
             header = self.latest_color_header
 
+        if not self._detection_enabled:
+            # Observe both ROI strategies while idle, without touching any
+            # mission/retrieval pose, target, cargo, TF, or action topic.
+            normal_dets = self.detect_pallets(color_img)
+            retrieval_dets = self.detect_pallets(color_img, retrieval=True)
+            if self.publish_debug:
+                self.publish_debug_image(
+                    self.create_idle_normal_debug_image(color_img, normal_dets),
+                    header, stream='normal', legacy=False)
+                self.publish_debug_image(
+                    self.create_retrieval_debug_image(
+                        color_img, retrieval_dets, localized_count=0),
+                    header, stream='retrieval', legacy=False)
+            return
+
+        if self._retrieval_candidates_enabled:
+            retrieval_detections = self.detect_pallets(
+                color_img, retrieval=True)
+            retrieval_pallets = [d for d in retrieval_detections
+                                 if d['class'] == 'pallet']
+            localized_count = self._publish_retrieval_candidates(
+                retrieval_pallets, depth_img, depth_encoding, header)
+            status = String()
+            status.data = json.dumps({
+                'detected_pallets': len(retrieval_pallets),
+                'localized_pallets': localized_count,
+            })
+            self.retrieval_detection_status_pub.publish(status)
+            self.get_logger().info(
+                f'[retrieval] central-strip pallet detections={len(retrieval_pallets)}, '
+                f'localized poses={localized_count}', throttle_duration_sec=1.0)
+            if self.publish_debug:
+                debug_img = self.create_retrieval_debug_image(
+                    color_img, retrieval_detections, localized_count)
+                self.publish_debug_image(debug_img, header, stream='retrieval')
+            return
+
+        # Normal pick/drop detector path keeps the existing ROI and gating.
         detections = self.detect_pallets(color_img)
 
         # --- Target Locking with loaded-pallet gating ---
@@ -1638,7 +1967,6 @@ class PalletDetectorNode(Node):
                 det, depth_img, depth_encoding, header)
             if p_base is not None:
                 candidates.append((det, p_base, cost))
-
         # When the supervisor supplies available shelf cargo classes, classify
         # each loaded candidate before target selection. Existing nearest/yaw,
         # pending-target inertia, and frame confirmation then operate on only
@@ -1652,7 +1980,7 @@ class PalletDetectorNode(Node):
                 if id(det) not in pool_ids:
                     continue
                 self.measure_box_heights(det, boxes, depth_img,
-                                         depth_encoding, header)
+                                         depth_encoding, header, pallets)
                 cls = det.get('max_box_class')
                 if cls in self.target_cargo_classes:
                     eligible_ids.add(id(det))
@@ -1786,7 +2114,7 @@ class PalletDetectorNode(Node):
                 # the boxes already detected this frame (no re-training; depth
                 # principle shared with the pallet pose).
                 self.measure_box_heights(best_detection, boxes, depth_img,
-                                          depth_encoding, header)
+                                          depth_encoding, header, pallets)
                 cargo_class = best_detection.get('max_box_class')
                 cargo_height = best_detection.get('max_box_height_m')
                 if cargo_class in ('medium', 'tall') and cargo_height is not None:

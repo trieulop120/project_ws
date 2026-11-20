@@ -19,12 +19,12 @@ from fastapi.staticfiles import StaticFiles
 from typing import Optional
 from amr_web.websocket_manager import WebSocketManager
 from amr_web.state_bridge import StateBridge
+from amr_web.navigation_validation import valid_resource_id, map_image_path
 # History (HISTORY_RESULTS_PLAN.md §6): log every WS command and connection
 # edge. Imports are guarded by try/except at the use site so a missing
 # history package (e.g. older install) cannot break the server.
 try:
     from amr_web.history import events as _history_events
-    from amr_web.history import runs as _history_runs
     _HISTORY_OK = True
 except Exception:
     _HISTORY_OK = False
@@ -44,6 +44,10 @@ def _client_ip(websocket: WebSocket) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _reject_json_constant(value):
+    raise ValueError(f'Non-finite JSON number: {value}')
 
 
 def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_logger=None, bridge_node=None) -> FastAPI:
@@ -74,20 +78,22 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
         return {"status": "ok", "service": "amr_web", "version": "0.3.0"}
 
     @app.get("/api/maps")
-    async def get_maps():
+    def get_maps():
         if bridge_node:
             maps = bridge_node.get_available_maps()
             return {"status": "ok", "maps": maps}
         return {"status": "error", "message": "Bridge node not available"}
 
     @app.get("/api/map/image/{map_id}")
-    async def get_map_image(map_id: str):
+    def get_map_image(map_id: str):
         if not bridge_node:
             return {"status": "error", "message": "Bridge node not available"}
 
         import yaml
         import base64
 
+        if not valid_resource_id(map_id):
+            return {'status': 'error', 'message': 'Invalid map identifier'}
         maps_dir = os.path.expanduser('~/project_ws/maps')
         yaml_path = os.path.join(maps_dir, f'{map_id}.yaml')
 
@@ -102,35 +108,16 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                 return {"status": "error", "message": "Empty YAML data"}
 
             pgm_filename = yaml_data.get('image', f'{map_id}.pgm')
-            pgm_path = os.path.join(maps_dir, pgm_filename)
-            if not os.path.exists(pgm_path):
-                return {"status": "error", "message": f"Image file not found: {pgm_path}"}
-
-            with open(pgm_path, 'rb') as f:
-                pgm_data = f.read()
-
-            header_end = pgm_data.find(b'\n', pgm_data.find(b'\n', pgm_data.find(b'\n') + 1) + 1) + 1
-            img_data = pgm_data[header_end:]
-
-            header = pgm_data[:header_end].decode('ascii', errors='ignore')
-            parts = header.split()
-            width = 0
-            height = 0
-            for p in parts:
-                if p.isdigit() and int(p) > 0:
-                    if width == 0:
-                        width = int(p)
-                    elif height == 0:
-                        height = int(p)
-                        break
-
-            if width == 0 or height == 0:
-                return {"status": "error", "message": f"Invalid PGM dimensions: {width}x{height}"}
-
+            pgm_path = map_image_path(maps_dir, map_id, pgm_filename)
+            # PGM permits comments, arbitrary whitespace and P2/P5 encodings.
+            # Pillow is already a bridge dependency; use its parser, not newline counting.
+            from PIL import Image
+            with Image.open(pgm_path) as image:
+                image = image.convert('L')
+                width, height = image.size
+                img_data = image.tobytes()
             origin = yaml_data.get('origin', [0, 0, 0])
             expected_size = width * height
-            if len(img_data) < expected_size:
-                return {"status": "error", "message": "PGM pixel data is incomplete"}
             encoded = base64.b64encode(img_data[:expected_size]).decode('ascii')
 
             return {
@@ -149,10 +136,14 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                 "is_pgm_raw": True,  # Danh dau day la PGM thuong, can render truc tiep
             }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            if node_logger:
+                node_logger.error(f'Map image {map_id} failed: {e}')
+            return {"status": "error", "message": "Map image unavailable; check the selected map files"}
 
     @app.get("/api/routes")
-    async def get_routes(map_id: str = None):
+    def get_routes(map_id: str = None):
+        if map_id is not None and not valid_resource_id(map_id):
+            return {'status': 'error', 'message': 'Invalid map identifier'}
         if bridge_node:
             routes = bridge_node.get_available_routes(map_id)
             return {"status": "ok", "routes": routes}
@@ -169,7 +160,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
         if not map_id or not route_data:
             return {"status": "error", "message": "Missing map_id or route payload"}
 
-        success, msg = bridge_node.save_route(map_id, route_data)
+        success, msg = await asyncio.to_thread(bridge_node.save_route, map_id, route_data)
         # [history] Record route save (plan §6).
         if _HISTORY_OK:
             try:
@@ -195,7 +186,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
         if not bridge_node:
             return {"status": "error", "message": "Bridge node not available"}
 
-        success, msg = bridge_node.delete_map_and_routes(map_id)
+        success, msg = await asyncio.to_thread(bridge_node.delete_map_and_routes, map_id)
         # [history] Record map delete (plan §6).
         if _HISTORY_OK:
             try:
@@ -216,6 +207,9 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
 
     async def handle_command(cmd: dict, websocket: WebSocket) -> dict:
         command = cmd.get('command', '')
+        if not isinstance(command, str):
+            return {'type': 'command_response', 'request_id': cmd.get('request_id'),
+                    'status': 'failed', 'message': 'Command must be a string'}
         result = {"type": "command_response", "command": command}
         if cmd.get('request_id') is not None:
             result['request_id'] = cmd['request_id']
@@ -227,12 +221,6 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             _history_events.record_command(cmd, client_ip=client_ip)
             if _HISTORY_OK else None
         )
-        # [history] Hand the client IP to the run that nav_bridge is about to open.
-        if command in ("nav_goal", "waypoint_mission") and _HISTORY_OK:
-            try:
-                _history_runs.set_pending_client(client_ip)
-            except Exception:
-                pass
         if command == "teleop" and _HISTORY_OK:
             try:
                 _history_events.record_teleop_tick(
@@ -250,9 +238,9 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                     result["status"] = "failed"
                     result["message"] = "Navigation is running – stop it first"
                 else:
-                    success = await asyncio.to_thread(bridge_node.start_slam)
+                    success, message = await asyncio.to_thread(bridge_node.web_control_command, command)
                     result["status"] = "started" if success else "failed"
-                    result["message"] = "SLAM started" if success else "SLAM already running or failed"
+                    result["message"] = message
                     await ws_manager.broadcast(json.dumps({
                         "type": "slam_state",
                         "is_slam_active": bridge_node.get_slam_state()
@@ -309,20 +297,14 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             map_id = cmd.get('map_id', '')
             route_id = cmd.get('route_id')
             if bridge_node:
-                conflict = bridge_node.mission_cycle_conflict()
-                if conflict:
-                    result["status"] = "failed"
-                    result["message"] = conflict
-                elif bridge_node.get_slam_state():
-                    result["status"] = "failed"
-                    result["message"] = "SLAM is running – stop it first"
-                else:
-                    success, msg = await asyncio.to_thread(bridge_node.start_navigation, map_id, route_id)
-                    result["status"] = "started" if success else "failed"
-                    result["message"] = msg
-                    # Always broadcast nav_state after start
-                    if success:
-                        await ws_manager.broadcast(json.dumps(bridge_node.get_nav_state()))
+                success, msg = await asyncio.to_thread(
+                    bridge_node.web_control_command, command, map_id, route_id)
+                result["status"] = "started" if success else "failed"
+                result["message"] = msg
+                result['nav_state'] = bridge_node.get_nav_state()
+                # Always broadcast nav_state after start
+                if success:
+                    await ws_manager.broadcast(json.dumps(bridge_node.get_nav_state()))
             else:
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
@@ -332,6 +314,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                 success, msg = await asyncio.to_thread(bridge_node.stop_navigation)
                 result["status"] = "stopped" if success else "failed"
                 result["message"] = msg
+                result['nav_state'] = bridge_node.get_nav_state()
                 # Broadcast full navigation state
                 await ws_manager.broadcast(json.dumps(bridge_node.get_nav_state()))
             else:
@@ -342,14 +325,11 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             pose = cmd.get('pose', {})
             route_id = cmd.get('route_id')
             if bridge_node:
-                conflict = bridge_node.mission_cycle_conflict()
-                if conflict:
-                    result["status"] = "failed"
-                    result["message"] = conflict
-                else:
-                    success, msg = await asyncio.to_thread(bridge_node.send_nav_goal, pose, route_id)
-                    result["status"] = "sent" if success else "failed"
-                    result["message"] = msg
+                success, msg = await asyncio.to_thread(
+                    bridge_node.web_control_command, command, pose, route_id, client_ip=client_ip)
+                result["status"] = "sent" if success else "failed"
+                result["message"] = msg
+                result['nav_state'] = bridge_node.get_nav_state()
             else:
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
@@ -366,7 +346,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
         elif command == "set_initial_pose":
             pose = cmd.get('pose', {})
             if bridge_node:
-                success, msg = await asyncio.to_thread(bridge_node.set_nav_initial_pose, pose)
+                success, msg = await asyncio.to_thread(bridge_node.web_control_command, command, pose)
                 result["status"] = "ok" if success else "failed"
                 result["message"] = msg
             else:
@@ -386,14 +366,11 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             waypoints = cmd.get('waypoints', [])
             mission_type = cmd.get('mission_type', 'waypoints')
             if bridge_node:
-                conflict = bridge_node.mission_cycle_conflict()
-                if conflict:
-                    result["status"] = "failed"
-                    result["message"] = conflict
-                else:
-                    success, msg = await asyncio.to_thread(bridge_node.send_waypoint_mission, waypoints, mission_type)
-                    result["status"] = "started" if success else "failed"
-                    result["message"] = msg
+                success, msg = await asyncio.to_thread(
+                    bridge_node.web_control_command, command, waypoints, mission_type, client_ip=client_ip)
+                result["status"] = "started" if success else "failed"
+                result["message"] = msg
+                result['nav_state'] = bridge_node.get_nav_state()
             else:
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
@@ -414,7 +391,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             mode = cmd.get('mode', 'MANUAL')
             if bridge_node and bridge_node._nav_bridge:
                 success, message = await asyncio.to_thread(
-                    bridge_node.set_operating_mode, mode)
+                    bridge_node.web_control_command, command, mode)
                 result["status"] = "ok" if success else "error"
                 result["mode"] = mode
                 result["message"] = message
@@ -423,15 +400,54 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                 result["message"] = "NavBridge not available"
 
         elif command in ("mission_cycle_start", "mission_cycle_stop",
-                         "mission_cycle_resume"):
+                         "mission_cycle_resume", "mission_cycle_cancel"):
             if bridge_node:
                 run_mode = cmd.get('run_mode', 'auto')
                 success, message = await asyncio.to_thread(
                     bridge_node.mission_cycle_command, command, run_mode)
                 result['status'] = 'started' if success and command == 'mission_cycle_start' else (
                     'ok' if success else 'error')
-                result['message'] = message
+                if not success and node_logger:
+                    node_logger.warning(f'Auto command {command}: {message}')
+                user_errors = {'mission_cycle_start': 'Cannot start mission; check readiness',
+                    'mission_cycle_stop': 'Stop not confirmed; check the robot',
+                    'mission_cycle_cancel': 'Cancellation not confirmed; check the robot',
+                    'mission_cycle_resume': 'Resume unavailable; check the robot'}
+                result['message'] = message if success else user_errors[command]
+                result['mission_supervisor'] = bridge_node.get_mission_supervisor_status()
                 result['run_mode'] = run_mode if command == 'mission_cycle_start' else None
+            else:
+                result['status'] = 'error'
+                result['message'] = 'Bridge node not available'
+
+        elif command == "pallet_retrieval_start":
+            if bridge_node:
+                slot = cmd.get('slot', '')
+                success, message = await asyncio.to_thread(
+                    bridge_node.pallet_retrieval_start, slot)
+                result['status'] = 'started' if success else 'error'
+                result['message'] = message
+                result['slot'] = slot
+            else:
+                result['status'] = 'error'
+                result['message'] = 'Bridge node not available'
+
+        elif command == "pallet_retrieval_cancel":
+            if bridge_node:
+                success, message = await asyncio.to_thread(
+                    bridge_node.pallet_retrieval_cancel)
+                result['status'] = 'canceled' if success else 'error'
+                result['message'] = message
+            else:
+                result['status'] = 'error'
+                result['message'] = 'Bridge node not available'
+
+        elif command == "confirm_forks_empty":
+            if bridge_node:
+                success, message = await asyncio.to_thread(
+                    bridge_node.confirm_forks_empty, cmd.get('confirmed_empty') is True)
+                result['status'] = 'ok' if success else 'error'
+                result['message'] = message
             else:
                 result['status'] = 'error'
                 result['message'] = 'Bridge node not available'
@@ -458,15 +474,12 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             linear = cmd.get('linear', 0.0)
             angular = cmd.get('angular', 0.0)
             if bridge_node:
-                conflict = bridge_node.mission_cycle_conflict()
-                if conflict:
-                    result["status"] = "error"
-                    result["message"] = conflict
-                else:
-                    bridge_node.publish_cmd_vel(linear, angular)
-                    result["status"] = "ok"
-                    result["linear"] = linear
-                    result["angular"] = angular
+                success, msg = await asyncio.to_thread(
+                    bridge_node.web_control_command, command, linear, angular)
+                result["status"] = "ok" if success else "error"
+                result["message"] = msg
+                result["linear"] = linear
+                result["angular"] = angular
             else:
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
@@ -475,15 +488,12 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             action = cmd.get('action', '')
             target_mm = cmd.get('target_mm', 0)
             if bridge_node:
-                conflict = bridge_node.mission_cycle_conflict()
-                if conflict:
-                    result["status"] = "error"
-                    result["message"] = conflict
-                else:
-                    bridge_node.publish_lift(action, target_mm)
-                    result["status"] = "ok"
-                    result["action"] = action
-                    result["target_mm"] = target_mm
+                success, msg = await asyncio.to_thread(
+                    bridge_node.web_control_command, command, action, target_mm)
+                result["status"] = "ok" if success else "error"
+                result["message"] = msg
+                result["action"] = action
+                result["target_mm"] = target_mm
             else:
                 result["status"] = "error"
                 result["message"] = "Bridge node not available"
@@ -499,13 +509,6 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
         else:
             result["status"] = "unknown"
             result["message"] = f"Unknown command: {command}"
-
-        # [history] The command has been handled: drop an unused pending client IP.
-        if command in ("nav_goal", "waypoint_mission") and _HISTORY_OK:
-            try:
-                _history_runs.set_pending_client(None)
-            except Exception:
-                pass
 
         # [history] Update the recorded 'requested' row with the final
         # success/failed status. Non-blocking; ignored on any error.
@@ -544,7 +547,7 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
 
             initial_system = state_bridge.get_system_overview_state()
             if bridge_node:
-                initial_system['mission_supervisor'] = bridge_node.get_mission_supervisor_status()
+                initial_system.update(bridge_node.get_web_mission_status())
             await ws_manager.send(websocket, json.dumps(initial_system))
 
             if bridge_node:
@@ -558,27 +561,115 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                     await ws_manager.send(websocket, json.dumps(
                         {"type": "llm_status", "data": _llm.last_status}))
 
-            # P1-9 Fix: Proper error handling, don't swallow exceptions
-            while True:
+            # Keep command order for normal work. Safety requests bypass that
+            # queue so a slow service request on this socket cannot delay Stop.
+            tasks = set()
+            previous = None
+            closed = False
+            requests = {}
+            interrupt_tasks = {}
+            command_generation = 0
+            interrupt_commands = {'nav_cancel', 'emergency_stop', 'stop_navigation',
+                                  'mission_cycle_stop', 'mission_cycle_cancel', 'pallet_retrieval_cancel', 'llm_stop'}
+
+            motion_commands = {'nav_goal', 'waypoint_mission', 'start_navigation', 'set_initial_pose',
+                               'set_op_mode', 'mission_cycle_start', 'mission_cycle_resume',
+                               'pallet_retrieval_start', 'teleop', 'lift'}
+
+            async def execute(cmd, predecessor, generation):
+                if predecessor is not None:
+                    await predecessor
+                if closed:
+                    return
+                request_id = cmd.get('request_id')
+                fingerprint = json.dumps(cmd, sort_keys=True)
+                if request_id is not None:
+                    if not isinstance(request_id, str) or len(request_id) > 200:
+                        await ws_manager.send(websocket, json.dumps({'type': 'command_response',
+                            'command': cmd.get('command'), 'status': 'failed', 'message': 'Invalid request identifier'}))
+                        return
+                    existing = requests.get(request_id)
+                    if existing:
+                        if existing[0] != fingerprint:
+                            response = {'type': 'command_response', 'command': cmd.get('command'),
+                                'request_id': request_id, 'status': 'failed', 'message': 'Request identifier already used'}
+                        else:
+                            response = await asyncio.shield(existing[1])
+                        await ws_manager.send(websocket, json.dumps(response))
+                        return
+                    completion = asyncio.get_running_loop().create_future()
+                    requests[request_id] = (fingerprint, completion)
                 try:
+                    if cmd['command'] in motion_commands and generation != command_generation:
+                        response = {'type': 'command_response', 'command': cmd['command'],
+                            'request_id': request_id, 'status': 'failed', 'message': 'Command superseded by Stop'}
+                    else:
+                        response = await handle_command(cmd, websocket)
+                except Exception as e:
+                    if node_logger:
+                        node_logger.error(f"Command '{cmd.get('command')}' request={request_id} failed: {e}\n{traceback.format_exc()}")
+                    response = {'type': 'command_response', 'command': cmd.get('command'),
+                        'request_id': request_id, 'status': 'error',
+                        'message': 'Command outcome unconfirmed. Check robot state before retrying; see bridge logs.'}
+                if request_id is not None:
+                    completion.set_result(response)
+                    for key in list(requests):
+                        if len(requests) <= 128:
+                            break
+                        if requests[key][1].done():
+                            del requests[key]
+                await ws_manager.send(websocket, json.dumps(response))
+
+            def completed(task):
+                tasks.discard(task)
+                if not task.cancelled() and task.exception() is not None and node_logger:
+                    node_logger.error(f'Web command task failed: {task.exception()}')
+
+            try:
+                while True:
                     raw = await websocket.receive_text()
                     try:
-                        cmd = json.loads(raw)
-                    except json.JSONDecodeError:
+                        cmd = json.loads(raw, parse_constant=_reject_json_constant)
+                    except (json.JSONDecodeError, ValueError):
+                        await ws_manager.send(websocket, json.dumps({'type': 'command_response',
+                            'status': 'failed', 'message': 'Invalid command JSON'}))
                         continue
-                    if not isinstance(cmd, dict) or 'command' not in cmd:
+                    if not isinstance(cmd, dict) or not isinstance(cmd.get('command'), str):
+                        await ws_manager.send(websocket, json.dumps({'type': 'command_response',
+                            'status': 'failed', 'message': 'Command must be a string'}))
                         continue
-                    try:
-                        response = await handle_command(cmd, websocket)
-                    except Exception as e:
-                        if node_logger:
-                            node_logger.error(f"Command '{cmd.get('command')}' failed: {e}\n{traceback.format_exc()}")
-                        response = {"type": "command_response", "command": cmd.get('command'),
-                                    "request_id": cmd.get('request_id'),
-                                    "status": "error", "message": str(e)}
-                    await ws_manager.send(websocket, json.dumps(response))
-                except WebSocketDisconnect:
-                    break
+                    interrupt = cmd['command'] in interrupt_commands
+                    if (interrupt and cmd['command'] in interrupt_tasks and
+                            not interrupt_tasks[cmd['command']].done()):
+                        await ws_manager.send(websocket, json.dumps({'type': 'command_response',
+                            'command': cmd['command'], 'request_id': cmd.get('request_id'),
+                            'status': 'failed', 'message': 'Stop request already pending; await confirmation'}))
+                        continue
+                    if len(tasks) >= 32 and not interrupt:
+                        await ws_manager.send(websocket, json.dumps({'type': 'command_response',
+                            'command': cmd['command'], 'request_id': cmd.get('request_id'),
+                            'status': 'failed', 'message': 'Too many pending commands; wait for acknowledgement'}))
+                        continue
+                    if interrupt:
+                        command_generation += 1
+                    task = asyncio.create_task(execute(cmd, None if interrupt else previous, command_generation))
+                    tasks.add(task)
+                    task.add_done_callback(completed)
+                    if interrupt:
+                        interrupt_tasks[cmd['command']] = task
+                    if not interrupt:
+                        previous = task
+            except WebSocketDisconnect:
+                pass
+            finally:
+                closed = True
+                # Do not cancel to_thread work: it may already be affecting ROS.
+                # Queued work skips execution once disconnected.
+                if tasks:
+                    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+                    for outcome in outcomes:
+                        if isinstance(outcome, Exception) and node_logger:
+                            node_logger.error(f'Command task failed: {outcome}')
 
         except Exception as e:
             if node_logger:

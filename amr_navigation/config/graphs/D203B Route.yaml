@@ -26,28 +26,28 @@ nodes:
     floor: 1
     description: Node P_1
     name: P_1
-  P_2:
+  D_1:
+    position:
+      x: 2.588
+      y: 1.812
+      z: 0.0
+    orientation:
+      yaw: 1.579
+    type: dropoff_approach
+    floor: 1
+    description: Node D_1
+    name: D_1
+  D_2:
     position:
       x: -2.96
       y: 0.2
       z: 0.0
     orientation:
       yaw: -3.1416
-    type: pickup_approach
-    floor: 1
-    description: Node P_2
-    name: P_2
-  D_1:
-    position:
-      x: 2.616
-      y: 2.16
-      z: 0.0
-    orientation:
-      yaw: 1.552
     type: dropoff_approach
     floor: 1
-    description: Node D_1
-    name: D_1
+    description: Diem tha pallet lay ra tu ke (xuat kho)
+    name: D_2
 edges:
 - from: NODE_HOME
   to: P_1

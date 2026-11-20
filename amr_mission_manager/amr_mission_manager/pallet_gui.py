@@ -6,14 +6,14 @@ pallet_gui.py
 GUI Tkinter cho pallet_mission_node (cung kieu voi mission_gui.py).
 
 Nut bam (trai -> phai theo thu tu lam viec):
-    1. HOME -> P_1 / HOME -> P_2   mission_manager/trigger_home_to_p1|p2 (Empty)
+    1. HOME -> P_1 / HOME -> D_2   mission_manager/trigger_home_to_p1|d2 (Empty)
                                     (edge -> BT ComputeRoute, khong co edge -> set goal: do BT cua mission_manager)
     2. Detect ON / OFF              pallet_mission/detect (SetBool)
                                     ON  = bat detector + ha lift ve Home
                                     OFF = tat detector + chot x, y, yaw + PHAN LOAI HANG (A/B)
     3. Go to pallet                 pallet_mission/go_to_pallet (Trigger)
                                     (vao pallet -> nang -> lui. after_pick=hold: dung, giu pallet = CARRYING)
-    4. P_1 -> D_1 / P_2 -> D_1      mission_manager/trigger_p1_to_d1|p2_to_d1 (Empty)
+    4. P_1 -> D_1 / D_2 -> D_1      mission_manager/trigger_p1_to_d1|d2_to_d1 (Empty)
     5. DROP                         pallet_mission/drop (Trigger)
                                     (can chinh o D_1 -> nang lift -> vao ke -> sieu am dung -> ha lift -> lui -> ha ve 0)
        Chon loai hang (Tu dong / A / B) = param pallet_mission cargo_type_override
@@ -43,9 +43,9 @@ from std_msgs.msg import String
 from std_srvs.srv import Empty, SetBool, Trigger
 
 SVC_HOME_P1 = 'mission_manager/trigger_home_to_p1'
-SVC_HOME_P2 = 'mission_manager/trigger_home_to_p2'
+SVC_HOME_D2 = 'mission_manager/trigger_home_to_d2'
 SVC_P1_D1 = 'mission_manager/trigger_p1_to_d1'
-SVC_P2_D1 = 'mission_manager/trigger_p2_to_d1'
+SVC_D2_D1 = 'mission_manager/trigger_d2_to_d1'
 SVC_RETURN_HOME = 'mission_manager/trigger_return_home'
 PARAM_SVC = '/pallet_mission/set_parameters'
 STATUS_TOPIC = '/pallet_mission/status'
@@ -90,9 +90,9 @@ class PalletGUINode(Node):
         self.events = queue.Queue()       # (label, ok, message) tu ROS thread -> GUI
 
         self.cli_home_p1 = self.create_client(Empty, SVC_HOME_P1)
-        self.cli_home_p2 = self.create_client(Empty, SVC_HOME_P2)
+        self.cli_home_d2 = self.create_client(Empty, SVC_HOME_D2)
         self.cli_p1_d1 = self.create_client(Empty, SVC_P1_D1)
-        self.cli_p2_d1 = self.create_client(Empty, SVC_P2_D1)
+        self.cli_d2_d1 = self.create_client(Empty, SVC_D2_D1)
         self.cli_return_home = self.create_client(Empty, SVC_RETURN_HOME)
         self.cli_detect = self.create_client(SetBool, 'pallet_mission/detect')
         self.cli_go = self.create_client(Trigger, 'pallet_mission/go_to_pallet')
@@ -194,8 +194,8 @@ class PalletGUI(tk.Tk):
         r.pack()
         self.btn_home_p1 = ttk.Button(r, text='HOME → P_1', width=17, command=self._on_home_p1)
         self.btn_home_p1.pack(side='left', padx=3)
-        self.btn_home_p2 = ttk.Button(r, text='HOME → P_2', width=17, command=self._on_home_p2)
-        self.btn_home_p2.pack(side='left', padx=3)
+        self.btn_home_d2 = ttk.Button(r, text='HOME → D_2', width=17, command=self._on_home_d2)
+        self.btn_home_d2.pack(side='left', padx=3)
 
         # ---- 2. Detect ----
         self._section(left, '2. DETECT PALLET + PHÂN LOẠI HÀNG')
@@ -218,8 +218,8 @@ class PalletGUI(tk.Tk):
         r.pack()
         self.btn_p1_d1 = ttk.Button(r, text='P_1 → D_1', width=17, command=self._on_p1_d1)
         self.btn_p1_d1.pack(side='left', padx=3)
-        self.btn_p2_d1 = ttk.Button(r, text='P_2 → D_1', width=17, command=self._on_p2_d1)
-        self.btn_p2_d1.pack(side='left', padx=3)
+        self.btn_d2_d1 = ttk.Button(r, text='D_2 → D_1', width=17, command=self._on_d2_d1)
+        self.btn_d2_d1.pack(side='left', padx=3)
 
         # ---- 5. Drop ----
         self._section(left, '5. DROP VÀO KỆ')
@@ -314,14 +314,14 @@ class PalletGUI(tk.Tk):
     def _on_home_p1(self):
         self._node.call(self._node.cli_home_p1, Empty.Request(), 'HOME → P_1')
 
-    def _on_home_p2(self):
-        self._node.call(self._node.cli_home_p2, Empty.Request(), 'HOME → P_2')
+    def _on_home_d2(self):
+        self._node.call(self._node.cli_home_d2, Empty.Request(), 'HOME → D_2')
 
     def _on_p1_d1(self):
         self._node.call(self._node.cli_p1_d1, Empty.Request(), 'P_1 → D_1')
 
-    def _on_p2_d1(self):
-        self._node.call(self._node.cli_p2_d1, Empty.Request(), 'P_2 → D_1')
+    def _on_d2_d1(self):
+        self._node.call(self._node.cli_d2_d1, Empty.Request(), 'D_2 → D_1')
 
     def _on_return_home(self):
         self._node.call(self._node.cli_return_home, Empty.Request(), 'Return HOME')
@@ -380,9 +380,9 @@ class PalletGUI(tk.Tk):
             self._live_var.set('')
             self._err_var.set('')
             for b in (self.btn_det_on, self.btn_det_off, self.btn_go, self.btn_p1_d1,
-                      self.btn_p2_d1, self.btn_drop, self.btn_lift_home):
+                      self.btn_d2_d1, self.btn_drop, self.btn_lift_home):
                 self._enable(b, False)
-            for b in (self.btn_home_p1, self.btn_home_p2, self.btn_return):
+            for b in (self.btn_home_p1, self.btn_home_d2, self.btn_return):
                 self._enable(b, True)
             self.after(100, self._refresh)
             return
@@ -484,9 +484,9 @@ class PalletGUI(tk.Tk):
         self._enable(self.btn_det_off, state == 'DETECTING')
         self._enable(self.btn_go, state == 'READY')
         self._enable(self.btn_home_p1, can_move and not holding)
-        self._enable(self.btn_home_p2, can_move and not holding)
+        self._enable(self.btn_home_d2, can_move and not holding)
         self._enable(self.btn_p1_d1, can_move and holding)
-        self._enable(self.btn_p2_d1, can_move and holding)
+        self._enable(self.btn_d2_d1, can_move and holding)
         self._enable(self.btn_drop, holding and state in ('CARRYING', 'FAILED', 'STOPPED'))
         self._enable(self.btn_return, can_move)
         self._enable(self.btn_lift_home, can_move)

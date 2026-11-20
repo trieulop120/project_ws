@@ -246,7 +246,9 @@
         drawRouteOverlay();
 
         // Draw robot
-        if (window.robotPose && window.robotPose.position && window.robotPose.orientation && window.mapData) {
+        if (window.robotPose && !window.robotPose.stale && window.missionTransportConnected !== false &&
+                (!window.isNavigationActive || window.robotPose.frame_id === 'map') &&
+                window.robotPose.position && window.robotPose.orientation && window.mapData) {
             const pos = window.robotPose.position;
             const yaw = window.robotPose.orientation.yaw;
             const cp = worldToCanvas(pos.x, pos.y);
@@ -294,6 +296,8 @@
 
     function drawLaserScan() {
         if (!window.laserData || !window.robotPose || !window.mapData) return;
+        if (window.robotPose.stale || window.missionTransportConnected === false ||
+                (window.isNavigationActive && window.robotPose.frame_id !== 'map')) return;
         const laser = window.laserData;
         const ranges = laser.ranges;
         if (!ranges || ranges.length === 0) return;

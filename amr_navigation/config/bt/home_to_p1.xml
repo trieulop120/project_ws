@@ -14,7 +14,7 @@
   Khong dung chung {path} cho ca 2 nhanh - tranh xung dot bo nho controller.
 
   ID phai khop thu tu node trong 'D203B Route.yaml':
-    0=NODE_HOME 1=P_1 2=P_2 3=D_1
+    0=NODE_HOME 1=P_1 2=D_1 3=D_2
   (mission_manager_node.py kiem tra (start_id, goal_id) truoc khi gui goal.)
 -->
 <root main_tree_to_execute="MainTree">

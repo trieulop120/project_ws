@@ -54,12 +54,12 @@ NODE_NAME = 'mission_manager'
 # - return_home: khong can probe route (BT la Nav2 thuan, khong co ComputeRoute)
 MISSION_BT_MAP = {
     'home_to_p1': ('NODE_HOME', 'P_1', 'home_to_p1.xml'),   # HOME -> P_1
-    'home_to_p2': ('NODE_HOME', 'P_2', 'home_to_p2.xml'),   # HOME -> P_2
-    'p1_to_d1':   ('P_1',       'D_1', 'p1_to_d1.xml'),     # P_1 -> D_1
-    'p2_to_d1':   ('P_2',       'D_1', 'p2_to_d1.xml'),     # P_2 -> D_1
-    'p1_to_p2':   ('P_1',       'P_2', 'p1_to_p2.xml'),     # P_1 -> P_2 (nhánh lấy thứ 2)
+    'home_to_d2': ('NODE_HOME', 'D_2', 'home_to_d2.xml'),   # HOME -> D_2 (diem tha xuat kho)
+    'p1_to_d1':   ('P_1',       'D_1', 'p1_to_d1.xml'),     # P_1 -> D_1 (luu kho vao ke)
+    'd2_to_d1':   ('D_2',       'D_1', 'd2_to_d1.xml'),     # D_2 -> D_1
     'd1_to_p1':   ('D_1',       'P_1', 'd1_to_p1.xml'),     # D_1 -> P_1
-    'd1_to_p2':   ('D_1',       'P_2', 'd1_to_p2.xml'),     # D_1 -> P_2
+    'd1_to_d2':   ('D_1',       'D_2', 'd1_to_d2.xml'),     # D_1 -> D_2 (thu nghiem xuat kho)
+    'p1_to_d2':   ('P_1',       'D_2', 'p1_to_d2.xml'),     # P_1 -> D_2 (thu nghiem xuat kho)
     'return_home': ('',          'NODE_HOME', 'return_home.xml'),
 }
 
@@ -253,6 +253,9 @@ class MissionManager(Node):
         self._nav_mode = 'FREE'
         self._route_reason = ''
         self._active_mission = None
+        self._mission_lock = threading.RLock()
+        self._nav_context = None
+        self._run_serial = 0
 
         if not self._nav_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().warn('NavigateToPose server not ready')
@@ -261,6 +264,7 @@ class MissionManager(Node):
 
         # Create mission services
         self._create_services()
+        self.create_service(Trigger, "mission_manager/stop", self._srv_stop, callback_group=ReentrantCallbackGroup())
 
         self.get_logger().info('Mission Manager initialized')
 
@@ -316,36 +320,60 @@ class MissionManager(Node):
 
         self.get_logger().info(f'Services: {", ".join(MISSION_BT_MAP.keys())}')
 
-    def _on_mission(self, request, response, mission_name: str):
-        """Handle mission request."""
-        if mission_name not in MISSION_BT_MAP:
-            self.get_logger().error(f'Unknown mission: {mission_name}')
-            return response
+    def _reserve_mission(self, mission):
+        with self._mission_lock:
+            if self._nav_context is not None:
+                return None
+            self._run_serial += 1
+            ctx = {'mission': mission, 'id': self._run_serial, 'valid': True,
+                   'send': None, 'handle': None}
+            self._nav_context = ctx
+            self._active_mission = mission
+            self._publish_status(mission, 'PENDING', 'Preparing owned navigation request', ctx)
+            return ctx
 
-        start_node, dest_node, bt_file = MISSION_BT_MAP[mission_name]
-        self.get_logger().info(f'=== {mission_name} -> {dest_node} ===')
-        self._active_mission = mission_name
-        self._execute_mission(mission_name, start_node, dest_node, bt_file)
+    def _srv_stop(self, _req, res):
+        with self._mission_lock:
+            ctx = self._nav_context
+            if ctx:
+                ctx['valid'] = False
+                if ctx['handle'] is not None:
+                    ctx['handle'].cancel_goal_async()
+            self._publish_status(self._active_mission or '', 'STOPPING' if ctx else 'CANCELED',
+                                 'Navigation STOP requested' if ctx else 'No owned navigation remains', ctx)
+        res.success, res.message = True, 'Navigation STOP requested; pending goal responses remain owned until terminal'
+        return res
+
+    def _run_reserved(self, mission, wait_for_accept, force_free=False):
+        if mission not in MISSION_BT_MAP:
+            return False
+        ctx = self._reserve_mission(mission)
+        if ctx is None:
+            return False
+        try:
+            start, destination, bt = MISSION_BT_MAP[mission]
+            return self._execute_mission(mission, start, destination, bt,
+                                         wait_for_accept=wait_for_accept, force_free=force_free, ctx=ctx)
+        finally:
+            with self._mission_lock:
+                if self._nav_context is ctx and ctx['send'] is None:
+                    self._nav_context = None
+                    self._publish_status(mission, 'CANCELED' if not ctx['valid'] else 'ABORTED',
+                                         'No navigation goal remains', ctx)
+
+    def _on_mission(self, request, response, mission_name: str):
+        self._run_reserved(mission_name, False)
         return response
 
-    def _on_mission_ack(self, request, response, mission_name: str,
-                        force_free: bool = False):
-        """Parallel Trigger endpoint: success only after Nav2 accepts the goal."""
-        if mission_name not in MISSION_BT_MAP:
-            response.success, response.message = False, f'Unknown mission: {mission_name}'
-            return response
-        start_node, dest_node, bt_file = MISSION_BT_MAP[mission_name]
-        self._active_mission = mission_name
-        accepted = self._execute_mission(
-            mission_name, start_node, dest_node, bt_file, wait_for_accept=True,
-            force_free=force_free)
+    def _on_mission_ack(self, request, response, mission_name: str, force_free: bool = False):
+        accepted = self._run_reserved(mission_name, True, force_free)
         response.success = bool(accepted)
-        response.message = 'Nav2 accepted NavigateToPose goal' if accepted else 'Nav2 did not accept goal'
+        response.message = 'Nav2 accepted NavigateToPose goal' if accepted else 'Nav2 goal rejected, canceled or previous navigation still pending'
         return response
 
     def _execute_mission(self, mission_name: str, start_node: str,
                          destination: str, bt_file: str, wait_for_accept: bool = False,
-                         force_free: bool = False) -> bool:
+                         force_free: bool = False, ctx=None) -> bool:
         """Execute mission to destination.
 
         Chien luoc hybrid (Q1 - duyet):
@@ -402,7 +430,7 @@ class MissionManager(Node):
             return self._navigate_to_pose(
                 pose, dst_node, bt_path,
                 use_home_pose=(mission_name == 'return_home'),
-                wait_for_accept=wait_for_accept)
+                wait_for_accept=wait_for_accept, ctx=ctx)
 
         except Exception as e:
             self.get_logger().error(f'Mission failed: {e}')
@@ -508,7 +536,7 @@ class MissionManager(Node):
                                   PROBE_WAIT_SERVER_S, PROBE_RESULT_TIMEOUT_S)
 
     def _navigate_to_pose(self, pose: PoseStamped, node_name: str, bt_path: str,
-                          use_home_pose: bool = False, wait_for_accept: bool = False):
+                          use_home_pose: bool = False, wait_for_accept: bool = False, ctx=None):
         """Send NavigateToPose goal with custom BT (bt_path rong = Nav2 default BT)."""
         pose.header.stamp = self.get_clock().now().to_msg()
 
@@ -531,96 +559,82 @@ class MissionManager(Node):
             self._publish_status(self._active_mission, 'ABORTED', 'NavigateToPose server not ready')
             return False
 
-        send_future = self._nav_client.send_goal_async(
-            goal,
-            feedback_callback=lambda fb: None
-        )
+        with self._mission_lock:
+            if ctx is None or self._nav_context is not ctx or not ctx['valid']:
+                return False
+            send_future = self._nav_client.send_goal_async(goal, feedback_callback=lambda _: None)
+            ctx['send'] = send_future
         accepted_event = threading.Event() if wait_for_accept else None
         accepted = {'value': False}
-
-        def _goal_response(future):
-            try:
-                handle = future.result()
-                accepted['value'] = bool(handle and handle.accepted)
-            except Exception:
-                accepted['value'] = False
-            self._on_goal_sent(future, node_name)
+        def response(future):
+            accepted['value'] = self._on_goal_sent(future, node_name, ctx)
             if accepted_event:
                 accepted_event.set()
-
-        send_future.add_done_callback(_goal_response)
+        send_future.add_done_callback(response)
         if accepted_event:
-            if not accepted_event.wait(timeout=8.0):
-                self._publish_status(self._active_mission, 'ABORTED', 'timeout waiting for Nav2 goal acceptance')
+            if not accepted_event.wait(timeout=8.):
+                with self._mission_lock:
+                    ctx['valid'] = False
+                    if ctx['handle'] is not None:
+                        ctx['handle'].cancel_goal_async()
                 return False
             return accepted['value']
         return True
 
-    def _on_goal_sent(self, future, node_name: str):
-        """Handle goal sent result."""
-        try:
-            handle = future.result()
-            if handle and handle.accepted:
-                self.get_logger().info(f'  Goal accepted: {node_name}')
-                # Robot dang chay -> bao EXECUTING cho LLM ngay.
-                self._publish_status(self._active_mission, 'EXECUTING',
-                                     'robot dang di')
-                result_future = handle.get_result_async()
-                result_future.add_done_callback(
-                    lambda f: self._on_complete(f, node_name)
-                )
+    def _on_goal_sent(self, future, node_name, ctx):
+        with self._mission_lock:
+            try:
+                handle = future.result()
+            except Exception as exc:
+                if self._nav_context is ctx:
+                    self.get_logger().error(f'Goal response unconfirmed run={ctx["id"]}: {exc}')
+                    self._publish_status(ctx['mission'], 'UNKNOWN', 'Goal response unconfirmed', ctx)
+                return False
+            if handle is None or not handle.accepted:
+                if self._nav_context is ctx:
+                    self._nav_context = None
+                    self._publish_status(ctx['mission'], 'ABORTED', 'Nav2 goal not accepted', ctx)
+                return False
+            ctx['handle'] = handle
+            result = handle.get_result_async()
+            valid = self._nav_context is ctx and ctx['valid']
+            if not valid:
+                handle.cancel_goal_async()
             else:
-                self.get_logger().error('  Goal rejected')
-                self._publish_status(self._active_mission, 'ABORTED',
-                                     'Nav2 tu choi goal')
-        except Exception as e:
-            self.get_logger().error(f'Error: {e}')
-            self._publish_status(self._active_mission, 'ABORTED', str(e))
+                self._publish_status(ctx['mission'], 'EXECUTING', 'Navigation executing', ctx)
+            result.add_done_callback(lambda done: self._on_complete(done, node_name, ctx))
+            return valid
 
-    def _on_complete(self, future, node_name: str):
-        """Handle navigation complete.
-
-        FIX (cho LLM): rclpy tra GetResult.Response co field `.status`
-        (uint8, theo action_msgs/GoalStatus). Truoc day code kiem tra
-        `hasattr(result, 'goal_handle')` - nhung ActionResult khong co
-        attribute do -> luon rơi vao nhanh 'COMPLETED', kể cả khi goal
-        ABORTED/CANCELED. Bay go doc `status` that.
-        """
-        try:
-            wrapped = future.result()
-            if wrapped is None:
-                self.get_logger().warn(f'  === {node_name} FAILED ===')
-                self._publish_status(self._active_mission, 'ABORTED',
-                                     'khong nhan duoc ket qua goal')
+    def _on_complete(self, future, node_name, ctx):
+        with self._mission_lock:
+            if self._nav_context is not ctx:
                 return
-
-            status = wrapped.status
-            if status == GoalStatus.STATUS_SUCCEEDED:
-                self.get_logger().info(f'  === {node_name} SUCCEEDED ===')
-                self._publish_status(self._active_mission, 'SUCCEEDED',
-                                     'da den noi')
-            elif status == GoalStatus.STATUS_ABORTED:
-                self.get_logger().warn(f'  === {node_name} ABORTED ===')
-                self._publish_status(
-                    self._active_mission, 'ABORTED',
-                    'ke chay: route va Nav2 free navigation deu that bai')
+            try:
+                status = future.result().status
+            except Exception as exc:
+                self.get_logger().error(f'Goal result unconfirmed run={ctx["id"]}: {exc}')
+                self._publish_status(ctx['mission'], 'UNKNOWN', 'Navigation result unconfirmed', ctx)
+                return
+            if status not in (4, 5, 6):
+                self._publish_status(ctx['mission'], 'UNKNOWN', f'Nonterminal navigation result status={status}', ctx)
+                return
+            self._nav_context = None
+            self.get_logger().info(f'Navigation terminal run={ctx["id"]} status={status} stop_requested={not ctx["valid"]}')
+            if not ctx['valid']:
+                state = 'CANCELED'
+            elif status == GoalStatus.STATUS_SUCCEEDED:
+                state = 'SUCCEEDED'
             elif status == GoalStatus.STATUS_CANCELED:
-                self.get_logger().warn(f'  === {node_name} CANCELED ===')
-                self._publish_status(self._active_mission, 'CANCELED',
-                                     'goal bi huy')
+                state = 'CANCELED'
             else:
-                self.get_logger().warn(f'  === {node_name} status={status} ===')
-                self._publish_status(self._active_mission, 'ABORTED',
-                                     f'goal status={status}')
-        except Exception as e:
-            self.get_logger().error(f'Error: {e}')
-            self._publish_status(self._active_mission, 'ABORTED', str(e))
+                state = 'ABORTED'
+            self._publish_status(ctx['mission'], state, f'Navigation result status={status}', ctx)
 
-    def _publish_status(self, mission_name, state: str, reason: str = ''):
+    def _publish_status(self, mission_name, state: str, reason: str = '', ctx=None):
         """Publish trang thai JSON cho LLM tren /mission/status."""
-        if mission_name is None:
-            return
         payload = {
+            "busy": self._nav_context is not None,
+            "run_id": (ctx or self._nav_context or {}).get("id"),
             'mission': mission_name,
             'state': state,
             'nav_mode': self._nav_mode,

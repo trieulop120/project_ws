@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""
-Pallet Detector Node — OpenVINO FP16 backend (Native Engine)
-============================================================
-Nạp trực tiếp thư mục OpenVINO qua Ultralytics Engine để đảm bảo
-độ chính xác 100% giống file best.pt mà vẫn đạt tốc độ ~20 FPS.
+"""Pallet detector with Ultralytics OpenVINO, forced Intel GPU execution.
+
+This node always uses the Intel GPU for inference. If OpenVINO cannot compile
+or run on the GPU, startup fails rather than silently switching to CPU.
+
+The parent PalletDetectorNode still provides all ROS 2 detection, depth,
+TF, and mission features. The existing launch file may keep passing
+inference_device:=intel:gpu, but doing so is no longer required for this node.
 """
 
 import os
+import yaml
+import numpy as np
 import rclpy
+from rclpy.parameter import Parameter
 from amr_perception.pallet_detector_node import PalletDetectorNode
 
 try:
@@ -17,7 +23,31 @@ except ImportError:
 
 
 class PalletDetectorOVNode(PalletDetectorNode):
-    """PalletDetectorNode chạy trên OpenVINO Engine native."""
+    """Use Ultralytics' native OpenVINO backend on an Intel GPU only."""
+
+    GPU_DEVICE = 'intel:gpu'
+
+    def _force_intel_gpu(self):
+        """Override the CPU default inherited from PalletDetectorNode.
+
+        The parent calls _load_model() after declaring and reading the ROS
+        inference_device parameter, so this override takes effect before
+        warm-up and before all subsequent detection predictions.
+        """
+        previous_device = getattr(self, 'inference_device', None)
+        if previous_device != self.GPU_DEVICE:
+            self.get_logger().warning(
+                f'Forcing inference_device={self.GPU_DEVICE} '
+                f'(previous value: {previous_device!r}); CPU fallback disabled.')
+        self.inference_device = self.GPU_DEVICE
+
+        # Keep `ros2 param get ... inference_device` consistent with reality.
+        results = self.set_parameters([
+            Parameter('inference_device', value=self.GPU_DEVICE)
+        ])
+        if not results or not results[0].successful:
+            reason = results[0].reason if results else 'unknown reason'
+            raise RuntimeError(f'Failed to set inference_device parameter: {reason}')
 
     def _find_ov_model_dir(self) -> str:
         candidates = []
@@ -41,52 +71,81 @@ class PalletDetectorOVNode(PalletDetectorNode):
                 return d
         return ''
 
+    def _warm_up(self):
+        """Compile the OpenVINO model and verify actual Intel GPU execution."""
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        self.model.predict(dummy, device=self.GPU_DEVICE, verbose=False)
+
+        predictor = getattr(self.model, 'predictor', None)
+        backend = getattr(predictor, 'model', None)
+        compiled = getattr(backend, 'ov_compiled_model', None)
+        if compiled is None:
+            raise RuntimeError(
+                'Cannot verify OpenVINO execution: ov_compiled_model is unavailable.')
+
+        execution_devices = list(compiled.get_property('EXECUTION_DEVICES'))
+        if not any(str(dev).upper().startswith('GPU') for dev in execution_devices):
+            raise RuntimeError(
+                'Intel GPU required, but OpenVINO compiled the model on '
+                f'{execution_devices}. CPU fallback is not allowed.')
+
+        self.get_logger().info(
+            f'OpenVINO GPU warm-up successful '
+            f'(requested={self.GPU_DEVICE}, actual={execution_devices})')
+
     def _load_model(self):
-        """Nạp thư mục OpenVINO IR bằng Ultralytics OpenVINO backend."""
+        """Load OpenVINO IR, force GPU, and fail fast if GPU is unavailable."""
+        self._force_intel_gpu()
+
         if YOLO is None:
-            self.get_logger().error('Thư viện Ultralytics chưa được cài đặt!')
-            return
+            raise RuntimeError('Ultralytics is not installed.')
 
         model_dir = self._find_ov_model_dir()
         if not model_dir:
-            self.get_logger().error(
-                'Không tìm thấy mô hình OpenVINO! (Cần thư mục best_openvino_model chứa best.xml & best.bin)')
-            return
+            raise RuntimeError(
+                'OpenVINO model not found. Expected best_openvino_model '
+                'directory containing best.xml and best.bin.')
 
         try:
-            self.get_logger().info(f'Đang nạp mô hình OpenVINO từ: {model_dir}')
-            # Nạp trực tiếp thư mục OpenVINO IR, Ultralytics sẽ tự kích hoạt OpenVINO C++ Engine bên dưới
-            self.model = YOLO(model_dir, task='segment')
-            self.get_logger().info('Nạp thành công OpenVINO FP16 Model!')
-        except Exception as e:
-            self.get_logger().error(f'Lỗi nạp mô hình OpenVINO: {e}')
+            self.get_logger().info(f'Loading OpenVINO model: {model_dir}')
+            metadata_path = os.path.join(model_dir, 'metadata.yaml')
+            task = None
+            if os.path.isfile(metadata_path):
+                with open(metadata_path, 'r', encoding='utf-8') as stream:
+                    metadata = yaml.safe_load(stream) or {}
+                task = metadata.get('task')
+            self.model = YOLO(model_dir, task=task) if task else YOLO(model_dir)
+            self._warm_up()
+            self.get_logger().info(
+                f'OpenVINO model loaded on Intel GPU (task={task or "auto"}).')
+        except Exception as exc:
             self.model = None
+            self.get_logger().error(f'Failed to start Intel GPU inference: {exc}')
+            raise
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PalletDetectorOVNode()
-    if bool(node.get_parameter('mt_executor').value):
-        from rclpy.executors import MultiThreadedExecutor
-        exec_ = MultiThreadedExecutor()
-        exec_.add_node(node)
-        try:
-            exec_.spin()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            exec_.shutdown()
-    else:
-        try:
+    node = None
+    try:
+        node = PalletDetectorOVNode()
+        if bool(node.get_parameter('mt_executor').value):
+            from rclpy.executors import MultiThreadedExecutor
+            executor = MultiThreadedExecutor()
+            executor.add_node(node)
+            try:
+                executor.spin()
+            finally:
+                executor.shutdown()
+        else:
             rclpy.spin(node)
-        except KeyboardInterrupt:
-            pass
-    node.destroy_node()
-    # SIGINT handled by rclpy may already have shut down the default context.
-    # Avoid raising a second shutdown error while pallet_mission stops this
-    # short-lived detector process after sampling.
-    if rclpy.ok():
-        rclpy.shutdown()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

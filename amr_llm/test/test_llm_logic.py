@@ -64,10 +64,10 @@ def test_mission_from_to():
                 L.mission_from_to('return_home') == (None, 'home'))
     ok &= check('p1_to_d1 -> (p1, d1)',
                 L.mission_from_to('p1_to_d1') == ('p1', 'd1'))
-    ok &= check('home_to_p2 -> (home, p2)',
-                L.mission_from_to('home_to_p2') == ('home', 'p2'))
-    ok &= check('d1_to_p2 -> (d1, p2)',
-                L.mission_from_to('d1_to_p2') == ('d1', 'p2'))
+    ok &= check('home_to_d2 -> (home, d2)',
+                L.mission_from_to('home_to_d2') == ('home', 'd2'))
+    ok &= check('d2_to_d1 -> (d2, d1)',
+                L.mission_from_to('d2_to_d1') == ('d2', 'd1'))
     ok &= check('ten ngoai danh -> ValueError',
                 raises(lambda: L.mission_from_to('bay_to_bay'))[0])
     return ok
@@ -239,17 +239,19 @@ def test_prompt():
     ok &= check('go_mission co tap day du cac mission',
                 all(m in p for m in L.MISSIONS))
     expected_missions = {
-        'home_to_p1', 'home_to_p2', 'p1_to_d1', 'p2_to_d1',
-        'p1_to_p2', 'd1_to_p1', 'd1_to_p2', 'return_home',
+        'home_to_p1', 'home_to_d2', 'p1_to_d1', 'd2_to_d1',
+        'd1_to_p1', 'd1_to_d2', 'p1_to_d2', 'return_home',
     }
     ok &= check('MISSIONS khop 8 mission tren Mission Manager',
                 set(L.MISSIONS) == expected_missions)
     expected_tools = {
         'set_mode', 'quick_goal', 'start_auto_cycle', 'start_single_cycle',
         'stop_cycle', 'cancel_navigation', 'resume_cycle', 'go_mission',
+        'retrieve_pallet', 'detect_pallet', 'lock_detection', 'lift_home',
+        'relative_move', 'get_robot_status',
         'pick_pallet', 'drop_pallet', 'lift_to',
     }
-    ok &= check('TOOLS khop du 11 action da tich hop', set(L.TOOLS) == expected_tools)
+    ok &= check('TOOLS khop cac action da tich hop', set(L.TOOLS) == expected_tools)
     ok &= check('TOOLS co drop_pallet', 'drop_pallet' in L.TOOLS)
     ok &= check('drop_pallet khong tham so', L.TOOLS['drop_pallet']['params'] == {})
     return ok

@@ -27,16 +27,16 @@ nodes:
     floor: 1
     description: ''
     properties: {}
-  P_2:
-    name: P_2
+  D_2:
+    name: D_2
     position:
       x: 6.57
       y: 3.03
       z: 0
     orientation:
       yaw: 3.14134054518021
-    type: pickup_approach
+    type: dropoff_approach
     floor: 1
-    description: ''
+    description: Diem tha pallet lay ra tu ke (xuat kho)
     properties: {}
 edges: []

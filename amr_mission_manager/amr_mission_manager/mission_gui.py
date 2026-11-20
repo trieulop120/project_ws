@@ -6,10 +6,12 @@ mission_gui.py
 Simple GUI for Mission Manager using Tkinter.
 
 Missions:
-    - HOME → P_1, HOME → P_2
-    - P_1 → D_1, P_2 → D_1
-    - D_1 → P_1, D_1 → P_2
+    - HOME → P_1, HOME → D_2
+    - P_1 → D_1, D_2 → D_1
+    - D_1 → P_1, D_1 → D_2
     - Return HOME (NavigateToPose direct)
+
+(D_2 = diem tha pallet lay ra tu ke - xuat kho; D_1 = ke)
 
 Usage:
     ros2 run amr_mission_manager mission_gui
@@ -38,12 +40,12 @@ class MissionGUINode(Node):
         """Create service clients."""
         services = [
             'mission_manager/trigger_home_to_p1',
-            'mission_manager/trigger_home_to_p2',
+            'mission_manager/trigger_home_to_d2',
             'mission_manager/trigger_p1_to_d1',
-            'mission_manager/trigger_p2_to_d1',
-            'mission_manager/trigger_p1_to_p2',
+            'mission_manager/trigger_d2_to_d1',
+            'mission_manager/trigger_p1_to_d2',
             'mission_manager/trigger_d1_to_p1',
-            'mission_manager/trigger_d1_to_p2',
+            'mission_manager/trigger_d1_to_d2',
             'mission_manager/trigger_return_home',
         ]
         for svc in services:
@@ -96,7 +98,7 @@ class MissionGUI(tk.Tk):
 
         for label, service in [
             ("HOME → P_1", "mission_manager/trigger_home_to_p1"),
-            ("HOME → P_2", "mission_manager/trigger_home_to_p2"),
+            ("HOME → D_2", "mission_manager/trigger_home_to_d2"),
         ]:
             btn = ttk.Button(btn_frame_home, text=label, width=18)
             btn.pack(side='left', padx=3)
@@ -113,7 +115,7 @@ class MissionGUI(tk.Tk):
 
         for label, service in [
             ("P_1 → D_1", "mission_manager/trigger_p1_to_d1"),
-            ("P_2 → D_1", "mission_manager/trigger_p2_to_d1"),
+            ("D_2 → D_1", "mission_manager/trigger_d2_to_d1"),
         ]:
             btn = ttk.Button(btn_frame_pick, text=label, width=18)
             btn.pack(side='left', padx=3)
@@ -130,7 +132,7 @@ class MissionGUI(tk.Tk):
 
         for label, service in [
             ("D_1 → P_1", "mission_manager/trigger_d1_to_p1"),
-            ("D_1 → P_2", "mission_manager/trigger_d1_to_p2"),
+            ("D_1 → D_2", "mission_manager/trigger_d1_to_d2"),
         ]:
             btn = ttk.Button(btn_frame_drop, text=label, width=18)
             btn.pack(side='left', padx=3)

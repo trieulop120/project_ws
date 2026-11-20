@@ -52,5 +52,10 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
   RENAME supervisor_gui
   )
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_mission_manager/pallet_retrieval_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME pallet_retrieval
+)
 
 ament_package()

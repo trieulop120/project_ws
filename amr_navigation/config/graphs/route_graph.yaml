@@ -25,16 +25,6 @@ nodes:
     type: pickup_approach
     floor: 1
     description: Node P_1
-  P_2:
-    position:
-      x: 1.881
-      y: -0.131
-      z: 0.0
-    orientation:
-      yaw: -1.5708
-    type: pickup_approach
-    floor: 1
-    description: Node P_2
   D_1:
     position:
       x: -1.758
@@ -45,6 +35,16 @@ nodes:
     type: dropoff_approach
     floor: 1
     description: Node D_1
+  D_2:
+    position:
+      x: 1.881
+      y: -0.131
+      z: 0.0
+    orientation:
+      yaw: -1.5708
+    type: dropoff_approach
+    floor: 1
+    description: Diem tha pallet lay ra tu ke (xuat kho)
   J3:
     position:
       x: 1.568
@@ -212,11 +212,11 @@ edges:
   weight: 1.0
   distance: 0.86
 - from: J3
-  to: P_2
+  to: D_2
   bidirectional: true
   weight: 1.0
   distance: 0.34
-- from: P_2
+- from: D_2
   to: J3
   bidirectional: true
   weight: 1.0

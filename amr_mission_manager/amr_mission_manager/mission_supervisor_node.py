@@ -4,7 +4,7 @@ mission_supervisor_node.py
 ==========================
 Mission Supervisor: integrates existing mission_manager and pallet_mission services.
 
-    single: HOME -> P_1/P_2 -> adaptive detect -> pick -> D_1 -> drop, repeat
+    single: HOME -> P_1 -> adaptive detect -> pick -> D_1 -> drop, repeat
             until the requested quantity is placed, then HOME -> DONE
     auto:   repeat the cycle until no pallet is detected at P_1 or no compatible
             known-empty shelf slot remains; then return HOME.
@@ -24,13 +24,17 @@ Chạy (cùng pallet_mission.launch.py, KHONG chay them mission_manager rieng):
     ros2 launch amr_mission_manager mission_supervisor.launch.py
     ros2 service call /mission/start std_srvs/srv/Trigger '{}'
     # override mission TRUOC khi start (hot, khong can restart):
-    ros2 param set /mission_supervisor pick_mission home_to_p2
+    ros2 param set /mission_supervisor pick_mission home_to_p1
     ros2 service call /mission/stop std_srvs/srv/Trigger '{}'
 """
 
 import json
 import math
+from amr_mission_manager.pallet_recovery import navigation_stopped
 import time
+import threading
+import uuid
+from functools import wraps
 
 import rclpy
 from rclpy.node import Node
@@ -73,11 +77,7 @@ DEFAULTS = {
     # Mission manager (names must match MISSION_BT_MAP of mission_manager_node)
     'pick_mission': 'home_to_p1',
     'drop_mission': 'p1_to_d1',
-    'pick_dest': 'P_1',            # node graph (map frame) de soi den choi
-    # Nhanh lay thu hai: chi duoc dung khi graph THAT co edge noi P_2 voi
-    # node nao do (xem _p2_available). P_1 het pallet -> di P_1 -> P_2.
-    'pick_dest_2': 'P_2',
-    'pick_mission_2_from_p1': 'p1_to_p2',
+    'pick_dest': 'P_1',            # node graph (map frame) duy nhat de lay pallet
     'run_mode': 'single',          # bounded quantity + HOME; auto: loop until source/slots empty
     # Bounded LLM mission: require exactly N successfully placed items of the
     # requested detector class. Empty class means any shelf-compatible cargo.
@@ -108,7 +108,7 @@ DEFAULTS = {
     'arrive_max_angular_speed_rps': 0.12,
     'goto_timeout_s': 180.0,
     # PICKING
-    'pick_sample_wait_s': 20.0,  # hard timeout (tinh tu Detect ON, gom ca thoi gian detector nap model)
+    'pick_sample_wait_s': 20.0,  # hard timeout; includes model load only when prewarm is disabled
     'sample_stable_s': 2.0,
     'no_pallet_conclude_s': 10.0,  # detector DA CHAY ma sau ngan nay van 0 mau -> ket luan khong co pallet
     'no_pallet_retries': 1,      # 1 = ket luan ngay lan quet trong dau tien (-> ve HOME)
@@ -144,6 +144,14 @@ def yaw_from_quat(q) -> float:
                       1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
+def _state_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._transition_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class MissionSupervisor(Node):
 
     def __init__(self):
@@ -160,6 +168,7 @@ class MissionSupervisor(Node):
         self._approach_retries = 0
         self._drop_retries = 0
         self._pm_fail_phase = None
+        self._pm_insertion_only = False
         self._retry_wait_until = 0.0
         self._stuck_t0 = None
         self._start_refusals = 0
@@ -199,8 +208,7 @@ class MissionSupervisor(Node):
         self._stable_anchor = None
         self._active_mission = self.p['pick_mission']
         self._active_dest = self.p['pick_dest']
-        # Hang doi diem lay trong mot chu ky: ['P_1'] hoac ['P_1','P_2'].
-        # P_2 chi duoc them khi graph THAT co edge noi P_2 (_p2_available).
+        # Diem lay duy nhat trong mot chu ky: P_1 (da bo nhanh lay thu hai P_2/D_2).
         self._pick_queue = []
         self._pick_idx = 0
         self._route_loader = None
@@ -210,8 +218,42 @@ class MissionSupervisor(Node):
         self._route_path_last_received = 0.0
         self._cycle = 0
         self._resume_state = None
+        self._pm_session_id = None
+        self._pm_operation_id = -1
+        self._await_operation_after = None
+        self._await_resume_checkpoint = None
+        self._pm_recovery = None
+        self._recovery_stop_future = None
+        self._recovery_cancel_future = None
+        self._recovery_still_since = None
+        self._recovery_started = 0.0
+        self._recovery_origin = None
+        self._recovery_route = None
+        self._mission_trigger_pending = False
+        self._navigation_stop_requests = []
+        self._manager_busy = None
+        self._manager_status_t = 0.0
         self._empty_scans = 0
         self._cancel_requested = False
+        self._mission_epoch = 0
+        self._tick_context = threading.local()
+        self._transition_lock = threading.RLock()
+        self._tick_inflight = False
+        self._pending_service_futures = []
+        self._run_id = None
+        self._supervisor_session_id = uuid.uuid4().hex
+        self._revision = 0
+        self._resume_revision = 0
+        self._active_since = None
+        self._elapsed_active_s = 0.0
+        self._stop_confirmed = False
+        self._discard_requested = False
+        self._discard_future = None
+        self._stop_request_serial = 0
+        self._discard_stop_serial = None
+        self._resume_inflight = False
+        self._recovery_cause = None
+        self._mission_nav_run_id = None
         self._camera_last_t = 0.0
         self._odom_t = 0.0
         self._odom_linear_speed = None
@@ -248,7 +290,7 @@ class MissionSupervisor(Node):
                                  self._on_detector_status, 10)
         self.create_subscription(Image, self.p['camera_topic'], self._on_camera,
                                  qos_profile_sensor_data)
-        self.create_subscription(Odometry, self.p['odom_topic'], self._on_odom, 10)
+        self.create_subscription(Odometry, self.p['odom_topic'], self._on_odom, qos_profile_sensor_data)
         self.create_subscription(
             GoalStatusArray, self.p['nav_status_topic'], self._on_nav_status, 10)
         # mission_manager reports the actual NavigateToPose result here. The
@@ -275,6 +317,7 @@ class MissionSupervisor(Node):
         self.create_service(
             Trigger, '/mission/stop', self._srv_stop,
             callback_group=self._control_group)
+        self.create_service(Trigger, '/mission/cancel', self._srv_cancel, callback_group=self._control_group)
         self.create_service(
             Trigger, '/mission/reset', self._srv_reset,
             callback_group=self._control_group)
@@ -307,7 +350,25 @@ class MissionSupervisor(Node):
     # ==================================================================
     # Helpers
     # ==================================================================
+    @_state_locked
     def _set_state(self, state: str, msg: str = ''):
+        if self._stale_step():
+            return
+        previous = self._state
+        now = time.monotonic()
+        if state in ('STOPPING', 'RECOVERY', IDLE, DONE, FAILED, STOPPED):
+            if self._active_since is not None:
+                self._elapsed_active_s += max(0., now - self._active_since)
+                self._active_since = None
+        elif self._active_since is None:
+            self._active_since = now
+        self._revision += 1
+        if state == 'RECOVERY' and previous not in ('RECOVERY', 'STOPPING'):
+            self._recovery_cause = 'error'
+            self._recovery_origin = self._state
+            self._recovery_pm_session = self._pm_session_id
+            self._recovery_route = self._route_path_loaded
+            self._request_recovery_stop()
         self._state = state
         self._msg = msg
         self._t_state = time.monotonic()
@@ -363,16 +424,53 @@ class MissionSupervisor(Node):
             self._route_path_error = str(e)
             self.get_logger().error(f'Failed to load active Nav2 route graph {msg.data}: {e}')
 
-    def _call_service_result(self, cli, req, timeout: float = 5.0):
-        # Availability checks happen from the state-machine timer. Keep them
-        # short so a missing service cannot starve STOP/status/timer callbacks.
-        if not cli.wait_for_service(timeout_sec=min(max(timeout, 0.0), 0.2)):
+    def _stale_step(self):
+        epoch = getattr(getattr(self, '_tick_context', None), 'epoch', None)
+        return epoch is not None and epoch != getattr(self, '_mission_epoch', 0)
+
+    @_state_locked
+    def _late_service_result(self, epoch):
+        if epoch != self._mission_epoch:
+            self.get_logger().warning(f'Late service result from Auto epoch={epoch}; current={self._mission_epoch}')
+            if self._cancel_requested and self._state in ('STOPPING', 'RECOVERY'):
+                self._request_recovery_stop()
+            return
+        self._stop_after_late_request()
+
+    def _call_service_result(self, cli, req, timeout: float = 5.0, on_late=None):
+        epoch = self._mission_epoch
+        if self._stale_step() or not cli.wait_for_service(timeout_sec=min(max(timeout, 0.0), 0.2)):
             return None
-        fut = cli.call_async(req)
+        with self._transition_lock:
+            if epoch != self._mission_epoch or self._stale_step():
+                return None
+            fut = cli.call_async(req)
+            self._pending_service_futures = [f for f in self._pending_service_futures if not f.done()]
+            self._pending_service_futures.append(fut)
         t_end = time.monotonic() + timeout
         while not fut.done() and time.monotonic() < t_end:
             time.sleep(0.02)
-        return fut.result() if fut.done() else None
+        if not fut.done():
+            def late(_):
+                with self._transition_lock:
+                    if epoch != self._mission_epoch:
+                        self._late_service_result(epoch)
+                    elif on_late:
+                        on_late(_)
+                    else:
+                        self._stop_after_late_request()
+            fut.add_done_callback(late)
+            self._late_service_result(epoch)
+            return None
+        if epoch != self._mission_epoch:
+            self._late_service_result(epoch)
+            return None
+        try:
+            return fut.result()
+        except Exception as exc:
+            self.get_logger().error(f'Auto service result unconfirmed epoch={epoch}: {exc}')
+            self._late_service_result(epoch)
+            return None
 
     def _service_client(self, srv_type, service_name):
         key = (srv_type, service_name)
@@ -386,11 +484,20 @@ class MissionSupervisor(Node):
     def _call_service(self, cli, req) -> bool:
         return self._call_service_result(cli, req) is not None
 
+    def _request_owned_navigation_stop(self):
+        client = self._service_client(Trigger, '/mission_manager/stop')
+        if client.service_is_ready():
+            self._navigation_stop_requests.append(client.call_async(Trigger.Request()))
+        elif self._cancel_cli.service_is_ready():
+            self._navigation_stop_requests.append(self._cancel_cli.call_async(CancelGoal.Request()))
+
     def _trigger_mission(self, mission: str, force_free: bool = False) -> bool:
         """Call the acknowledged mission trigger; success means Nav2 accepted its goal."""
-        if self._cancel_requested:
+        if self._cancel_requested or any(not f.done() for f in self._navigation_stop_requests):
             return False
+        self._navigation_stop_requests = []
         self._mission_nav_expected = mission
+        self._mission_nav_run_id = None
         self._mission_nav_status = None
         self._mission_nav_status_t = 0.0
         self._mission_nav_attempt_t = time.time()
@@ -399,7 +506,11 @@ class MissionSupervisor(Node):
         svc = f'/{self.p["mission_manager_node"]}/trigger_{mission}{suffix}'
         cli = self._service_client(Trigger, svc)
         req = Trigger.Request()
-        result = self._call_service_result(cli, req, timeout=12.0)
+        self._mission_trigger_pending = True
+        try:
+            result = self._call_service_result(cli, req, timeout=12.0)
+        finally:
+            self._mission_trigger_pending = False
         if self._cancel_requested or result is None or not getattr(result, 'success', True):
             return False
         self.get_logger().info(f'Da goi {svc}')
@@ -408,12 +519,23 @@ class MissionSupervisor(Node):
     def _on_mission_nav_status(self, msg: String):
         try:
             data = json.loads(msg.data)
+            self._manager_busy = data.get('busy')
+            self._manager_status_t = time.monotonic()
             mission = str(data.get('mission') or '')
             state = str(data.get('state') or '').upper()
             stamp = float(data.get('timestamp') or time.time())
-            if mission != self._mission_nav_expected or stamp + 0.05 < self._mission_nav_attempt_t:
+            if mission != self._mission_nav_expected or stamp < self._mission_nav_attempt_t:
                 return
+            run_id = data.get('run_id')
+            if run_id is not None:
+                if self._mission_nav_run_id is None:
+                    if state not in ('PENDING', 'EXECUTING'):
+                        return
+                    self._mission_nav_run_id = run_id
+                elif run_id != self._mission_nav_run_id:
+                    return
             self._mission_nav_status = {
+                'run_id': run_id,
                 'mission': mission, 'state': state,
                 'reason': str(data.get('reason') or ''),
                 'nav_mode': data.get('nav_mode'),
@@ -426,6 +548,17 @@ class MissionSupervisor(Node):
     # Services
     # ==================================================================
     def _srv_start(self, req, res):
+        with self._transition_lock:
+            return self._start_operation(req, res)
+
+    def _start_operation(self, req, res):
+        if (getattr(self, '_tick_inflight', False) or self._state == 'STOPPING' or
+                getattr(self, '_discard_requested', False)):
+            res.success, res.message = False, 'Previous mission is still stopping'
+            return res
+        if any(not f.done() for f in self._pending_service_futures) or self._manager_busy is True:
+            res.success, res.message = False, 'Previous operation outcome is unconfirmed'
+            return res
         route_age = (time.monotonic() - self._route_path_last_received
                      if self._route_path_last_received > 0.0 else float('inf'))
         if self._route_loader is None or route_age > 6.0:
@@ -433,15 +566,13 @@ class MissionSupervisor(Node):
             detail = self._route_path_error or 'route graph chưa được nạp'
             res.message = f'Từ chối start: {detail}; route status age={route_age:.1f}s'
             return res
+        if (self._pm_recovery or {}).get('checkpoint'):
+            res.success, res.message = False, 'Pallet operation checkpoint retained; Resume or explicitly reset after inspection'
+            return res
         requested_mode = self.get_parameter('run_mode').value
         if requested_mode not in ('single', 'auto'):
             res.success = False
             res.message = "run_mode phai la 'single' hoac 'auto'"
-            return res
-        if self._pm_cargo is True:
-            res.success = False
-            res.message = ('Dang mang pallet; khong the bat dau chu ky pick moi. '
-                           'Dung /mission/resume sau khi kiem tra vi tri va tai.')
             return res
         if self._state not in (IDLE, DONE, FAILED, STOPPED):
             res.message = f'dang ban ({self._state}), dung /mission/stop truoc'
@@ -458,7 +589,6 @@ class MissionSupervisor(Node):
         # - override hot, không cần restart.
         for k in ('pick_mission', 'drop_mission', 'pick_dest', 'run_mode',
                   'target_cargo_class', 'target_quantity', 'target_drop_slot',
-                  'pick_dest_2', 'pick_mission_2_from_p1',
                   'pm_final_window_s', 'pm_min_samples', 'pm_max_pos_std_m',
                   'pm_max_yaw_std_deg', 'pm_max_sample_age_s',
                   'pm_require_stable'):
@@ -511,16 +641,18 @@ class MissionSupervisor(Node):
 
         # Canh bao nhat quan: `pick_dest` va `pick_mission` phai tro cung mot
         # diem. Khong tu sua (nguoi van hanh can thay), chi bao ro.
-        if self.p['pick_mission'] == 'home_to_p2' and self.p['pick_dest'] != 'P_2':
-            self.get_logger().warn(
-                f'[mission] pick_mission={self.p["pick_mission"]} nhung pick_dest='
-                f'{self.p["pick_dest"]} -> robot se toi {self.p["pick_dest"]} nhung '
-                f'mission lai dich sang P_2. Sua pick_dest cho khop.')
         if self.p['pick_mission'] == 'home_to_p1' and self.p['pick_dest'] != 'P_1':
             self.get_logger().warn(
                 f'[mission] pick_mission={self.p["pick_mission"]} nhung pick_dest='
                 f'{self.p["pick_dest"]} -> khong khop. Sua pick_dest cho khop.')
 
+        self._mission_epoch += 1
+        self._run_id = uuid.uuid4().hex
+        self._resume_revision = 0
+        self._elapsed_active_s = 0.0
+        self._active_since = None
+        self._recovery_cause = None
+        self._stop_confirmed = False
         self._pick_phase = S_SAMPLING
         self._detect_on_called = False
         self._go_called = False
@@ -558,52 +690,323 @@ class MissionSupervisor(Node):
         res.message = 'start'
         return res
 
-    def _srv_stop(self, req, res):
-        if self._state in (IDLE, DONE, FAILED, STOPPED):
-            res.success, res.message = True, 'không có gì để dừng'
-            return res
-        # Huyen Nav2 (mission_manager) + pallet_mission (xe + lift)
-        checkpoint = self._resume_state
-        if checkpoint is None and self._state not in ('IDLE', STOPPED, 'RECOVERY', 'DONE', 'FAILED'):
-            checkpoint = self._state
+    def _stop_after_late_request(self):
+        if self._cancel_requested and self._state in ('STOPPING', 'RECOVERY'):
+            self._request_recovery_stop()
+            return
+        if self._state != 'RECOVERY':
+            self._resume_state = self._state if self._state not in (IDLE, DONE, FAILED, STOPPED) else None
+            self._set_state('RECOVERY', 'Service outcome uncertain; STOP requested before any retry')
+        else:
+            self._request_recovery_stop()
+
+    @_state_locked
+    def _request_recovery_stop(self):
+        """Request STOP; completion is established from telemetry before Resume."""
         self._cancel_requested = True
+        self._stop_request_serial += 1
+        self._stop_confirmed = False
+        self._recovery_started = time.monotonic()
+        self._recovery_cancel_future = None
+        self._recovery_stop_future = None
+        self._manager_stop_request = None
+        self._recovery_still_since = None
         try:
-            if self._cancel_cli.wait_for_service(timeout_sec=0.2):
-                self._cancel_cli.call_async(CancelGoal.Request())
-        except Exception:
-            pass
-        cli = self._service_client(
-            Trigger, f'/{self.p["pallet_mission_node"]}/stop')
-        self._call_service_result(cli, Trigger.Request(), timeout=1.0)
-        # A manual operator cancel is recoverable regardless of cargo state.
-        # Preserve the active phase, queue, retries, and selected shelf slot.
-        self._resume_state = checkpoint if checkpoint not in ('IDLE', STOPPED, 'DONE', 'FAILED') else None
-        self._set_state('RECOVERY', 'OPERATOR_CANCEL: da dung xe/lift; kiem tra an toan truoc khi RESUME')
-        res.success = True
-        res.message = 'OPERATOR_CANCEL; RECOVERY'
+            manager = self._service_client(Trigger, '/mission_manager/stop')
+            if manager.service_is_ready():
+                self._manager_stop_request = manager.call_async(Trigger.Request())
+                self._pending_service_futures.append(self._manager_stop_request)
+            if self._cancel_cli.service_is_ready():
+                self._recovery_cancel_future = self._cancel_cli.call_async(CancelGoal.Request())
+                self._pending_service_futures.append(self._recovery_cancel_future)
+            cli = self._service_client(Trigger, f'/{self.p["pallet_mission_node"]}/stop')
+            if cli.service_is_ready():
+                self._recovery_stop_future = cli.call_async(Trigger.Request())
+                self._pending_service_futures.append(self._recovery_stop_future)
+        except Exception as exc:
+            self.get_logger().warn(f'Recovery stop request failed: {exc}')
+
+    def _srv_stop(self, req, res):
+        with self._transition_lock:
+            if self._state in (IDLE, DONE, FAILED, STOPPED):
+                res.success, res.message = True, 'No active supervisor mission'
+                return res
+            if self._state == 'STOPPING':
+                if self._manager_stop_request is None or self._recovery_stop_future is None:
+                    self._request_recovery_stop()
+                res.success, res.message = True, 'Stopping mission'
+                return res
+            if self._state == 'RECOVERY' and self._stop_confirmed and not self._resume_inflight:
+                res.success, res.message = True, 'Mission paused'
+                return res
+            self._begin_user_stop(discard=False)
+        res.success, res.message = True, 'Stopping mission'
         return res
 
-    def _srv_resume(self, req, res):
-        if self._state != 'RECOVERY' or not self._resume_state:
-            res.success, res.message = False, 'Khong co checkpoint de tiep tuc'
-            return res
-        state = self._resume_state
-        self._resume_state = None
-        self._resume_free_nav = bool(
-            self._mission_nav_status and self._mission_nav_status.get('state') == 'ABORTED')
-        self._approach_retries = 0
-        self._drop_retries = 0
-        self._detector_restarts = 0
-        self._triggered = False
-        self._go_called = False
-        self._cancel_requested = False
-        self._mission_nav_status = None
-        self._mission_nav_status_t = 0.0
-        self._mission_nav_expected = None
-        self._mission_nav_consumed_t = 0.0
-        self._set_state(state, 'Resume tu checkpoint; da kiem tra an toan truoc khi bam')
-        res.success, res.message = True, 'resumed'
+    def _srv_cancel(self, req, res):
+        with self._transition_lock:
+            if self._state == IDLE:
+                res.success, res.message = True, 'Mission canceled'
+                return res
+            if self._discard_requested:
+                if self._discard_future is not None and self._discard_future.done():
+                    try:
+                        if not self._discard_future.result().success:
+                            self._discard_future = None
+                    except Exception as exc:
+                        self.get_logger().warning(f'Discard response unconfirmed: {exc}')
+                        self._discard_future = None
+                if self._manager_stop_request is None or self._recovery_stop_future is None:
+                    self._request_recovery_stop()
+                res.success, res.message = True, 'Canceling mission'
+                return res
+            self._begin_user_stop(discard=True)
+        res.success, res.message = True, 'Canceling mission'
         return res
+
+    def _begin_user_stop(self, discard):
+        previous = self._state
+        if previous not in ('STOPPING', 'RECOVERY'):
+            self._resume_state = previous if previous not in (IDLE, DONE, FAILED, STOPPED) else None
+            self._recovery_origin = self._resume_state
+            self._recovery_pm_session = self._pm_session_id
+            self._recovery_route = self._route_path_loaded
+        self._mission_epoch += 1
+        self._cancel_requested = True  # fence timer/results BEFORE sending any child cancel
+        self._discard_requested = discard
+        self._discard_future = None
+        self._stop_confirmed = False
+        if previous != 'RECOVERY' or self._recovery_cause != 'error':
+            self._recovery_cause = 'user'
+        self._set_state('STOPPING', 'Operator requested full cancellation' if discard else 'Operator requested pause')
+        self._request_recovery_stop()
+
+    def _stop_blocked(self):
+        now = time.monotonic()
+        if (getattr(self, '_tick_inflight', False) or getattr(self, '_mission_trigger_pending', False)
+                or getattr(self, '_resume_inflight', False)):
+            return 'Waiting for the previous mission step'
+        if any(not f.done() for f in getattr(self, '_pending_service_futures', [])):
+            return 'Waiting for outstanding mission service requests'
+        for future in (getattr(self, '_manager_stop_request', None), getattr(self, '_recovery_stop_future', None)):
+            if future is None or not future.done():
+                return 'Waiting for owner STOP acknowledgement'
+            try:
+                if not future.result().success:
+                    return 'Owner STOP rejected'
+            except Exception as exc:
+                return f'Owner STOP failed: {exc}'
+        if self._manager_busy is not False or self._manager_status_t < self._recovery_started:
+            return 'Waiting for pending/active manager goal to end'
+        if any(not f.done() for f in self._navigation_stop_requests):
+            return 'Waiting for earlier navigation stop'
+        if not navigation_stopped(self._nav_goal_active, self._nav_status_t, self._recovery_started,
+                                  getattr(self, '_recovery_cancel_future', None)):
+            return 'Waiting for terminal navigation'
+        if (not self._robot_stopped(now) or self._recovery_still_since is None or
+                now - self._recovery_still_since < self.p['arrive_settle_s']):
+            return 'Waiting for stationary odometry'
+        if (now - self._pm_status_t > 1.5 or self._pm_status_t < self._recovery_started or
+                (self._pm_recovery or {}).get('stop_confirmed') is not True):
+            return 'Waiting for pallet/lift stop confirmation'
+        return ''
+
+    def _advance_stop(self):
+        with self._transition_lock:
+            reason = self._stop_blocked()
+            if reason:
+                if reason != getattr(self, '_stop_reason', ''):
+                    self.get_logger().info(f'Auto stop run={self._run_id}: {reason}')
+                self._stop_reason = reason
+                return
+            self._stop_confirmed = True
+            if not self._discard_requested:
+                self._set_state('RECOVERY', 'User-requested recovery; mission checkpoint retained')
+                return
+            if self._discard_future is None:
+                client = self._service_client(Trigger, f'/{self.p["pallet_mission_node"]}/discard_recovery')
+                if not client.service_is_ready():
+                    self._stop_reason = 'Pallet discard service unavailable'
+                    return
+                self._discard_future = client.call_async(Trigger.Request())
+                self._discard_stop_serial = self._stop_request_serial
+                self._pending_service_futures.append(self._discard_future)
+                return
+            if not self._discard_future.done():
+                return
+            if self._discard_stop_serial != self._stop_request_serial:
+                self._discard_future = None
+                return
+            try:
+                response = self._discard_future.result()
+            except Exception as exc:
+                self._stop_reason = f'Pallet discard failed: {exc}'
+                self.get_logger().error(self._stop_reason)
+                return
+            if not response.success:
+                self._stop_reason = response.message
+                return
+            self._clear_auto_cycle()
+            self._set_state(IDLE, 'Auto mission canceled; physical observations preserved')
+
+    def _clear_auto_cycle(self):
+        self._mission_epoch += 1
+        self._cancel_requested = self._discard_requested = self._resume_inflight = False
+        self._resume_state = self._recovery_origin = None
+        self._active_mission = self._active_dest = None
+        self._mission_nav_expected = self._mission_nav_status = self._mission_nav_run_id = None
+        self._mission_nav_status_t = self._mission_nav_consumed_t = 0.0
+        self._pick_queue = []
+        self._pick_idx = self._cycle = 0
+        self._triggered = self._go_called = self._detect_on_called = False
+        self._near_t0 = self._stable_since = self._stable_anchor = None
+        self._await_resume_checkpoint = self._await_operation_after = None
+        self._drop_slot_chosen = None
+        self._active_since = None
+        self._elapsed_active_s = 0.0
+        self._resume_free_nav = False
+        self._stop_reason = ''
+        self._recovery_cause = None
+        self._retry_wait_until = self._last_slot_poll = 0.0
+        self._slot_wait_why = ''
+        self._slot_operator_notified = False
+        self._pick_phase = S_SAMPLING
+        self._pm_sampling_applied = self._detector_filter_applied = False
+        self._retries = self._approach_retries = self._drop_retries = 0
+        self._detector_restarts = self._start_refusals = self._empty_scans = 0
+        self._terminal_after_home, self._terminal_reason = DONE, ''
+
+    def _resume_blocked(self):
+        if self._state != 'RECOVERY' or not self._resume_state:
+            return 'No supervisor recovery checkpoint'
+        if getattr(self, '_discard_requested', False):
+            return 'Mission cancellation is pending'
+        if getattr(self, '_tick_inflight', False):
+            return 'Previous mission step has not ended'
+        now = time.monotonic()
+        future = getattr(self, '_recovery_stop_future', None)
+        if future is None or not future.done():
+            return 'Waiting for pallet STOP response; retry Stop if its service was unavailable'
+        try:
+            if not future.result().success:
+                return 'Pallet STOP was not acknowledged; retry Stop'
+        except Exception:
+            return 'Pallet STOP failed; retry Stop'
+        if any(not f.done() for f in self._navigation_stop_requests):
+            return 'Waiting for earlier navigation STOP requests'
+        if getattr(self, '_recovery_cancel_future', None) is not None and not self._recovery_cancel_future.done():
+            return 'Waiting for navigation cancel response'
+        if getattr(self, '_manager_stop_request', None) is not None and not self._manager_stop_request.done():
+            return 'Waiting for mission_manager STOP acknowledgement'
+        if self._manager_busy is not False or self._manager_status_t < self._recovery_started:
+            return 'Waiting for mission_manager to release pending navigation'
+        if getattr(self, '_mission_trigger_pending', False):
+            return 'Waiting for the previous mission trigger to finish'
+        if not navigation_stopped(self._nav_goal_active, self._nav_status_t, self._recovery_started,
+                                  getattr(self, '_recovery_cancel_future', None)):
+            return 'Waiting for Nav2 idle status'
+        if (not self._robot_stopped(now) or self._recovery_still_since is None
+                or now - self._recovery_still_since < float(self.p['arrive_settle_s'])):
+            return 'Waiting for fresh odometry and a stationary robot'
+        if (now - self._pm_status_t > 1.5 or self._pm_status_t < self._recovery_started
+                or not isinstance(self._pm_cargo, bool)):
+            return 'Waiting for fresh pallet/cargo status after Stop'
+        if self._pm_session_id != self._recovery_pm_session:
+            return 'Pallet node restarted during recovery; inspect and reset mission'
+        if (self._pm_recovery or {}).get('stop_pending'):
+            return 'Waiting for all child STOP requests to finish'
+        if self._route_loader is None or now - self._route_path_last_received > 6.0:
+            return 'Route graph missing or stale'
+        if self._route_path_loaded != self._recovery_route:
+            return 'Route changed since recovery checkpoint'
+        if 'stop_confirmed' in (self._pm_recovery or {}) and self._pm_recovery['stop_confirmed'] is not True:
+            return 'Pallet/lift stop is not confirmed'
+        origin = self._recovery_origin
+        if origin == GOTO_PICK and self._pm_cargo is not False:
+            return 'Cannot resume a pick navigation while carrying cargo'
+        if origin == GOTO_D and self._pm_cargo is not True:
+            return 'Cannot resume shelf navigation without confirmed cargo'
+        cp = (self._pm_recovery or {}).get('checkpoint')
+        if origin in (PICKING, DROPPING) and cp:
+            if not self._pm_recovery.get('available'):
+                return self._pm_recovery.get('reason') or 'Pallet operation cannot resume'
+        elif origin == PICKING and self._pm_state not in ('IDLE', 'READY', 'CARRYING'):
+            return 'No recoverable PICK operation; inspect robot'
+        elif origin == DROPPING and self._pm_state not in ('CARRYING', DONE):
+            return 'No recoverable DROP operation; inspect robot'
+        if origin in (GOTO_PICK, PICKING) and not self._pm_cargo and not self._camera_ok():
+            return 'Camera is not ready'
+        return ''
+
+    def _srv_resume(self, req, res):
+        with self._transition_lock:
+            if self._resume_inflight:
+                res.success, res.message = False, 'Resume is already pending'
+                return res
+            self._resume_inflight = True
+        try:
+            return self._resume_operation(req, res)
+        finally:
+            self._resume_inflight = False
+
+    def _resume_operation(self, req, res):
+        resume_epoch = self._mission_epoch
+        reason = self._resume_blocked()
+        if reason:
+            self.get_logger().warning(f'Auto Resume rejected run={self._run_id}: {reason}')
+            res.success, res.message = False, reason
+            return res
+        recovery_started = self._recovery_started
+        origin = self._recovery_origin
+        state = self._resume_state
+        cp = (self._pm_recovery or {}).get('checkpoint')
+        if origin in (PICKING, DROPPING):
+            state = origin  # finish the interrupted child before considering cargo/navigation
+            if cp:
+                cli = self._service_client(Trigger, f'/{self.p["pallet_mission_node"]}/resume')
+                result = self._call_service_result(cli, Trigger.Request(), timeout=3.0,
+                                                   on_late=lambda _: self._request_recovery_stop())
+                if self._recovery_started != recovery_started:
+                    self._request_recovery_stop()
+                    res.success, res.message = False, 'Resume interrupted by a newer Stop'
+                    return res
+                if result is None or not result.success:
+                    if result is None:
+                        self._request_recovery_stop()
+                    res.success, res.message = False, result.message if result else 'Pallet Resume unconfirmed; STOP requested'
+                    return res
+                self._await_resume_checkpoint = cp['id']
+                self._go_called = cp['state'] not in ('READY', 'DETECTING')
+                if origin == DROPPING and cp['state'] == 'CARRYING':
+                    self._go_called = False
+                self._detect_on_called = cp['state'] == 'DETECTING'
+                self._pick_phase = S_SAMPLING if cp['state'] == 'DETECTING' else S_APPROACHING
+                self._pm_state = None
+            elif origin == PICKING:
+                self._go_called = self._pm_state == 'CARRYING'
+                self._detect_on_called = False
+                self._pick_phase = S_APPROACHING if self._pm_state == 'READY' else S_SAMPLING
+            else:
+                self._go_called = self._pm_state == DONE
+        else:
+            self._triggered = False
+        with self._transition_lock:
+            if resume_epoch != self._mission_epoch:
+                res.success, res.message = False, 'Resume interrupted by a newer stop'
+                return res
+            self._resume_free_nav = bool(self._mission_nav_status and self._mission_nav_status.get('state') == 'ABORTED')
+            self._mission_epoch += 1
+            self._resume_revision += 1
+            self._stop_confirmed = False
+            self._cancel_requested = False
+            self._mission_nav_status = None
+            self._mission_nav_expected = None
+            self._mission_nav_consumed_t = 0.0
+            self._near_t0 = None
+            self._resume_state = None
+            self._set_state(state, 'Resumed interrupted operation; completed steps and budgets retained')
+            res.success, res.message = True, 'resumed'
+            return res
 
     def _srv_reset(self, req, res):
         if self._state not in (IDLE, STOPPED, 'RECOVERY', 'DONE', 'FAILED'):
@@ -625,6 +1028,7 @@ class MissionSupervisor(Node):
         elif 'cargo=unknown' in result.message:
             self._pm_cargo = None
 
+        self._clear_auto_cycle()
         self._pick_phase = S_SAMPLING
         self._detect_on_called = False
         self._go_called = False
@@ -645,7 +1049,7 @@ class MissionSupervisor(Node):
         self._slot_wait_why = ''
         self._slot_operator_notified = False
         self._set_state(IDLE, 'Mission reset by operator entering MANUAL')
-        res.success, res.message = True, 'Mission reset; physical cargo/lift state preserved'
+        res.success, res.message = True, 'Mission reset; cargo state cleared, lift position preserved'
         return res
 
     # ==================================================================
@@ -789,6 +1193,17 @@ class MissionSupervisor(Node):
             d = json.loads(msg.data)
         except Exception:
             return
+        same_session = self._pm_session_id == d.get('session_id')
+        if (same_session and self._await_resume_checkpoint is not None
+                and d.get('last_resumed_checkpoint_id', 0) < self._await_resume_checkpoint):
+            return
+        if (same_session and self._go_called and self._await_operation_after is not None
+                and d.get('operation_id', -1) <= self._await_operation_after):
+            return
+        self._await_resume_checkpoint = None
+        self._pm_operation_id = d.get('operation_id', -1)
+        self._pm_session_id = d.get('session_id')
+        self._pm_recovery = d.get('recovery')
         self._pm_state = d.get('state')
         self._pm_phase = d.get('phase')
         self._pm_lift = d.get('lift_cm')
@@ -798,6 +1213,7 @@ class MissionSupervisor(Node):
         self._pm_cargo_why = d.get('cargo_why') or ''
         self._pm_cargo = d.get('cargo')
         self._pm_fail_phase = d.get('fail_phase')
+        self._pm_insertion_only = d.get('insertion_only') is True
         self._pm_msg = d.get('msg') or ''
         self._pm_status_t = time.monotonic()
 
@@ -808,7 +1224,13 @@ class MissionSupervisor(Node):
         twist = msg.twist.twist
         self._odom_linear_speed = math.hypot(twist.linear.x, twist.linear.y)
         self._odom_angular_speed = abs(twist.angular.z)
-        self._odom_t = time.monotonic()
+        now = time.monotonic()
+        previous = self._odom_t
+        self._odom_t = now
+        if (now - previous > 0.5 or not self._robot_stopped(now)):
+            self._recovery_still_since = None
+        elif self._recovery_still_since is None:
+            self._recovery_still_since = now
 
     def _robot_stopped(self, now: float) -> bool:
         """Require fresh odometry and low measured speed before pallet detection."""
@@ -823,8 +1245,8 @@ class MissionSupervisor(Node):
 
     def _navigation_idle(self, now: float) -> bool:
         """Only hand control to pallet_mission after the Nav2 goal has ended."""
-        return (self._nav_status_t > 0.0 and now - self._nav_status_t <= 2.0
-                and self._nav_goal_active is False)
+        return (self._nav_status_t > 0.0 and self._nav_goal_active is False
+                and not any(not f.done() for f in self._navigation_stop_requests))
 
     def _on_nav_status(self, msg: GoalStatusArray):
         # GoalStatus constants: ACCEPTED=1, EXECUTING=2, CANCELING=3.
@@ -917,7 +1339,9 @@ class MissionSupervisor(Node):
         self._resume_state = DROPPING
 
     def _can_auto_retry(self, used: int) -> bool:
-        return (used < int(self.p['approach_retries'])
+        return (not (self._pm_recovery or {}).get('checkpoint')
+                and used < int(self.p['approach_retries'])
+                and not self._pm_insertion_only
                 and self._pm_fail_phase in self.SAFE_RETRY_PHASES
                 and not self._cancel_requested)
 
@@ -1019,78 +1443,34 @@ class MissionSupervisor(Node):
         return sid, self._shelf_model._slot_by_id[sid].tf_frame, ''
 
     # ==================================================================
-    # Nhanh lay (P_1 -> P_2) - chi bat khi graph THAT co edge
+    # Diem lay duy nhat (P_1) - da bo nhanh lay thu hai (P_2/D_2).
     # ==================================================================
-    def _p2_available(self) -> bool:
-        """P_2 co dung duoc khong? Chi khi graph dang chay THAT co edge noi P_2.
-
-        P_2 la diem lay thu hai. Khi graph khong noi P_2 voi node nao (node
-        bi bo troi trong YAML, hoac graph hien tai khong co canh P_2) thi
-        P_2 KHONG duoc dung -> nhanh nay tat hoan toan, robot chi lay o P_1.
-
-        Doc lai moi lan quyet dinh (khong cache) de sua graph roi restart lai
-    """
-        loader = self._route_loader
-        if loader is None:
-            return False
-        try:
-            name = loader.resolve(self.p['pick_dest_2'])
-            if not name:
-                return False
-            return bool(loader.get_connected_nodes(name))
-        except Exception as e:
-            self.get_logger().warn(f'[pick] khong kiem tra duoc edge cua '
-                                   f'{self.p["pick_dest_2"]}: {e}')
-            return False
-
     def _build_pick_queue(self) -> list:
-        """Hang doi diem lay cho chu ky hien tai.
-
-        Luon bat dau tu `pick_dest` (mac dinh P_1). Neu P_2 co edge thi them
-        P_2 vao CUOI hang doi -> khi P_1 het pallet, robot moi di sang P_2.
-        """
-        queue = [self.p['pick_dest']]
-        if self._p2_available() and self.p['pick_dest_2'] not in queue:
-            queue.append(self.p['pick_dest_2'])
-        return queue
+        """Hang doi diem lay cho chu ky: luon chi [P_1] (diem lay duy nhat)."""
+        return [self.p['pick_dest']]
 
     def _current_pick_dest(self):
-        """Diem lay dang chay (theo hang doi)."""
+        """Diem lay duy nhat."""
         if not self._pick_queue:
             return self.p['pick_dest']
-        idx = min(self._pick_idx, len(self._pick_queue) - 1)
-        return self._pick_queue[idx]
-
-    def _next_pick_dest(self):
-        """Diem lay tiep theo trong hang doi, hoac None neu het."""
-        nxt = self._pick_idx + 1
-        if nxt < len(self._pick_queue):
-            return self._pick_queue[nxt]
-        return None
+        return self._pick_queue[0]
 
     def _mission_for_pick_dest(self, dest: str) -> str:
         """Mission de di toi `dest`.
 
-        - Diem dau tien cua chu ky (P_1): dung `pick_mission` (HOME -> P_1).
-        - Diem thu hai (P_2) khi dang o P_1: dung `pick_mission_2_from_p1`
-          (P_1 -> P_2) de khong phai quay ve HOME.
-        - Diem thu hai khi bat dau chu ky moi (tu D_1): dung `d1_to_p1` /
-          `d1_to_p2` neu co, nguoc lai `pick_mission`.
+        - Diem lay (P_1) khi bat dau chu ky (tu HOME): dung `pick_mission`.
+        - Khi bat dau chu ky moi (tu D_1 sau khi da dat len ke): dung
+          `d1_to_p1` neu co, nguoc lai `pick_mission`.
         """
         if dest == self.p['pick_dest']:
             return self.p['pick_mission']
-        # Diem thu hai.
-        if self._pick_idx > 0:
-            return self.p['pick_mission_2_from_p1']
         return self._mission_from_d1(dest)
 
     @staticmethod
     def _mission_from_d1(dest: str) -> str:
         """Return the registered mission ID for traveling from D_1 to a pick node."""
-        # Mission service IDs omit the underscore in the numbered node name:
-        # mission_manager registers d1_to_p1 / d1_to_p2, while graph nodes are
-        # named P_1 / P_2. Do not derive the service ID with lower() alone.
-        d1_missions = {'P_1': 'd1_to_p1', 'P_2': 'd1_to_p2'}
+        # Mission service ID d1_to_p1 (khong bien doi ten bang lower()).
+        d1_missions = {'P_1': 'd1_to_p1'}
         return d1_missions.get(dest, '')
 
     def _start_return_home(self, why):
@@ -1171,7 +1551,7 @@ class MissionSupervisor(Node):
     def _do_goto_d(self, now):
         if self._shelf_expired(now):
             try:
-                self._cancel_cli.call_async(CancelGoal.Request())
+                self._request_owned_navigation_stop()
             except Exception:
                 pass
             self._set_state('RECOVERY', 'Du lieu cam bien ke stale/mat ket noi tren duong toi D_1')
@@ -1182,7 +1562,7 @@ class MissionSupervisor(Node):
             sid, frame, why = self._select_drop_slot_for(self._pm_cargo_type)
             if sid is None:
                 try:
-                    self._cancel_cli.call_async(CancelGoal.Request())
+                    self._request_owned_navigation_stop()
                 except Exception:
                     pass
                 # Dang CAM PALLET + ke khong con o phu hop -> cho tai D_1,
@@ -1215,7 +1595,7 @@ class MissionSupervisor(Node):
         if dest is None or pose is None:
             if now - self._t_state > 10.0:
                 try:
-                    self._cancel_cli.call_async(CancelGoal.Request())
+                    self._request_owned_navigation_stop()
                 except Exception:
                     pass
                 self._set_state('RECOVERY', 'Khong doc duoc pose D_1/robot')
@@ -1233,7 +1613,7 @@ class MissionSupervisor(Node):
                     if now - self._stuck_t0 > float(self.p['nav_finish_wait_s']):
                         self.get_logger().warn('[GOTO_D] Xe da dung o D_1 nhung Nav2 goal chua ket thuc -> huy goal')
                         try:
-                            self._cancel_cli.call_async(CancelGoal.Request())
+                            self._request_owned_navigation_stop()
                         except Exception:
                             pass
                         self._stuck_t0 = None
@@ -1260,7 +1640,7 @@ class MissionSupervisor(Node):
             self._near_t0 = None
         if now - self._t_state > float(self.p['goto_timeout_s']):
             try:
-                self._cancel_cli.call_async(CancelGoal.Request())
+                self._request_owned_navigation_stop()
             except Exception:
                 pass
             self._set_state('RECOVERY', 'Di toi D_1 qua timeout; dang giu pallet')
@@ -1293,13 +1673,10 @@ class MissionSupervisor(Node):
                 Parameter('drop_slot', Parameter.Type.STRING, sid).to_parameter_msg(),
                 Parameter('cargo_type_override', Parameter.Type.STRING, '').to_parameter_msg(),
             ]
-            fut = cli.call_async(req)
-            end = time.monotonic() + 2.0
-            while not fut.done() and time.monotonic() < end:
-                time.sleep(0.01)
+            result = self._call_service_result(cli, req, timeout=2.)
             if self._cancel_requested:
                 return
-            if not fut.done() or not all(x.successful for x in fut.result().results):
+            if result is None or not all(x.successful for x in result.results):
                 self._set_state('RECOVERY', 'Khong dat duoc drop_slot cho pallet_mission')
                 self._resume_state = DROPPING
                 return
@@ -1309,14 +1686,12 @@ class MissionSupervisor(Node):
                 return
             if self._cancel_requested:
                 return
-            fut = drop.call_async(Trigger.Request())
-            end = time.monotonic() + 3.0
-            while not fut.done() and time.monotonic() < end:
-                time.sleep(0.01)
+            self._await_operation_after = self._pm_operation_id
+            result = self._call_service_result(drop, Trigger.Request(), timeout=3.)
             if self._cancel_requested:
                 return
-            if not fut.done() or not fut.result().success:
-                why = fut.result().message if fut.done() else 'service khong tra loi trong 3s'
+            if result is None or not result.success:
+                why = result.message if result else 'service khong tra loi trong 3s'
                 self._drop_refused(now, f'Drop chua khoi dong: {why}')
                 return
             self._start_refusals = 0
@@ -1362,8 +1737,20 @@ class MissionSupervisor(Node):
             self._set_state('RECOVERY', 'Drop FAILED; dung tai checkpoint, kiem tra vi tri pallet '
                                         f'(pha loi: {self._pm_fail_phase})')
             self._resume_state = DROPPING
+        elif self._pm_state == STOPPED:
+            self._set_state('RECOVERY', 'DROP stopped; inspect pallet and staging before Resume')
+            self._resume_state = DROPPING
         elif now - self._t_state > float(self.p.get('drop_timeout_s', 360.0)):
-            self._set_state('RECOVERY', 'Drop timeout; can kiem tra pallet va lift truoc Resume')
+            # DROP now owns a Nav2 staging leg as well as local/lift actions.
+            # Stop the child before releasing supervision on this timeout.
+            try:
+                self._request_owned_navigation_stop()
+            except Exception as e:
+                self.get_logger().warn(f'DROP timeout Nav2 cancel failed: {e}')
+            cli = self._service_client(Trigger, f'/{pm}/stop')
+            result = self._call_service_result(cli, Trigger.Request(), timeout=1.0)
+            stop_msg = 'stop requested' if result is not None and result.success else 'stop unconfirmed'
+            self._set_state('RECOVERY', f'Drop timeout ({stop_msg}); can kiem tra pallet va lift truoc Resume')
             self._resume_state = DROPPING
 
     def _do_return_home(self, now):
@@ -1379,7 +1766,7 @@ class MissionSupervisor(Node):
             return
         if now - self._t_state > float(self.p['goto_timeout_s']):
             try:
-                self._cancel_cli.call_async(CancelGoal.Request())
+                self._request_owned_navigation_stop()
             except Exception:
                 pass
             self._set_state('RECOVERY', 'Ve HOME qua timeout; da yeu cau huy goal Nav2')
@@ -1410,6 +1797,20 @@ class MissionSupervisor(Node):
                         self._set_state(DONE, f'Ve HOME xong; da dat {self._cycle} pallet len ke')
 
     def _tick(self):
+        if self._state == 'STOPPING':
+            self._advance_stop()
+            return
+        if self._cancel_requested:
+            return
+        self._tick_inflight = True
+        self._tick_context.epoch = self._mission_epoch
+        try:
+            self._run_mission_tick()
+        finally:
+            self._tick_context.epoch = None
+            self._tick_inflight = False
+
+    def _run_mission_tick(self):
         now = time.monotonic()
 
         self._handle_mission_nav_result()
@@ -1430,7 +1831,7 @@ class MissionSupervisor(Node):
     def _do_goto_pick(self, now):
         if self._shelf_expired(now):
             try:
-                self._cancel_cli.call_async(CancelGoal.Request())
+                self._request_owned_navigation_stop()
             except Exception:
                 pass
             self._set_state('RECOVERY', 'Du lieu cam bien ke stale/mat ket noi truoc khi di pick')
@@ -1462,7 +1863,7 @@ class MissionSupervisor(Node):
         if dest is None or pose is None:
             if now - self._t_state > 10.0:
                 try:
-                    self._cancel_cli.call_async(CancelGoal.Request())
+                    self._request_owned_navigation_stop()
                 except Exception:
                     pass
                 self._set_state('RECOVERY', f'Khong doc duoc pose (dest={dest is not None}, '
@@ -1492,7 +1893,7 @@ class MissionSupervisor(Node):
             self._near_t0 = None
         if now - self._t_state > float(self.p['goto_timeout_s']):
             try:
-                self._cancel_cli.call_async(CancelGoal.Request())
+                self._request_owned_navigation_stop()
             except Exception:
                 pass
             self._set_state('RECOVERY', f'Ve {self._active_dest} qua thoi gian '
@@ -1619,23 +2020,11 @@ class MissionSupervisor(Node):
                             return
                         self._empty_scans += 1
                     if self._empty_scans >= int(self.p['no_pallet_retries']):
-                        next_dest = self._next_pick_dest()
-                        # Kiem tra lai edge ngay tai thoi diem re nhanh; graph
-                        # khong con edge thi bo qua P_2 va ket thuc chu ky.
-                        if (next_dest == self.p['pick_dest_2']
-                                and self._p2_available()):
-                            self._pick_idx += 1
-                            self._active_dest = next_dest
-                            self._active_mission = self.p['pick_mission_2_from_p1']
-                            self._triggered, self._near_t0 = False, None
-                            self._set_state(
-                                GOTO_PICK,
-                                f'{self._current_pick_dest()} het pallet -> di toi '
-                                f'{next_dest} bang {self._active_mission}')
-                        else:
-                            self._start_return_home(
-                                f'{self._active_dest} khong detect duoc pallet sau '
-                                f'{self._empty_scans} lan quet')
+                        # Diem lay duy nhat la P_1 (da bo nhanh thu hai P_2/D_2):
+                        # het pallet -> ket thuc chu ky, ve HOME.
+                        self._start_return_home(
+                            f'{self._active_dest} khong detect duoc pallet sau '
+                            f'{self._empty_scans} lan quet')
                     else:
                         self._pick_retry(res.message)
             return
@@ -1656,6 +2045,7 @@ class MissionSupervisor(Node):
                 return
             self._drop_slot_chosen = (sid, frame)
             cli = self._service_client(Trigger, f'/{pm}/go_to_pallet')
+            self._await_operation_after = self._pm_operation_id
             res = self._call_service_result(cli, Trigger.Request())
             if self._cancel_requested:
                 return
@@ -1723,9 +2113,7 @@ class MissionSupervisor(Node):
                 self._resume_state = GOTO_D
                 return
             self._drop_slot_chosen = (sid, frame)
-            drop_mission = ('p2_to_d1'
-                            if self._current_pick_dest() == self.p['pick_dest_2']
-                            else self.p['drop_mission'])
+            drop_mission = self.p['drop_mission']
             self._active_mission, self._active_dest = drop_mission, 'D_1'
             self._triggered, self._near_t0 = False, None
             self._set_state(GOTO_D, f'Da pick pallet {ctype}; di toi D_1, o du kien {sid}')
@@ -1737,6 +2125,7 @@ class MissionSupervisor(Node):
     # ==================================================================
     # Status (web-ready: JSON duy nhat)
     # ==================================================================
+    @_state_locked
     def _publish_status(self):
         detector = self._detector_status or {}
         now = time.monotonic()
@@ -1754,13 +2143,16 @@ class MissionSupervisor(Node):
         route_stale = route_age > 6.0
         try:
             route_nodes = route_loader.get_all_node_names() if route_loader else []
-            p2_node = route_loader.resolve(self.p['pick_dest_2']) if route_loader else None
-            p2_connected_nodes = (route_loader.get_connected_nodes(p2_node)
-                                  if p2_node else [])
         except Exception:
-            route_nodes, p2_connected_nodes = [], []
+            route_nodes = []
+        # AUTO Start does not depend on cargo/fork heartbeat. A retained
+        # operation checkpoint, unresolved stop, or active Nav2 goal still blocks.
         can_start = (self._state in (IDLE, DONE, FAILED, STOPPED)
-                     and self._pm_cargo is not True)
+                     and not (self._pm_recovery or {}).get('checkpoint')
+                     and not self._discard_requested and not self._tick_inflight
+                     and self._nav_goal_active is not True)
+        stop_reason = self._stop_blocked() if self._state in ('STOPPING', 'RECOVERY') else ''
+        elapsed = self._elapsed_active_s + (max(0., now - self._active_since) if self._active_since is not None else 0.)
         # Milestone progress for the current pallet cycle. Nav2 route feedback
         # is combined with these phase boundaries in the web UI; Auto has no
         # fixed total number of pallet cycles, so this is per cycle.
@@ -1768,6 +2160,8 @@ class MissionSupervisor(Node):
                           and self._resume_state else self._state)
         progress_percent = None
         progress_phase = None
+        if self._state == 'STOPPING' and self._resume_state:
+            progress_state = self._resume_state
         if progress_state == GOTO_PICK:
             progress_percent, progress_phase = 0.0, 'to_pick'
         elif progress_state == PICKING:
@@ -1788,6 +2182,15 @@ class MissionSupervisor(Node):
         elif self._state == DONE:
             progress_percent, progress_phase = 100.0, 'complete'
         d = {
+            'supervisor_session_id': self._supervisor_session_id,
+            'run_id': self._run_id,
+            'revision': self._revision,
+            'resume_revision': self._resume_revision,
+            'elapsed_s': round(elapsed, 1),
+            'recovery_cause': self._recovery_cause,
+            'stop_confirmed': (self._state == 'RECOVERY' and not stop_reason or self._state == IDLE and self._stop_confirmed),
+            'cancel_pending': self._discard_requested,
+            'stop_reason': stop_reason or getattr(self, '_stop_reason', ''),
             'state': self._state,
             'msg': self._msg,
             'progress_percent': progress_percent,
@@ -1817,9 +2220,6 @@ class MissionSupervisor(Node):
                 'error': 'stale' if route_stale else self._route_path_error,
                 'age_s': round(route_age, 2) if self._route_path_last_received > 0.0 else None,
                 'nodes': route_nodes,
-                'pick_dest_2': self.p['pick_dest_2'],
-                'pick_dest_2_enabled': bool(p2_connected_nodes),
-                'pick_dest_2_connected_nodes': p2_connected_nodes,
             },
             'pick_queue': self._pick_queue[self._pick_idx:],
             'waiting_slot': self._state == WAITING_SLOT,
@@ -1864,6 +2264,7 @@ class MissionSupervisor(Node):
             'pm_live': self._pm_live,
             'pm_msg': self._pm_msg,
             'pm_fail_phase': self._pm_fail_phase,
+            'pm_insertion_only': self._pm_insertion_only,
             'cargo_why': self._pm_cargo_why,
             'pm_samples': self._pm_samples,
             'pm_min_samples': int(self.p['pm_min_samples']),
@@ -1874,7 +2275,9 @@ class MissionSupervisor(Node):
                 if self._mission_nav_status else None,
             'odom_fresh': self._odom_t > 0.0 and now - self._odom_t <= 0.5,
             'robot_stopped': self._robot_stopped(now),
-            'resume_available': self._state == 'RECOVERY' and bool(self._resume_state),
+            'resume_available': self._state == 'RECOVERY' and not self._resume_inflight and not self._resume_blocked(),
+            'resume_reason': self._resume_blocked() if self._state == 'RECOVERY' else '',
+            'operation_checkpoint': (self._pm_recovery or {}).get('checkpoint'),
             'resume_state': self._resume_state,
             'retries': {
                 'pick': self._retries,

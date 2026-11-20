@@ -30,23 +30,8 @@ poses:
           y: 0.0
           z: 0.0
           w: 1.0
-  P_2:
-    id: 2
-    pose_stamped:
-      header:
-        frame_id: map
-      pose:
-        position:
-          x: 1.881
-          y: -0.131
-          z: 0.0
-        orientation:
-          x: 0.0
-          y: 0.0
-          z: -0.7071080798594735
-          w: 0.7071054825112363
   D_1:
-    id: 3
+    id: 2
     pose_stamped:
       header:
         frame_id: map
@@ -60,6 +45,21 @@ poses:
           y: 0.0
           z: 0.9999999999932537
           w: -3.673205103346574e-06
+  D_2:
+    id: 3
+    pose_stamped:
+      header:
+        frame_id: map
+      pose:
+        position:
+          x: 1.881
+          y: -0.131
+          z: 0.0
+        orientation:
+          x: 0.0
+          y: 0.0
+          z: -0.7071080798594735
+          w: 0.7071054825112363
   J3:
     id: 4
     pose_stamped:

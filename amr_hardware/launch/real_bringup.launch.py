@@ -190,8 +190,12 @@ def generate_launch_description():
             'baudrate': ParameterValue(esp32_baudrate, value_type=int),
             'wheel_radius': 0.0509,
             'wheelbase': 0.4813,
+            'wheel_counts_per_rev': 3960.0,
+            'lift_counts_per_rev': 1320.0,  # dự kiến; xác nhận bằng đo encoder thực tế
+            'lift_screw_pitch_mm': 4.0,
             'odom_scale': 1.0,   # hieu chinh quang duong odometry (chi tinh tien)
             'publish_tf': False,
+            'drive_command_timeout': 0.0,  # 0 = khong timeout RPM; twist_mux phan xu ly source Nav2/mission
         }],
     )
 

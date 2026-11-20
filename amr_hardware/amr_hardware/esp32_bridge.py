@@ -24,10 +24,19 @@ class ESP32Bridge(Node):
         self.declare_parameter('baudrate', 921600)
         self.declare_parameter('wheel_radius', 0.0509)    
         self.declare_parameter('wheelbase', 0.4813)         
-        self.declare_parameter('counts_per_rev', 3960.0)  # 3960 xung/vòng
+        self.declare_parameter('wheel_counts_per_rev', 3960.0)  # CPR hai bánh xe
+        # Khớp firmware imu_3ecoder: 11 xung/vòng motor x 30:1 x quadrature x4.
+        # Firmware cũng ghi cần xác nhận bằng một vòng trục ra thực tế.
+        self.declare_parameter('lift_counts_per_rev', 1320.0)
+        self.declare_parameter('lift_screw_pitch_mm', 4.0)
         self.declare_parameter('max_rpm', 110.0)           # Tốc độ tối đa 110 RPM
-        self.declare_parameter('drive_command_timeout', 0.30)
-        self.declare_parameter('lift_velocity_timeout', 0.30)
+        # 0 disables the host-side drive deadman. The mux owns source timeouts;
+        # this parameter remains available for deployments that want a second
+        # hardware-bridge watchdog.
+        self.declare_parameter('drive_command_timeout', 0.0)
+        # 0 disables the host-side lift velocity deadman for manual M± control.
+        # Explicit M0 / stop commands still stop the lift.
+        self.declare_parameter('lift_velocity_timeout', 0.0)
         self.declare_parameter('gyro_scale_z', 0.977)
         # He so hieu chinh quang duong cho ODOMETRY (thuc/do, trung binh 11 lan chay = 1.054).
         # Chi ap len dc (tinh tien); KHONG dung cho lenh cmd_vel->RPM va KHONG dung cho yaw
@@ -48,12 +57,22 @@ class ESP32Bridge(Node):
         # Doi khi dang chay: ros2 param set /esp32_bridge shelf_stable_s 8.0
         self.declare_parameter('shelf_stable_s', 1.0)
         self.declare_parameter('joint_names', ['front_encoder_wheel_left_joint', 'front_encoder_wheel_right_joint', 'encoder_lift_joint'])
+        # Sau khi ket noi ESP32 thanh cong, choi delay (s) roi gui lenh HOME
+        # de ha lift ve vi tri gan nhat (0). Chi gui khi telemetry van moi.
+        self.declare_parameter('startup_lift_home', True)
+        self.declare_parameter('startup_lift_home_delay_s', 3.0)
 
         self.port = self.get_parameter('port').value
         self.baudrate = self.get_parameter('baudrate').value
+        self.startup_lift_home = bool(self.get_parameter('startup_lift_home').value)
+        self.startup_lift_home_delay = max(0.5, float(self.get_parameter('startup_lift_home_delay_s').value))
         self.wheel_radius = self.get_parameter('wheel_radius').value
         self.wheelbase = self.get_parameter('wheelbase').value
-        self.cpr = self.get_parameter('counts_per_rev').value
+        self.wheel_cpr = float(self.get_parameter('wheel_counts_per_rev').value)
+        self.lift_cpr = float(self.get_parameter('lift_counts_per_rev').value)
+        self.lift_screw_pitch_mm = float(self.get_parameter('lift_screw_pitch_mm').value)
+        if self.wheel_cpr <= 0.0 or self.lift_cpr <= 0.0 or self.lift_screw_pitch_mm <= 0.0:
+            raise ValueError('Wheel/lift CPR and lift_screw_pitch_mm must be positive')
         self.max_rpm = float(self.get_parameter('max_rpm').value)
         self.drive_command_timeout = float(self.get_parameter('drive_command_timeout').value)
         self.lift_velocity_timeout = float(self.get_parameter('lift_velocity_timeout').value)
@@ -97,9 +116,18 @@ class ESP32Bridge(Node):
         self._drive_timeout_reported = False
 
         self.ser = None
+        self._startup_home_timer = None
+        self._startup_home_sent = False
         if not self.connect_serial():
             self.get_logger().error('[FATAL] ESP32 Bridge startup FAILED. Serial not connected.')
             # Tiếp tục chạy để có thể debug, nhưng serial commands sẽ không hoạt động
+        elif self.startup_lift_home:
+            # Chờ ESP32 on dinh trong startup_lift_home_delay_s roi gui HOME
+            # (ha lift ve 0), chi gui 1 lan neu telemetry van moi.
+            self._startup_home_t0 = time.monotonic()
+            self._startup_home_timer = self.create_timer(0.5, self._startup_home_tick)
+            self.get_logger().info(
+                f'Startup lift HOME scheduled after {self.startup_lift_home_delay:.1f}s')
 
         # Publishers
         self.pub_imu = self.create_publisher(Imu, '/imu/data_raw', 10)
@@ -277,17 +305,50 @@ class ESP32Bridge(Node):
                 self.get_logger().error(f'Serial TX failed: {e}')
                 return False
 
+    def _startup_home_tick(self):
+        """One-shot: sau delay, gửi HOME (hạ lift về 0) nếu ESP32 vẫn ổn định.
+
+        Chỉ gửi khi telemetry (last PKT) còn tươi trong 2s — tránh gửi khi
+        ESP32 đã mất kết nối giữa chừng. Sau khi gửi (hoặc bỏ qua), hủy timer.
+        """
+        if self._startup_home_sent:
+            self._startup_home_timer.cancel()
+            return
+        now = time.monotonic()
+        if now - self._startup_home_t0 < self.startup_lift_home_delay:
+            return
+        with self.data_lock:
+            last_pkt = self.last_pkt_time
+        telemetry_fresh = last_pkt > 0.0 and (now - last_pkt) < 2.0
+        if not telemetry_fresh:
+            self.get_logger().warn(
+                'Skipping startup lift HOME: ESP32 telemetry stale/lost since connect')
+            self._startup_home_timer.cancel()
+            return
+        sent = self._serial_write(b'HOME\n')
+        self._startup_home_sent = True
+        self._startup_home_timer.cancel()
+        if sent:
+            self.get_logger().info('Startup: sent HOME (lower lift to home) to ESP32')
+
     def _send_drive_commands(self):
         """Gửi lệnh L/R liên tục mỗi 30Hz (từ publish_loop)."""
         now = time.monotonic()
         with self.command_lock:
-            if (self.last_drive_command_time == 0.0 or
-                    now - self.last_drive_command_time > self.drive_command_timeout):
+            timed_out = (self.drive_command_timeout > 0.0 and
+                         (self.last_drive_command_time == 0.0 or
+                          now - self.last_drive_command_time > self.drive_command_timeout))
+            if timed_out:
+                motion_was_requested = (
+                    abs(self.last_rpm_left) > 1e-3 or abs(self.last_rpm_right) > 1e-3)
                 self.last_rpm_left = 0.0
                 self.last_rpm_right = 0.0
-                if not self._drive_timeout_reported:
+                # A one-shot zero command on button release naturally expires
+                # after the deadman interval. Keep the stop behavior, but only
+                # warn when the watchdog actually cuts a nonzero drive target.
+                if motion_was_requested and not self._drive_timeout_reported:
                     self.get_logger().warn('Drive command timeout: forcing both wheel RPMs to zero')
-                    self._drive_timeout_reported = True
+                self._drive_timeout_reported = True
             left, right = self.last_rpm_left, self.last_rpm_right
         self._serial_write(f'L{left:.2f}\nR{right:.2f}\n'.encode('utf-8'))
 
@@ -315,7 +376,8 @@ class ESP32Bridge(Node):
     def _enforce_lift_deadman(self) -> None:
         now = time.monotonic()
         with self.command_lock:
-            expired = (self.lift_velocity_active and
+            expired = (self.lift_velocity_timeout > 0.0 and
+                       self.lift_velocity_active and
                        now - self.last_lift_velocity_command_time > self.lift_velocity_timeout)
             if expired:
                 self.lift_velocity_active = False
@@ -406,8 +468,8 @@ class ESP32Bridge(Node):
             battery_percent = float(p[6])
 
             # PKT mac dinh:
-            #   8 truong: PKT,el,er,em3,gz,dist_cm,batt,timestamp            (firmware cu)
-            #   9 truong: PKT,el,er,em3,gz,dist_cm,batt,timestamp,shelf      (firmware co ke)
+            #   8 truong: PKT,el,er,em3,gz,dist_cm,batt,timestamp (firmware cu)
+            #   9 truong: PKT,el,er,em3,gz,dist_cm,batt,timestamp,shelf
             # Cac truong khac (tog_yaw/tog_acc/tog_dist) lam lech index -> bo qua dist va ke.
             shelf = None
             if len(p) in (8, 9):
@@ -511,16 +573,16 @@ class ESP32Bridge(Node):
         js.header.stamp = now
         js.name = self.joint_names
         js.position = [
-            (el / self.cpr) * 2 * math.pi,
-            (er / self.cpr) * 2 * math.pi,
-            (em3 / self.cpr) * 0.004
+            (el / self.wheel_cpr) * 2 * math.pi,
+            (er / self.wheel_cpr) * 2 * math.pi,
+            (em3 / self.lift_cpr) * (self.lift_screw_pitch_mm / 1000.0)
         ]
         self.pub_js.publish(js)
 
         # 3. Publish Odometry Raw
         wheel_circ = 2 * math.pi * self.wheel_radius
-        dl = ((el - self.last_el) / self.cpr) * wheel_circ
-        dr = ((er - self.last_er) / self.cpr) * wheel_circ
+        dl = ((el - self.last_el) / self.wheel_cpr) * wheel_circ
+        dr = ((er - self.last_er) / self.wheel_cpr) * wheel_circ
         dt = (dr - dl) / self.wheelbase           # yaw: giu nguyen, khong nhan odom_scale
         dc = ((dl + dr) / 2.0) * self.odom_scale  # tinh tien: da hieu chinh
 

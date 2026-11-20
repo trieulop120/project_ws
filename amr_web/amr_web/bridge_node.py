@@ -18,8 +18,10 @@ import math
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import time
+from functools import wraps
 from typing import Optional, Tuple
 from ament_index_python.packages import get_package_share_directory
 
@@ -49,6 +51,7 @@ from amr_web.converters import (
 )
 from amr_web.web_server import create_app
 from amr_web.nav_bridge import NavBridge
+from amr_web.navigation_validation import valid_resource_id
 # History (HISTORY_RESULTS_PLAN.md §6): edge-triggered system events.
 # Import is guarded so a broken history package cannot kill the bridge.
 try:
@@ -82,6 +85,24 @@ def plan_qos():
     )
 
 
+def _guard_map_mutation(method):
+    @wraps(method)
+    def guarded(self, map_id, *args, **kwargs):
+        if not valid_resource_id(map_id):
+            return False, 'Invalid map identifier'
+        if not self._mission_ownership_lock.acquire(blocking=False):
+            return False, 'Mission busy'
+        try:
+            nav = self.get_nav_state()
+            if (nav.get('nav2_running') or nav.get('goal_active')) and (
+                    nav.get('map_id') is None or nav.get('map_id') == map_id):
+                return False, 'Map and routes are in use; stop their navigation session before editing'
+            return method(self, map_id, *args, **kwargs)
+        finally:
+            self._mission_ownership_lock.release()
+    return guarded
+
+
 class WebBridge(Node):
     """
     ROS 2 Web Bridge Node - Optimized for Overview Dashboard.
@@ -92,7 +113,16 @@ class WebBridge(Node):
         'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
         'WAITING_SLOT', 'RETURN_HOME',
     }
-    _CYCLE_BLOCKED_COMMANDS = _CYCLE_RUNNING | {'RECOVERY'}
+    _CYCLE_BLOCKED_COMMANDS = _CYCLE_RUNNING | {'RECOVERY', 'STOPPING'}
+    _RETRIEVAL_ACTIVE = {
+        'HOMING_LIFT', 'NAVIGATING_TO_D1', 'ALIGNING_TO_SLOT', 'LOADING_DETECTOR',
+        'DETECTING', 'PICKING', 'NAVIGATING_TO_D2', 'PLACING_AT_D2',
+        'RETURNING_HOME', 'CANCELING', 'RECOVERY',
+    }
+    _PALLET_ACTIVE = {
+        'DETECTING', 'NAVIGATING', 'SETTLING', 'ALIGNING', 'INSERTING',
+        'LIFTING', 'BACKING', 'HOMING', 'LOWERING',
+    }
 
     def __init__(self):
         super().__init__('web_bridge')
@@ -165,12 +195,31 @@ class WebBridge(Node):
         # us_cm,lift_cm,ts} piggybacked on the 1Hz system_status broadcast.
         self._mission_status = None
         self._mission_supervisor_status = None
+        self._pallet_retrieval_status = None
+        self._last_retrieval_state = None
+        self._retrieval_start_pending = False
+        self._mission_start_pending = False
+        self._web_stop_generation = 0
+        self._mission_ownership_lock = threading.Lock()
+        self._auto_stop_lock = threading.Lock()
+        # Serialize full Navigation shutdown separately from normal mission Cancel.
+        self._nav_session_stop_lock = threading.Lock()
+        self._nav_session_stopping = False
+        self._mission_status_changed = threading.Event()
+        self._auto_stop_target = None
+        self._auto_service_requests = []
+        # Recent Missions is history, not part of the current Nav2 session.
+        # Keep the latest 50 entries across Cancel, Stop and Bridge restart.
+        self._recent_missions_lock = threading.RLock()
+        self._recent_missions_path = os.path.expanduser('~/.ros/amr_web/recent_missions.json')
         self._recent_supervisor_missions = deque(maxlen=50)
+        self._load_recent_supervisor_missions()
         self._recent_mission_baseline_pending = False
         self._nav2_goal_active = {
             'navigate_to_pose': False,
             'navigate_through_poses': False,
         }
+        self._nav2_goal_status_ts = {key: 0.0 for key in self._nav2_goal_active}
         self._plan_received_t = 0.0
 
         # State Managers
@@ -273,7 +322,8 @@ class WebBridge(Node):
                 GoalStatusArray,
                 f'/{action_name}/_action/status',
                 lambda msg, name=action_name: self._on_nav2_goal_status(name, msg),
-                10,
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                           durability=DurabilityPolicy.TRANSIENT_LOCAL),
                 callback_group=self._cb_sensor)
         self._camera_sub = self.create_subscription(
             Image, self._camera_topic, self._on_camera_rgb, qos_profile=sensor_qos(),
@@ -290,13 +340,29 @@ class WebBridge(Node):
             String, self._mission_status_topic, self._on_mission_status, 10)
         self._mission_supervisor_status_sub = self.create_subscription(
             String, self._supervisor_status_topic, self._on_mission_supervisor_status, 10)
+        self._pallet_retrieval_status_sub = self.create_subscription(
+            String, '/pallet_retrieval/status', self._on_pallet_retrieval_status, 10)
         self._mission_start_client = self.create_client(Trigger, '/mission/start')
         self._mission_stop_client = self.create_client(Trigger, '/mission/stop')
+        self._mission_cancel_client = self.create_client(Trigger, '/mission/cancel')
         self._mission_reset_client = self.create_client(Trigger, '/mission/reset')
         self._mission_resume_client = self.create_client(Trigger, '/mission/resume')
         self._mission_params_client = self.create_client(
             SetParameters, '/mission_supervisor/set_parameters')
+        self._retrieval_params_client = self.create_client(
+            SetParameters, '/pallet_retrieval/set_parameters')
+        self._retrieval_start_client = self.create_client(
+            Trigger, '/pallet_retrieval/start')
+        self._retrieval_cancel_client = self.create_client(
+            Trigger, '/pallet_retrieval/cancel')
+        self._retrieval_resume_client = self.create_client(Trigger, '/pallet_retrieval/resume')
+        self._manager_stop_client = self.create_client(Trigger, '/mission_manager/stop')
+        self._manager_stop_request = None
+        self._pallet_resume_client = self.create_client(Trigger, '/pallet_mission/resume')
+        self._pallet_resume_pending = False
         self._pallet_stop_client = self.create_client(Trigger, '/pallet_mission/stop')
+        self._pallet_discard_client = self.create_client(Trigger, '/pallet_mission/discard_recovery')
+        self._confirm_empty_client = self.create_client(Trigger, '/pallet_mission/confirm_empty')
         self._lidar_sub = self.create_subscription(
             LaserScan, self._lidar_topic, self._on_lidar, qos_profile=sensor_qos(),
             callback_group=self._cb_sensor)
@@ -369,8 +435,11 @@ class WebBridge(Node):
             self._nav_bridge = None
 
     def _on_nav_session_end(self) -> None:
-        """Clear per-session dashboard caches without touching persistent history."""
-        self._mission_status = None
+        """Reset assistant session; only ROS may replace pallet/cargo ownership.
+
+        Nav2 exiting does not stop a pallet controller's independent timers.
+        Keep last-known active status as an interlock even if it becomes stale.
+        """
         llm = getattr(self, 'llm', None)
         if llm is not None:
             try:
@@ -483,13 +552,7 @@ class WebBridge(Node):
                     # plenty; the mission publishes at ~2Hz, we just forward
                     # the freshest parse). `stale` lets the UI dim when the
                     # mission node has gone quiet (stopped / not running).
-                    m = self._mission_status
-                    if m is not None:
-                        m = dict(m)
-                        m['stale'] = (now - m.get('ts', 0.0)) > 3.0
-                    system_status['mission'] = m
-                    supervisor = self.get_mission_supervisor_status()
-                    system_status['mission_supervisor'] = supervisor
+                    system_status.update(self.get_web_mission_status())
                     await self._ws_manager.broadcast(json.dumps(system_status))
                     # [history] Feed the edge-trigger monitor (plan §6).
                     if _HISTORY_OK:
@@ -650,17 +713,29 @@ class WebBridge(Node):
             return
         self._mission_status = {
             'state': d.get('state'),
+            'last_resumed_checkpoint_id': d.get('last_resumed_checkpoint_id'),
+            # AUTO already carries these through supervisor.pm_*; retain only
+            # the same diagnostics needed for standalone PICK/DROP as well.
+            'msg': d.get('msg'),
+            'fail_phase': d.get('fail_phase'),
+            'recovery': d.get('recovery'),
             'cargo': d.get('cargo'),       # None | True | False
             'us_cm': d.get('us_cm'),       # raw ultrasonic reading, cm (or None)
             'us_fresh': d.get('us_fresh') is True,
             'us_pick_confirmed': d.get('us_pick_confirmed') is True,
             'mode': d.get('mode'),         # pick | drop
+            'slot': (d.get('drop') or {}).get('slot'),
             'cargo_class': d.get('cargo_class'),   # medium | tall | unknown | None
             'cargo_type': d.get('cargo_type'),     # A | B | None
             'cargo_h_cm': d.get('cargo_h_cm'),     # measured box height, cm (or None)
             'lift_cm': d.get('lift_cm'),
             'ts': time.time(),
         }
+
+        if getattr(self, '_pallet_resume_pending', False):
+            resume_id = d.get('last_resumed_checkpoint_id', 0)
+            if resume_id >= getattr(self, '_pallet_resume_checkpoint_id', 0):
+                self._pallet_resume_pending = False
 
     def _on_mission_supervisor_status(self, msg: String) -> None:
         """Keep the full mission cycle payload for Web and LLM status views."""
@@ -670,17 +745,165 @@ class WebBridge(Node):
             return
         if isinstance(data, dict):
             previous = self._mission_supervisor_status
+            if (previous and data.get('supervisor_session_id') and
+                    data.get('supervisor_session_id') == previous.get('supervisor_session_id') and
+                    data.get('revision', 0) < previous.get('revision', 0)):
+                return
             if self._recent_mission_baseline_pending:
                 self._recent_mission_baseline_pending = False
-            elif previous:
+            elif previous and (not previous.get('supervisor_session_id') or
+                    not data.get('supervisor_session_id') or
+                    previous.get('supervisor_session_id') == data.get('supervisor_session_id')):
                 self._record_supervisor_mission(previous, data)
             self._mission_supervisor_status = {**data, 'ts': time.time()}
+            target = getattr(self, '_auto_stop_target', None)
+            if target is not None and self._auto_stop_complete(target):
+                self._auto_stop_target = None
+                self._mission_start_pending = False
+            changed = getattr(self, '_mission_status_changed', None)
+            if changed is not None:
+                changed.set()
+            if (data.get('state') in self._CYCLE_BLOCKED_COMMANDS or
+                    (data.get('state') in {'DONE', 'FAILED', 'STOPPED'} and
+                     (data.get('state'), data.get('msg')) !=
+                     getattr(self, '_mission_start_baseline', None))):
+                self._mission_start_pending = False
+            # A later Auto run replaces the previous retrieval result for all
+            # browsers, including clients that reconnect after Auto completes.
+            if data.get('state') in (
+                    'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
+                    'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY'):
+                retrieval = self._pallet_retrieval_status
+                if retrieval and retrieval.get('state') in (
+                        'DONE', 'FAILED', 'CANCELED', 'STOPPED'):
+                    self._pallet_retrieval_status = {**retrieval, 'superseded': True}
 
-    def _clear_recent_supervisor_missions(self) -> None:
-        """Start a fresh Recent Missions view for the next navigation session."""
-        self._recent_supervisor_missions.clear()
-        # The next supervisor payload establishes the new session baseline;
-        # do not turn a transition left over from the previous map into history.
+    def _on_pallet_retrieval_status(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            return
+        if isinstance(data, dict):
+            previous = self._pallet_retrieval_status or {}
+            old_state = previous.get('state')
+            new_state = data.get('state')
+            slot = str(data.get('slot') or previous.get('slot') or '').strip().upper()
+            labels = {
+                'HOMING_LIFT': 'Homing',
+                'NAVIGATING_TO_D1': 'Go to D_1',
+                'ALIGNING_TO_SLOT': f'Align with rack slot {slot}',
+                'LOADING_DETECTOR': 'Load pallet detector',
+                'DETECTING': f'Detect pallet at {slot}',
+                'PICKING': f'Retrieve pallet from {slot}',
+                'NAVIGATING_TO_D2': 'Go to D_2',
+                'PLACING_AT_D2': 'Place pallet at D_2',
+                'RETURNING_HOME': 'Return to HOME',
+            }
+            same_run = (not data.get('run_id') or data.get('run_id') == previous.get('run_id'))
+            resumed = same_run and (data.get('resume_revision') or 0) > (previous.get('resume_revision') or 0)
+            if resumed:
+                phase = data.get('recovery_from') or previous.get('recovery_from') or new_state
+                self._append_recent_mission({
+                    'time': datetime.now().strftime('%H:%M:%S'),
+                    'name': labels.get(phase, f'Retrieve pallet from {slot or "rack"}'),
+                    'status': 'Resumed', 'cycle': 0,
+                })
+            recovery_returned = new_state == 'RECOVERY' and previous.get('resuming') and not data.get('resuming')
+            if old_state != new_state or resumed or recovery_returned:
+                if old_state in labels and new_state not in (
+                        'FAILED', 'STOPPED', 'CANCELED', 'CANCELING', 'RECOVERY'):
+                    self._append_recent_mission({
+                        'time': datetime.now().strftime('%H:%M:%S'),
+                        'name': labels[old_state], 'status': 'Completed', 'cycle': 0,
+                    })
+                if new_state == 'RECOVERY' and not data.get('resuming'):
+                    phase = data.get('recovery_from') or old_state
+                    self._append_recent_mission({
+                        'time': datetime.now().strftime('%H:%M:%S'),
+                        'name': labels.get(phase, f'Retrieve pallet from {slot or "rack"}'),
+                        'status': 'Recovery Required', 'cycle': 0,
+                    })
+                elif new_state == 'FAILED':
+                    self._append_recent_mission({
+                        'time': datetime.now().strftime('%H:%M:%S'),
+                        'name': f'Retrieve pallet from {slot or "rack"}',
+                        'status': 'Failed', 'cycle': 0,
+                    })
+                elif new_state == 'DONE':
+                    self._append_recent_mission({
+                        'time': datetime.now().strftime('%H:%M:%S'),
+                        'name': f'Retrieve pallet from {slot or "rack"}',
+                        'status': 'Completed', 'cycle': 0,
+                    })
+                elif new_state == 'CANCELED':
+                    self._append_recent_mission({
+                        'time': datetime.now().strftime('%H:%M:%S'),
+                        'name': f'Retrieve pallet from {slot or "rack"}',
+                        'status': 'Canceled', 'cycle': 0,
+                    })
+            terminal = new_state in ('DONE', 'FAILED', 'CANCELED', 'STOPPED')
+            supervisor = self.get_mission_supervisor_status() or {}
+            auto_active = not supervisor.get('stale', True) and supervisor.get('state') in (
+                'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
+                'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY')
+            self._pallet_retrieval_status = {
+                **data, 'ts': time.time(),
+                'superseded': terminal and (bool(data.get('discarded')) or
+                    (same_run and previous.get('superseded', False)) or auto_active),
+            }
+            if new_state in self._RETRIEVAL_ACTIVE:
+                self._retrieval_start_pending = False
+            elif (new_state in ('DONE', 'FAILED', 'CANCELED', 'STOPPED') and
+                  (new_state, data.get('message')) !=
+                  getattr(self, '_retrieval_start_baseline', None)):
+                self._retrieval_start_pending = False
+
+    def _load_recent_supervisor_missions(self) -> None:
+        """Restore recent task outcomes after a Web Bridge restart."""
+        try:
+            with open(self._recent_missions_path, 'r', encoding='utf-8') as stream:
+                items = json.load(stream)
+            if not isinstance(items, list):
+                raise ValueError('Recent Missions file is not a list')
+            self._recent_supervisor_missions = deque(
+                (item for item in items[:50] if isinstance(item, dict)), maxlen=50)
+        except FileNotFoundError:
+            pass  # First launch, no previous history
+        except (OSError, ValueError, TypeError) as exc:
+            self.get_logger().warning(f'Cannot load Recent Missions history: {exc}')
+
+    def _append_recent_mission(self, item: dict) -> None:
+        """Append one completed milestone and persist the bounded history.
+
+        Not a mission ownership or safety signal. Persistence failure must never
+        interrupt a running robot mission.
+        """
+        with self._recent_missions_lock:
+            self._recent_supervisor_missions.appendleft(item)
+            folder = os.path.dirname(self._recent_missions_path)
+            temporary = None
+            try:
+                os.makedirs(folder, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                        mode='w', encoding='utf-8', dir=folder,
+                        prefix='.recent_missions_', suffix='.tmp',
+                        delete=False) as stream:
+                    temporary = stream.name
+                    json.dump(list(self._recent_supervisor_missions), stream, ensure_ascii=False, indent=2)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self._recent_missions_path)
+            except OSError as exc:
+                self.get_logger().warning(f'Cannot save Recent Missions history: {exc}')
+            finally:
+                if temporary is not None and os.path.exists(temporary):
+                    try:
+                        os.unlink(temporary)
+                    except OSError:
+                        pass
+
+    def _mark_recent_supervisor_session_boundary(self) -> None:
+        """Ignore one cross-session status transition WITHOUT erasing history."""
         self._recent_mission_baseline_pending = True
 
     @staticmethod
@@ -689,7 +912,7 @@ class WebBridge(Node):
         phase = (phase or '').upper()
         dest = (destination or '').upper()
         if phase == 'GOTO_PICK':
-            return {'P_1': 'Go to Pick 1', 'P_2': 'Go to Pick 2'}.get(
+            return {'P_1': 'Go to Pick (P_1)', 'D_2': 'Go to D_2'}.get(
                 dest, 'Go to pickup')
         if phase == 'PICKING':
             return 'Pick pallet'
@@ -704,11 +927,12 @@ class WebBridge(Node):
         mission = (name or '').lower()
         if mission == 'return_home':
             return 'Return to HOME'
-        if mission in {'p1_to_d1', 'p2_to_d1'}:
+        if mission in {'p1_to_d1', 'd2_to_d1'}:
             return 'Go to shelf (D_1)'
-        if mission in {'home_to_p1', 'home_to_p2', 'd1_to_p1', 'd1_to_p2',
-                        'p1_to_p2'}:
-            return 'Go to pickup'
+        if mission in {'home_to_p1', 'd1_to_p1'}:
+            return 'Go to Pick (P_1)'
+        if mission in {'home_to_d2', 'd1_to_d2', 'p1_to_d2'}:
+            return 'Go to D_2 (haul-out drop point)'
         return 'Pallet mission'
 
     def _record_supervisor_mission(self, previous: dict, current: dict) -> None:
@@ -738,6 +962,14 @@ class WebBridge(Node):
               and new_state == previous.get('resume_state')):
             outcome = 'Resumed'
             phase = previous.get('resume_state')
+        elif (old_state in ('STOPPING', 'RECOVERY') and new_state == 'IDLE'
+              and previous.get('run_id') and
+              (previous.get('cancel_pending') or
+               'canceled' in str(current.get('msg') or '').lower())):
+            # The final cancel travels STOPPING -> IDLE, not RUNNING -> STOPPED.
+            # Previous snapshot still knows the interrupted mission and phase.
+            outcome = 'Canceled'
+            phase = previous.get('resume_state') or old_state
         else:
             phase = None
         # Detection reaches READY before the physical approach/pick starts.
@@ -757,7 +989,7 @@ class WebBridge(Node):
             events.append(('Detect pallet', 'Completed', current.get('cycle') or {}))
         # appendleft reverses insertion order, so emit older events first.
         for label, event_status, cycle in events:
-            self._recent_supervisor_missions.appendleft({
+            self._append_recent_mission({
                 'time': datetime.now().strftime('%H:%M:%S'),
                 'name': label,
                 'status': event_status,
@@ -771,8 +1003,27 @@ class WebBridge(Node):
             return None
         result = dict(data)
         result['stale'] = (time.time() - result.get('ts', 0.0)) > 3.0
-        result['recent_missions'] = list(self._recent_supervisor_missions)
+        with self._recent_missions_lock:
+            result['recent_missions'] = list(self._recent_supervisor_missions)
+        target = getattr(self, '_auto_stop_target', None)
+        result['web_control_pending'] = target is not None
+        result['web_control_action'] = target['command'] if target else None
+        if target is not None:
+            result['can_start'] = False
         return result
+
+    def get_web_mission_status(self):
+        """Use the same three-source snapshot on connect and periodic updates."""
+        now = time.time()
+        def fresh_copy(status):
+            if status is None:
+                return None
+            return {**status, 'stale': now - status.get('ts', 0.0) > 3.0}
+        return {
+            'mission': fresh_copy(self._mission_status),
+            'mission_supervisor': self.get_mission_supervisor_status(),
+            'pallet_retrieval': fresh_copy(self._pallet_retrieval_status),
+        }
 
     def _is_navigation_goal_active(self) -> bool:
         """True for both Web Quick Goals and goals issued by Auto missions.
@@ -783,7 +1034,9 @@ class WebBridge(Node):
         """
         if self._nav_bridge and self._nav_bridge.is_goal_active():
             return True
-        if any(self._nav2_goal_active.values()):
+        now = time.monotonic()
+        if any(active and now - self._nav2_goal_status_ts.get(name, 0.0) <= 3.0
+               for name, active in self._nav2_goal_active.items()):
             return True
         status = self.get_mission_supervisor_status()
         if status is None or status.get('stale'):
@@ -794,20 +1047,126 @@ class WebBridge(Node):
         active_statuses = (1, 2, 3)  # ACCEPTED, EXECUTING, CANCELING
         self._nav2_goal_active[name] = any(
             goal.status in active_statuses for goal in msg.status_list)
+        self._nav2_goal_status_ts[name] = time.monotonic()
+        if self._nav_bridge:
+            self._nav_bridge.observe_goal_status(name, msg)
+        target = getattr(self, '_auto_stop_target', None)
+        if target is not None and self._auto_stop_complete(target):
+            self._auto_stop_target = None
+            self._mission_start_pending = False
 
     def mission_cycle_conflict(self):
-        """Return a reason when another web Nav2 goal would conflict with a cycle."""
+        """Guard external Web commands, including a start awaiting ROS status.
+
+        Last-known active states remain a control interlock when stale. This
+        does not arbitrate internal ROS commands issued by the mission owner.
+        """
+        if getattr(self, '_nav_session_stopping', False):
+            return 'Navigation session is stopping'
+        target = getattr(self, '_auto_stop_target', None)
+        if target is not None:
+            if not self._auto_stop_complete(target):
+                return 'Mission is stopping'
+            self._auto_stop_target = None
+        manager_stop = getattr(self, '_manager_stop_request', None)
+        if (getattr(self, '_mission_start_pending', False)
+                or (manager_stop is not None and not manager_stop.done())
+                or getattr(self, '_pallet_resume_pending', False) or self._retrieval_is_active()):
+            return 'Mission busy'
         status = self.get_mission_supervisor_status()
-        if status is None:
-            return None
-        state = status.get('state')
-        if status.get('stale') and state in self._CYCLE_BLOCKED_COMMANDS:
-            return 'Mission status is stale during an active cycle; verify the supervisor before sending another goal'
-        if status.get('stale'):
-            return None
-        if state in self._CYCLE_BLOCKED_COMMANDS:
-            return f'Mission cycle is active ({state}); stop it first'
+        if status and status.get('state') in self._CYCLE_BLOCKED_COMMANDS:
+            return 'Mission busy'
+        if ((self._mission_status or {}).get('state') in self._PALLET_ACTIVE
+                or ((self._mission_status or {}).get('recovery') or {}).get('stop_pending')):
+            return 'Mission busy'
         return None
+
+    def web_control_command(self, command: str, *args, client_ip=None):
+        """Serialize operator commands with mission starts, using the same lock.
+
+        Only the Web dispatcher calls this guard. ROS/LLM mission helpers keep
+        their existing wrappers; STOP/CANCEL/E-stop never wait for this lock.
+        """
+        if not self._mission_ownership_lock.acquire(blocking=False):
+            return False, 'Mission busy'
+        run_history = None
+        try:
+            if getattr(self._nav_bridge, '_stopping', False):
+                return False, 'Navigation session is stopping'
+            if command == 'set_op_mode':
+                # Preserve AUTO -> MANUAL's explicit stop/reset and recovery.
+                # A retrieval must first cancel through its coordinator.
+                if (getattr(self, '_mission_start_pending', False) or
+                        self._retrieval_is_active()):
+                    return False, 'Mission busy'
+                mode = args[0]
+                if mode == 'AUTO' and self._is_navigation_goal_active():
+                    return False, 'Finish or cancel navigation before switching to AUTO'
+                if mode == getattr(self._nav_bridge, '_op_mode', None):
+                    return True, 'ok'
+                if mode != 'MANUAL' and self.mission_cycle_conflict():
+                    supervisor = self.get_mission_supervisor_status() or {}
+                    # Changing the mode flag is needed before Resume from a
+                    # MANUAL recovery session; it does not resume robot motion.
+                    if (mode != 'AUTO' or supervisor.get('state') != 'RECOVERY' or
+                            (self._mission_status or {}).get('state') in self._PALLET_ACTIVE):
+                        return False, 'Mission busy'
+                return self.set_operating_mode(mode)
+            conflict = self.mission_cycle_conflict()
+            if conflict:
+                return False, conflict
+            if command in ('nav_goal', 'waypoint_mission', 'set_initial_pose', 'teleop', 'lift'):
+                if self._nav_bridge and self._nav_bridge._op_mode != 'MANUAL':
+                    return False, 'Switch to MANUAL before using manual controls'
+            if command in ('nav_goal', 'waypoint_mission') and _HISTORY_OK:
+                try:
+                    from amr_web.history import runs as run_history
+                    run_history.set_pending_client(client_ip)
+                except Exception as exc:
+                    self.get_logger().warning(f'Navigation history attribution failed: {exc}')
+            if command == 'start_slam':
+                if self.get_nav_state().get('nav2_running'):
+                    return False, 'Navigation is running; stop it first'
+                success = self.start_slam()
+                return success, 'SLAM started' if success else 'SLAM already running or failed'
+            # Manual lift/teleop must also yield to manual navigation.
+            if command in ('teleop', 'lift') and self._is_navigation_goal_active():
+                return False, 'Mission busy'
+            if command == 'start_navigation':
+                if self.get_slam_state():
+                    return False, 'SLAM is running – stop it first'
+                return self.start_navigation(*args)
+            if command == 'nav_goal':
+                if self._is_navigation_goal_active():
+                    return False, 'Navigation is pending, active or unconfirmed'
+                return self.send_nav_goal(*args)
+            if command == 'waypoint_mission':
+                if self._is_navigation_goal_active():
+                    return False, 'Navigation is pending, active or unconfirmed'
+                return self.send_waypoint_mission(*args)
+            if command == 'set_initial_pose':
+                if self._is_navigation_goal_active():
+                    return False, 'Mission busy'
+                return self.set_nav_initial_pose(*args)
+            if command == 'teleop':
+                if any(isinstance(value, bool) or not isinstance(value, (int, float)) or
+                       not math.isfinite(value) for value in args):
+                    return False, 'Velocity requires finite numeric values'
+                self.publish_cmd_vel(*args)
+                return True, 'ok'
+            if command == 'lift':
+                if args[0] not in ('UP', 'DOWN', 'HOME', 'SET_HEIGHT'):
+                    return False, 'Invalid lift action'
+                if args[0] == 'SET_HEIGHT' and (isinstance(args[1], bool) or
+                        not isinstance(args[1], (int, float)) or not math.isfinite(args[1]) or args[1] < 0):
+                    return False, 'Lift height must be a finite non-negative number'
+                self.publish_lift(*args)
+                return True, 'ok'
+            return False, 'Invalid command'
+        finally:
+            if run_history is not None:
+                run_history.set_pending_client(None)
+            self._mission_ownership_lock.release()
 
     def _mark_supervisor_reset(self) -> None:
         """Update the local cache before the next periodic supervisor status."""
@@ -823,7 +1182,7 @@ class WebBridge(Node):
             }
 
     @staticmethod
-    def _call_service_wait(client, request, timeout_s=3.0):
+    def _call_service_wait(client, request, timeout_s=3.0, on_future=None):
         """Wait for a service result from a non-ROS worker thread."""
         if not client.wait_for_service(timeout_sec=min(timeout_s, 1.0)):
             return None, f'Service unavailable: {client.srv_name}'
@@ -837,7 +1196,10 @@ class WebBridge(Node):
                 result['error'] = str(exc)
             done.set()
 
-        client.call_async(request).add_done_callback(_on_done)
+        future = client.call_async(request)
+        if on_future is not None:
+            on_future(future)
+        future.add_done_callback(_on_done)
         if not done.wait(timeout_s):
             return None, f'Service timed out: {client.srv_name}'
         if 'error' in result:
@@ -846,11 +1208,174 @@ class WebBridge(Node):
 
     def mission_cycle_command(self, command: str, run_mode: str = 'auto'):
         """Control the mission supervisor without bypassing its state machine."""
+        if command in ('mission_cycle_stop', 'mission_cycle_cancel'):
+            return self._stop_auto_mission(command)
+        if command not in ('mission_cycle_start', 'mission_cycle_resume'):
+            return self._mission_cycle_command(command, run_mode)
+        if getattr(self, '_nav_session_stopping', False):
+            return False, 'Navigation session is stopping'
+        if not self._mission_ownership_lock.acquire(blocking=False):
+            return False, 'Mission busy'
+        try:
+            manager_stop = getattr(self, '_manager_stop_request', None)
+            if manager_stop is not None and not manager_stop.done():
+                return False, 'Waiting for navigation STOP acknowledgement'
+            if command == 'mission_cycle_resume':
+                child = self._resume_child_operation()
+                if child is not None:
+                    return child
+                # RECOVERY owns the robot, but its own Resume remains valid.
+                current = self.get_mission_supervisor_status() or {}
+                if (current.get('stale', True) or current.get('state') != 'RECOVERY' or
+                        current.get('resume_available') is not True):
+                    return False, current.get('resume_reason') or 'Resume unavailable'
+                if (getattr(self, '_mission_start_pending', False) or
+                        self._retrieval_is_active() or
+                        self._is_navigation_goal_active() or
+                        (self._mission_status or {}).get('state') in self._PALLET_ACTIVE):
+                    return False, 'Mission busy'
+            return self._mission_cycle_command(command, run_mode)
+        finally:
+            self._mission_ownership_lock.release()
+
+    def _auto_stop_complete(self, target):
+        status = self.get_mission_supervisor_status() or {}
+        if any(not entry['settled'] or entry['error'] for entry in getattr(self, '_auto_service_requests', [])):
+            return False
+        if status.get('revision', 0) < target.get('required_revision', 0):
+            return False
+        if (not status.get('stale', True) and target.get('allow_new_run') and
+                status.get('state') in ('STOPPING', 'RECOVERY') and status.get('recovery_cause') == 'user'):
+            target['run_id'] = status.get('run_id')
+            target['allow_new_run'] = False
+        if status.get('stale', True) or status.get('run_id') != target['run_id']:
+            return False
+        ended = (status.get('state') == 'IDLE' and status.get('cancel_pending') is not True
+                 if target['command'] == 'mission_cycle_cancel' else
+                 status.get('state') == 'RECOVERY' and status.get('stop_confirmed') is True)
+        return ended and not (self._nav_bridge and self._nav_bridge.is_goal_active())
+
+    def _track_auto_request(self, future, command, generation):
+        self._auto_service_requests = [item for item in self._auto_service_requests if not item['settled'] or item['error']]
+        entry = {'future': future, 'settled': False, 'error': False}
+        self._auto_service_requests.append(entry)
+        def complete(done):
+            try:
+                response = done.result()
+                target = self._auto_stop_target
+                if response.success and generation != self._web_stop_generation and target is not None:
+                    status = self.get_mission_supervisor_status() or {}
+                    target['required_revision'] = max(target.get('required_revision', 0), status.get('revision', 0) + 1)
+                    client = self._mission_cancel_client if target['command'] == 'mission_cycle_cancel' else self._mission_stop_client
+                    self.get_logger().warning(f'Late {command} accepted after Stop; stopping through owner')
+                    late = client.call_async(Trigger.Request())
+                    self._track_auto_request(late, target['command'], self._web_stop_generation)
+            except Exception as exc:
+                entry['error'] = True
+                self.get_logger().error(f'Auto service outcome unconfirmed: {exc}')
+            finally:
+                entry['settled'] = True
+                self._mission_status_changed.set()
+        future.add_done_callback(complete)
+
+    def _wait_auto_transition(self, target, timeout_s=20.):
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self._mission_status_changed.clear()
+            if self._auto_stop_complete(target):
+                self._auto_stop_target = None
+                self._mission_start_pending = False
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                status = self.get_mission_supervisor_status() or {}
+                self.get_logger().warning(f'Auto {target} unconfirmed: state={status.get("state")} reason={status.get("stop_reason")}')
+                return False
+            self._mission_status_changed.wait(min(remaining, .5))
+
+    def _stop_auto_mission(self, command, from_nav_shutdown=False):
+        if self._nav_session_stopping and not from_nav_shutdown:
+            return False, 'Navigation session is stopping'
+        # Stop targets its current owner; it must bypass the motion/start mutex.
+        if not self._auto_stop_lock.acquire(blocking=False):
+            return False, 'Stopping mission; wait for confirmation'
+        try:
+            if self._retrieval_is_active():
+                return False, 'Use the active retrieval controls'
+            status = self.get_mission_supervisor_status() or {}
+            if status.get('stale', True):
+                return False, 'Mission state unavailable; stopping is unconfirmed'
+            self._web_stop_generation += 1
+            target = {'command': command, 'run_id': status.get('run_id'),
+                      'allow_new_run': status.get('state') == 'IDLE' and self._mission_start_pending}
+            self._auto_stop_target = target
+            client = self._mission_cancel_client if command == 'mission_cycle_cancel' else self._mission_stop_client
+            response, error = self._call_service_wait(client, Trigger.Request(), timeout_s=3.)
+            if response is None or not response.success:
+                self.get_logger().warning(f'Auto stop request={target} failed: {error or getattr(response, "message", "rejected")}')
+                return False, 'Stop not confirmed; check the robot'
+            # ACK only means the supervisor has fenced its timer and requested
+            # child stops. Its measured terminal snapshot establishes completion.
+            if not self._wait_auto_transition(target):
+                return False, 'Stop not confirmed; keep the robot stopped and check connection'
+            return True, 'Mission canceled' if command == 'mission_cycle_cancel' else 'Mission paused'
+        finally:
+            self._auto_stop_lock.release()
+
+    def _resume_child_operation(self):
+        """Dispatch the existing Resume command to the current ROS owner."""
+        retrieval = self._pallet_retrieval_status or {}
+        supervisor = self.get_mission_supervisor_status() or {}
+        pm = self._mission_status or {}
+        client = None
+        if retrieval.get('state') == 'RECOVERY':
+            if (time.time() - retrieval.get('ts', 0.) > 3. or not retrieval.get('resume_available')):
+                return False, retrieval.get('resume_reason') or 'Retrieval Resume unavailable'
+            if supervisor.get('state') in self._CYCLE_BLOCKED_COMMANDS:
+                return False, 'Supervisor owns recovery'
+            client = self._retrieval_resume_client
+        elif supervisor.get('state') not in self._CYCLE_BLOCKED_COMMANDS:
+            recovery = pm.get('recovery') or {}
+            if recovery.get('checkpoint'):
+                if (time.time() - pm.get('ts', 0.) > 3. or not recovery.get('available')):
+                    return False, recovery.get('reason') or 'Pallet Resume unavailable'
+                if self._retrieval_is_active():
+                    return False, 'Retrieval owns the pallet operation'
+                if getattr(self, '_pallet_resume_pending', False):
+                    return False, 'Pallet Resume awaiting acknowledgement'
+                client = self._pallet_resume_client
+                self._pallet_resume_checkpoint_id = recovery['checkpoint']['id']
+                self._pallet_resume_pending = True
+        if client is None:
+            return None
+        if self._is_navigation_goal_active() or getattr(self, '_mission_start_pending', False):
+            self._pallet_resume_pending = False
+            return False, 'Mission busy'
+        generation = getattr(self, '_web_stop_generation', 0)
+        response, error = self._call_service_wait(client, Trigger.Request(), timeout_s=4.)
+        if generation != getattr(self, '_web_stop_generation', 0):
+            self._stop_robot_and_lift()
+            return False, 'Resume canceled by a newer Stop'
+        if response is None:
+            return False, error
+        if not response.success:
+            self._pallet_resume_pending = False
+        return bool(response.success), response.message
+
+    def _mission_cycle_command(self, command: str, run_mode: str):
+        if command in ('mission_cycle_stop', 'mission_cycle_cancel'):
+            return self._stop_auto_mission(command)
         clients = {
             'mission_cycle_stop': self._mission_stop_client,
             'mission_cycle_resume': self._mission_resume_client,
         }
+        start_generation = getattr(self, '_web_stop_generation', 0)
         if command == 'mission_cycle_start':
+            nav = self.get_nav_state()
+            if not nav.get('nav2_ready') or nav.get('process_owned') is not True:
+                return False, 'Start a ready navigation session owned by this bridge first'
+            if self.mission_cycle_conflict() or self._is_navigation_goal_active():
+                return False, 'Mission busy'
             if run_mode != 'auto':
                 return False, 'Only Auto pallet cycles are supported'
             current = self.get_mission_supervisor_status()
@@ -876,27 +1401,166 @@ class WebBridge(Node):
             if (len(response.results) != len(req.parameters) or
                     not all(item.successful for item in response.results)):
                 return False, f'Could not set mission parameters for run_mode={run_mode}'
+            if start_generation != getattr(self, '_web_stop_generation', 0):
+                return False, 'Canceled'
             client = self._mission_start_client
+            # An old terminal heartbeat cannot acknowledge a new start.
+            baseline = self._mission_supervisor_status or {}
+            self._mission_start_baseline = (baseline.get('state'), baseline.get('msg'))
+            self._mission_start_pending = True
         else:
             client = clients.get(command)
             if client is None:
                 return False, f'Invalid mission command: {command}'
-            if command == 'mission_cycle_stop':
-                stopped, stop_message = self._stop_robot_and_lift()
-                if not stopped:
-                    return False, stop_message
-        response, error = self._call_service_wait(client, Trigger.Request())
+        response, error = self._call_service_wait(client, Trigger.Request(), on_future=(
+            lambda future: self._track_auto_request(future, command, start_generation)))
         if response is None:
             return False, error
         if not response.success:
+            if command == 'mission_cycle_start':
+                self._mission_start_pending = False
             state = (self.get_mission_supervisor_status() or {}).get('state', 'unknown')
-            return False, f'Mission supervisor rejected the command ({state})'
+            return False, response.message or f'Mission supervisor rejected the command ({state})'
+        if command in ('mission_cycle_start', 'mission_cycle_resume') and start_generation != getattr(self, '_web_stop_generation', 0):
+            # STOP bypasses the start lock. If acceptance raced with it,
+            # cancel the accepted run before reporting the start result.
+            target = self._auto_stop_target or {}
+            stop_client = self._mission_cancel_client if target.get('command') == 'mission_cycle_cancel' else self._mission_stop_client
+            stop_response, stop_error = self._call_service_wait(stop_client, Trigger.Request())
+            stopped, stop_message = self._stop_robot_and_lift()
+            self._mission_start_pending = not (
+                stopped and stop_response is not None and stop_response.success)
+            return False, 'Canceled' if not self._mission_start_pending else (
+                stop_error or stop_message or 'Stop unconfirmed')
+        if command == 'mission_cycle_stop':
+            self._mission_start_pending = False
         return True, response.message or 'ok'
+
+    def pallet_retrieval_start(self, slot: str):
+        """Start the operator-selected shelf retrieval mission in Auto mode."""
+        if getattr(self, '_nav_session_stopping', False):
+            return False, 'Navigation session is stopping'
+        if not self._mission_ownership_lock.acquire(blocking=False):
+            return False, 'Mission busy'
+        try:
+            return self._pallet_retrieval_start(slot)
+        finally:
+            self._mission_ownership_lock.release()
+
+    def _pallet_retrieval_start(self, slot: str):
+        start_generation = getattr(self, '_web_stop_generation', 0)
+        nav = self.get_nav_state()
+        if not nav.get('nav2_ready') or nav.get('process_owned') is not True:
+            return False, 'Start a ready navigation session owned by this bridge first'
+        slot = str(slot or '').strip().upper()
+        if slot not in {'A1', 'A2', 'B1', 'B2'}:
+            return False, f'Invalid shelf slot: {slot}'
+        if not self._nav_bridge or self._nav_bridge._op_mode != 'AUTO':
+            return False, 'Switch Navigation to AUTO before retrieval'
+        if self.mission_cycle_conflict():
+            return False, 'Mission busy'
+        supervisor = self.get_mission_supervisor_status()
+        if supervisor is None or supervisor.get('stale'):
+            return False, 'Mission supervisor status is missing or stale'
+        if supervisor.get('state') not in ('IDLE', 'DONE', 'FAILED', 'STOPPED'):
+            return False, f"Mission supervisor is active ({supervisor.get('state')})"
+        if self._is_navigation_goal_active():
+            return False, 'Finish or cancel the active navigation goal before retrieval'
+        req = SetParameters.Request()
+        req.parameters = [Parameter(
+            'target_slot', Parameter.Type.STRING, slot).to_parameter_msg()]
+        response, error = self._call_service_wait(
+            self._retrieval_params_client, req, timeout_s=4.0)
+        if response is None:
+            return False, error
+        if not response.results or not response.results[0].successful:
+            return False, 'Could not set the selected retrieval slot'
+        if start_generation != getattr(self, '_web_stop_generation', 0):
+            return False, 'Canceled'
+        baseline = self._pallet_retrieval_status or {}
+        self._retrieval_start_baseline = (baseline.get('state'), baseline.get('message'))
+        self._retrieval_start_pending = True
+        response, error = self._call_service_wait(
+            self._retrieval_start_client, Trigger.Request(), timeout_s=5.0)
+        if response is None:
+            return False, error
+        if not response.success:
+            self._retrieval_start_pending = False
+            return False, response.message or 'Retrieval mission was rejected'
+        if start_generation != getattr(self, '_web_stop_generation', 0):
+            canceled, message = self.pallet_retrieval_cancel()
+            return False, 'Canceled' if canceled else message
+        self._retrieval_start_pending = (
+            (self._pallet_retrieval_status or {}).get('state') not in self._RETRIEVAL_ACTIVE)
+        return True, response.message or f'Retrieval started for {slot}'
+
+    def _retrieval_is_active(self) -> bool:
+        if getattr(self, '_retrieval_start_pending', False):
+            return True
+        status = self._pallet_retrieval_status or {}
+        # Stale active telemetry is uncertainty, not proof of an idle robot.
+        return status.get('state') in self._RETRIEVAL_ACTIVE
+
+    def pallet_retrieval_cancel(self):
+        """Cancel retrieval first, then confirm a stop for Nav2 and pallet/lift."""
+        if getattr(self, '_nav_session_stopping', False):
+            return False, 'Navigation session is stopping'
+        self._web_stop_generation = getattr(self, '_web_stop_generation', 0) + 1
+        if not self._retrieval_is_active():
+            return False, 'No active pallet retrieval mission'
+        discard_request = (self._pallet_retrieval_status or {}).get('state') == 'RECOVERY'
+        response, error = self._call_service_wait(
+            self._retrieval_cancel_client, Trigger.Request(), timeout_s=3.0)
+        if response is None:
+            return False, error
+        if not response.success:
+            return False, response.message or 'Retrieval coordinator rejected cancel'
+        if discard_request:
+            # The ROS coordinator waits asynchronously for pallet_mission's
+            # discard confirmation; its terminal snapshot closes the UI.
+            return True, 'Retrieval discard requested'
+        stopped, stop_message = self._stop_robot_and_lift()
+        if not stopped:
+            return False, ('Retrieval cancel requested, but safety stop was not confirmed: '
+                           f'{stop_message}')
+        return True, 'Retrieval cancel acknowledged; navigation ended and pallet/lift stop requested. Verify standstill.'
+
+    def confirm_forks_empty(self, confirmed_empty=False):
+        """Reconcile cargo only after explicit manual unloading confirmation."""
+        if confirmed_empty is not True:
+            return False, 'Confirm that the pallet has physically been removed from the forks'
+        if not self._mission_ownership_lock.acquire(blocking=False):
+            return False, 'Another pallet operation is starting'
+        try:
+            if not self._nav_bridge or self._nav_bridge._op_mode != 'MANUAL':
+                return False, 'Switch to MANUAL and stop the robot before confirming empty forks'
+            if self._retrieval_is_active() or self._is_navigation_goal_active():
+                return False, 'Stop navigation/retrieval before confirming empty forks'
+            status = self.get_mission_supervisor_status()
+            if not status or status.get('stale') or status.get('state') not in ('IDLE', 'DONE', 'FAILED', 'STOPPED'):
+                return False, 'Supervisor must be fresh and idle; stop/reset the mission first'
+            if status.get('odom_fresh') is not True or status.get('robot_stopped') is not True:
+                return False, 'Fresh odometry must confirm the robot is stopped'
+            pallet = self._mission_status or {}
+            if time.time() - pallet.get('ts', 0.0) > 3.0:
+                return False, 'Pallet telemetry is missing/stale; empty forks cannot be confirmed'
+            response, error = self._call_service_wait(self._confirm_empty_client, Trigger.Request())
+            if response is None or not response.success:
+                return False, error or getattr(response, 'message', '') or 'Empty forks confirmation rejected'
+            # Drop the old loaded label immediately, while awaiting ROS telemetry.
+            self._mission_status = {**pallet, 'state': 'IDLE', 'cargo': False,
+                                    'cargo_class': None, 'cargo_type': None,
+                                    'cargo_h_cm': None, 'mode': None, 'ts': time.time()}
+            return True, response.message
+        finally:
+            self._mission_ownership_lock.release()
 
     def set_operating_mode(self, mode: str):
         """Entering MANUAL from AUTO stops and resets the auto mission first."""
         if mode not in ('AUTO', 'MANUAL'):
             return False, 'Operating mode must be AUTO or MANUAL'
+        if mode == 'MANUAL' and self._retrieval_is_active():
+            return False, 'Pallet retrieval is active; cancel it and confirm the stop before switching to MANUAL'
         stop_message = ''
         if mode == 'MANUAL' and self._nav_bridge \
                 and self._nav_bridge._op_mode == 'AUTO':
@@ -936,12 +1600,22 @@ class WebBridge(Node):
         try:
             t = self._tf_buffer.lookup_transform(
                 self._map_frame, frame_id, rclpy.time.Time())
+            stamp = rclpy.time.Time.from_msg(t.header.stamp)
+            age = (self.get_clock().now() - stamp).nanoseconds / 1e9
+            if age < -1.0 or age > 3.0:
+                return None
         except Exception:
             return None
         q = t.transform.rotation
         p = t.transform.translation
         tyaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
         return (p.x, p.y, tyaw)
+
+    def navigation_pose_ready(self):
+        odom = self._last_odom_pose or {}
+        now = self.get_clock().now().nanoseconds / 1e9
+        return (0 <= now - odom.get('timestamp', 0) <= 3.0 and
+                self._lookup_map_tf(self._base_frame) is not None)
 
     def _on_pose(self, msg: Odometry) -> None:
         try:
@@ -1362,13 +2036,31 @@ class WebBridge(Node):
 
         return routes
 
+    @_guard_map_mutation
     def save_route(self, map_id: str, route_data: dict) -> tuple:
         import yaml
         try:
+            if not isinstance(route_data, dict) or not isinstance(route_data.get('nodes'), list):
+                return False, 'Route must contain a node list'
+            names = []
+            for item in route_data['nodes']:
+                if not isinstance(item, dict) or not valid_resource_id(item.get('name')):
+                    return False, 'Each route node requires a valid name'
+                position, orientation = item.get('position') or {}, item.get('orientation') or {}
+                NavBridge.validate_pose({'x': position.get('x'), 'y': position.get('y'), 'yaw': orientation.get('yaw', 0.0)})
+                names.append(item['name'])
+            if len(set(names)) != len(names):
+                return False, 'Route node names must be unique'
+            edges = route_data.get('edges', [])
+            if not isinstance(edges, list) or any(not isinstance(edge, dict) or
+                    edge.get('from') not in names or edge.get('to') not in names for edge in edges):
+                return False, 'Route edges must reference existing nodes'
             routes_dir = os.path.expanduser(f'~/project_ws/maps/{map_id}/routes')
             os.makedirs(routes_dir, exist_ok=True)
 
             graph_name = route_data.get('graph_name', f'{map_id}_route')
+            if not valid_resource_id(graph_name):
+                return False, 'Invalid route identifier'
             yaml_path = os.path.join(routes_dir, f'{graph_name}.yaml')
             geojson_path = os.path.join(routes_dir, f'{graph_name}.geojson')
             poses_path = os.path.join(routes_dir, f'{graph_name}_poses.yaml')
@@ -1440,6 +2132,7 @@ class WebBridge(Node):
             self.get_logger().error(f'Failed to save route: {e}')
             return False, str(e)
 
+    @_guard_map_mutation
     def delete_map_and_routes(self, map_id: str) -> tuple:
         import shutil
         try:
@@ -1490,9 +2183,9 @@ class WebBridge(Node):
             return False, "NavBridge not initialized"
 
         try:
-            # P0-5 Fix: Clear old map before starting navigation
-            self._state_bridge.clear_map()
-            self._map_pending = False
+            start_generation = self._web_stop_generation
+            if not valid_resource_id(map_id) or (route_id is not None and not valid_resource_id(route_id)):
+                return False, 'Invalid map or route identifier'
 
             maps_dir = os.path.expanduser('~/project_ws/maps')
             map_yaml = os.path.join(maps_dir, f'{map_id}.yaml')
@@ -1508,10 +2201,10 @@ class WebBridge(Node):
 
                 if os.path.exists(candidate_geojson):
                     route_file = candidate_geojson
-                elif os.path.exists(candidate_yaml):
-                    route_file = candidate_yaml
                 else:
-                    self.get_logger().warn(f"Route file not found for: {route_id}")
+                    return False, 'Selected route GeoJSON is unavailable; save the route first'
+            else:
+                return False, 'Select a route for this navigation session'
 
             # Gọi nav_bridge với file route chính xác (truyen day du map_id va route_id)
             success, msg = self._nav_bridge.start_nav2(
@@ -1522,7 +2215,12 @@ class WebBridge(Node):
             )
 
             if success:
-                self._clear_recent_supervisor_missions()
+                if start_generation != self._web_stop_generation:
+                    self._nav_bridge.stop_nav2()
+                    return False, 'Navigation startup superseded by Stop'
+                self._state_bridge.clear_map()
+                self._map_pending = False
+                self._mark_recent_supervisor_session_boundary()
             if success and self._verbose:
                 self.get_logger().info(f'Navigation started: map={map_id}, route={route_id}')
 
@@ -1532,61 +2230,199 @@ class WebBridge(Node):
             self.get_logger().error(f'Failed to start navigation: {e}')
             return False, str(e)
 
-    def stop_navigation(self) -> tuple:
-        """Stop Nav2 and stop/reset the supervisor cycle when in AUTO."""
-        if not self._nav_bridge:
-            return False, "NavBridge not initialized"
+    def _stop_retrieval_for_nav_session(self, timeout_s=25.0):
+        """Cancel active Retrieval AND discard its Recovery checkpoint.
 
-        warnings = []
-        motion_stop_ok = True
-        state = None
-        supervisor_stopped = False
-        if self._nav_bridge._op_mode == 'AUTO':
-            stop_ok, stop_message = self._stop_robot_and_lift()
-            motion_stop_ok = stop_ok
-            status = self.get_mission_supervisor_status()
-            state = (status.get('state')
-                     if status is not None and not status.get('stale') else None)
-            supervisor_stopped = True
-
-            if state in self._CYCLE_RUNNING:
+        /pallet_retrieval/cancel has two distinct meanings: while its worker
+        runs it requests cancellation; once the worker has reached RECOVERY and
+        released the run lock it discards. An ACK to the first request is not
+        proof of terminal cancellation.
+        """
+        status = self._pallet_retrieval_status or {}
+        if not self._retrieval_is_active():
+            return True, 'No active retrieval'
+        deadline = time.monotonic() + timeout_s
+        cancel_sent = False
+        discard_last_sent = 0.0
+        while time.monotonic() < deadline:
+            status = self._pallet_retrieval_status or {}
+            state = status.get('state')
+            if state == 'CANCELED' and status.get('resume_step') is None:
+                self._retrieval_start_pending = False
+                return True, 'Retrieval discarded'
+            if state == 'DONE' and not self._retrieval_start_pending:
+                return True, 'Retrieval completed before Stop'
+            # Only the worker may enter RECOVERY. Do not send a second cancel
+            # while it is still CANCELING: it is an ACK, not a discard.
+            if not cancel_sent or (state == 'RECOVERY' and
+                                   time.monotonic() - discard_last_sent >= 0.7):
                 response, error = self._call_service_wait(
-                    self._mission_stop_client, Trigger.Request(), timeout_s=2.0)
-                supervisor_stopped = bool(response and response.success)
-                if not supervisor_stopped:
-                    warnings.append(
-                        'supervisor stop not confirmed: '
-                        f'{error or getattr(response, "message", "") or "rejected"}')
+                    self._retrieval_cancel_client, Trigger.Request(), timeout_s=3.0)
+                if response is None:
+                    return False, f'Retrieval stop unconfirmed: {error}'
+                if not response.success:
+                    # A concurrent completion can legitimately remove the
+                    # worker between the state check and the request.
+                    status = self._pallet_retrieval_status or {}
+                    if status.get('state') == 'CANCELED':
+                        self._retrieval_start_pending = False
+                        return True, 'Retrieval discarded'
+                    return False, response.message or 'Retrieval stop rejected'
+                cancel_sent = True
+                if state == 'RECOVERY':
+                    discard_last_sent = time.monotonic()
+            time.sleep(0.1)
+        return False, ('Retrieval cancellation/discard not confirmed; '
+                       f'last state={(self._pallet_retrieval_status or {}).get("state", "unknown")}')
 
-            if not stop_ok:
-                warnings.append(stop_message)
-            # Stop Navigation ends the current cycle, including any pending
-            # RECOVERY checkpoint. Only mission_cycle_stop (operator cancel)
-            # preserves a checkpoint for a later Resume.
-            if state == 'RECOVERY' or (state in self._CYCLE_RUNNING and supervisor_stopped):
-                if supervisor_stopped:
-                    response, error = self._call_service_wait(
-                        self._mission_reset_client, Trigger.Request(), timeout_s=2.0)
-                    if response and response.success:
-                        self._mark_supervisor_reset()
-                    else:
-                        warnings.append(
-                            'supervisor reset failed: '
-                            f'{error or getattr(response, "message", "") or "rejected"}')
-            elif state is None:
-                warnings.append('supervisor status unavailable/stale; mission reset not attempted')
+    def _stop_supervisor_for_nav_session(self):
+        """End the cycle, never preserve a supervisor Recovery on Nav Mode Stop."""
+        status = self.get_mission_supervisor_status()
+        if status is None:
+            if self._mission_start_pending or self._auto_stop_target:
+                return False, 'Supervisor status missing while a mission start/stop is pending'
+            return True, 'No supervisor status available; no Web-owned cycle pending'
+        if status.get('state') == 'IDLE' and not self._mission_start_pending and not self._auto_stop_target:
+            return True, 'Auto mission already Idle'
+        if status.get('stale'):
+            return False, 'Supervisor status stale; full mission cancel cannot be confirmed'
+        # The existing cancel path waits for a fresh IDLE snapshot, pending
+        # child stop requests, and terminal navigation. It fences late Starts.
+        return self._stop_auto_mission('mission_cycle_cancel', from_nav_shutdown=True)
 
-        # P0-5 Fix: Clear map when stopping navigation
-        self._state_bridge.clear_map()
-        self._map_pending = False
-        self._nav2_goal_active = {key: False for key in self._nav2_goal_active}
-        nav_ok, nav_message = self._nav_bridge.stop_nav2()
+    def _discard_pallet_checkpoint_for_nav_session(self):
+        """Do not leave a pallet recovery owned by a discarded Retrieval."""
+        status = self._mission_status or {}
+        recovery = status.get('recovery') or {}
+        if not recovery.get('checkpoint') and not recovery.get('stop_pending'):
+            return True, 'No pallet recovery checkpoint'
+        if time.time() - status.get('ts', 0.0) > 3.0:
+            return False, 'Pallet recovery status is stale'
+        response, error = self._call_service_wait(
+            self._pallet_discard_client, Trigger.Request(), timeout_s=4.0)
+        if response is None or not response.success:
+            return False, (error or getattr(response, 'message', None)
+                           or 'Pallet recovery discard unconfirmed')
+        return True, 'Pallet recovery discarded'
+
+    def _shutdown_nav2_after_unconfirmed_cancel(self, reason):
+        """Fail-safe: stop Nav2 commands even if a coordinator cannot finish.
+
+        This is NOT a successful full session cleanup. Preserve mission/status
+        interlocks for later reconciliation; never claim a terminal action.
+        """
+        self.get_logger().warning(f'Full Navigation stop not confirmed: {reason}')
+        try:
+            self._nav_bridge._emergency_stop()
+        except Exception as exc:
+            self.get_logger().warning(f'Zero velocity publish unconfirmed: {exc}')
+        try:
+            nav_ok, nav_message = self._nav_bridge.stop_nav2()
+        except Exception as exc:
+            nav_ok, nav_message = False, str(exc)
         if nav_ok:
-            self._clear_recent_supervisor_missions()
-        if warnings:
-            nav_message += '; WARNING: ' + '; '.join(warnings)
-        return (nav_ok and motion_stop_ok and self._nav_bridge._op_mode == 'MANUAL',
-                nav_message)
+            # Only Nav2-specific session data is cleared. Do not clear the
+            # supervisor/retrieval caches or their unresolved ownership flags.
+            self._state_bridge.clear_map()
+            self._state_bridge.clear_layers()
+            self._map_pending = False
+        self.get_logger().warning(f'Nav2 fallback shutdown: {nav_message}')
+        return False, ('Navigation session stop incomplete; confirm robot/mission stop '
+                       'before restarting')
+
+    def stop_navigation(self) -> tuple:
+        """Full STOP NAV MODE: terminate owners, then the Web-owned Nav2 stack.
+
+        Unlike CANCEL MISSION, Stop Nav Mode does NOT retain Recovery. Never
+        report Stop success while a coordinator or motion stop is unconfirmed.
+        """
+        if not self._nav_bridge:
+            return False, 'NavBridge not initialized'
+        if not self._nav_session_stop_lock.acquire(blocking=False):
+            return False, 'Navigation shutdown already in progress'
+        self._nav_session_stopping = True
+        self._web_stop_generation += 1  # Fence starts/resumes sent earlier.
+        try:
+            # Snapshot whether a live ROS task actually needs measured motion
+            # confirmation. An idle session must be stoppable while ESP32 is
+            # unplugged; do not claim physical standstill in that case.
+            supervisor_before = self.get_mission_supervisor_status() or {}
+            pallet_before = self._mission_status or {}
+            had_motion_owner = (self._retrieval_is_active() or
+                supervisor_before.get('state') in self._CYCLE_BLOCKED_COMMANDS or
+                pallet_before.get('state') in self._PALLET_ACTIVE or
+                bool((pallet_before.get('recovery') or {}).get('checkpoint')) or
+                bool(self._mission_start_pending) or
+                self._is_navigation_goal_active())
+
+            # 1. The retrieval owner must finish its worker and discard its
+            #    checkpoint before Nav2 action servers are taken away.
+            ok, reason = self._stop_retrieval_for_nav_session()
+            if not ok:
+                self.get_logger().warning(f'Nav shutdown blocked: {reason}')
+                return self._shutdown_nav2_after_unconfirmed_cancel(reason)
+
+            # 2. Cancel Supervisor (not /mission/stop, which preserves Recovery).
+            ok, reason = self._stop_supervisor_for_nav_session()
+            if not ok:
+                self.get_logger().warning(f'Nav shutdown blocked: {reason}')
+                return self._shutdown_nav2_after_unconfirmed_cancel(reason)
+
+            # 3. Active tasks require the existing measured safety-stop path.
+            # An idle session can be shut down without ESP32 feedback; best
+            # effort zero velocity is not reported as physical confirmation.
+            if had_motion_owner:
+                stopped, reason = self._stop_robot_and_lift()
+                if not stopped:
+                    self.get_logger().warning(f'Nav shutdown blocked: {reason}')
+                    return self._shutdown_nav2_after_unconfirmed_cancel(reason)
+            else:
+                try:
+                    self._nav_bridge._emergency_stop()
+                except Exception as exc:
+                    self.get_logger().info(f'Idle Nav shutdown: zero velocity not acknowledged: {exc}')
+
+            # The pallet controller may have its own recovery even if no
+            # supervisor/retrieval cycle currently owns the mission card.
+            ok, reason = self._discard_pallet_checkpoint_for_nav_session()
+            if not ok:
+                self.get_logger().warning(f'Nav shutdown blocked: {reason}')
+                return self._shutdown_nav2_after_unconfirmed_cancel(reason)
+
+            # Wait for the asynchronous manager /stop request issued above.
+            manager_future = getattr(self, '_manager_stop_request', None)
+            if manager_future is not None:
+                deadline = time.monotonic() + 4.0
+                while not manager_future.done() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if not manager_future.done():
+                    return self._shutdown_nav2_after_unconfirmed_cancel('Mission manager STOP acknowledgement unavailable')
+                try:
+                    if not manager_future.result().success:
+                        return self._shutdown_nav2_after_unconfirmed_cancel('Mission manager rejected STOP')
+                except Exception as exc:
+                    self.get_logger().warning(f'Mission manager STOP failed: {exc}')
+                    return self._shutdown_nav2_after_unconfirmed_cancel('Mission manager STOP unconfirmed')
+
+            # 4. Only shutdown after owners are fenced and their stop is
+            #    confirmed. Never reset status/goal caches before this point.
+            nav_ok, nav_message = self._nav_bridge.stop_nav2()
+            if not nav_ok:
+                return False, nav_message
+            self._state_bridge.clear_map()
+            self._state_bridge.clear_layers()
+            self._map_pending = False
+            self._nav2_goal_active = {key: False for key in self._nav2_goal_active}
+            self._nav2_goal_status_ts = {key: 0.0 for key in self._nav2_goal_status_ts}
+            self._mission_start_pending = False
+            self._retrieval_start_pending = False
+            self._pallet_resume_pending = False
+            self._auto_stop_target = None
+            self._mark_recent_supervisor_session_boundary()
+            return True, 'Navigation session stopped'
+        finally:
+            self._nav_session_stopping = False
+            self._nav_session_stop_lock.release()
 
     def send_nav_goal(self, pose: dict, route_id: Optional[str] = None) -> tuple:
         """
@@ -1608,6 +2444,8 @@ class WebBridge(Node):
         """Stop Nav2, base motion and pallet lift; report any unconfirmed step."""
         if not self._nav_bridge:
             return False, "stop not confirmed: NavBridge not initialized"
+        if self._retrieval_is_active():
+            return self.pallet_retrieval_cancel()
         stopped, message = self._stop_robot_and_lift()
         if not stopped:
             return False, message
@@ -1629,6 +2467,12 @@ class WebBridge(Node):
         return True, message
 
     def _stop_robot_and_lift(self) -> tuple:
+        # Invalidate Web starts awaiting parameter/service acknowledgements.
+        # STOP remains independent of the start lock and ROS mission logic.
+        self._web_stop_generation = getattr(self, '_web_stop_generation', 0) + 1
+        self._pallet_resume_pending = False
+        if self._manager_stop_client.service_is_ready():
+            self._manager_stop_request = self._manager_stop_client.call_async(Trigger.Request())
         failures = []
         try:
             self._nav_bridge._emergency_stop()
@@ -1659,7 +2503,7 @@ class WebBridge(Node):
         elif not response.success:
             failures.append(f'pallet stop not confirmed: {response.message or "rejected"}')
         else:
-            pallet_note = f'pallet stop confirmed: {response.message or "stopped"}'
+            pallet_note = f'pallet stop request acknowledged: {response.message or "requested"}'
 
         if failures:
             return False, 'stop not confirmed: ' + '; '.join(failures)

@@ -12,7 +12,12 @@ from std_msgs.msg import Bool, String
 from rclpy.callback_groups import ReentrantCallbackGroup
 from std_srvs.srv import SetBool, Trigger
 
-LOCATIONS = ("home", "p1", "p2", "d1", "unknown")
+try:
+    from .robot_queries import classify_query
+except ImportError:
+    from amr_llm.robot_queries import classify_query
+
+LOCATIONS = ("home", "p1", "d1", "d2", "unknown")
 MAX_TEXT_LEN = 300
 
 
@@ -38,14 +43,14 @@ class LLMBridge:
                 f"/llm/quick_goal/{target.lower()}",
                 lambda request, response, name=target: self._quick_goal(name, response),
                 callback_group=ReentrantCallbackGroup())
-            for target in ("HOME", "P_1", "P_2", "D_1")]
+            for target in ("HOME", "P_1", "D_2", "D_1")]
         self._node_check_srvs = [
             node.create_service(
                 Trigger,
                 f"/llm/check_node/{target.lower()}",
                 lambda request, response, name=target: self._check_named_node(name, response),
                 callback_group=ReentrantCallbackGroup())
-            for target in ("HOME", "P_1", "P_2", "D_1")]
+            for target in ("HOME", "P_1", "D_2", "D_1")]
         self._mode_timer = node.create_timer(1.0, self._publish_mode)
 
     def _publish_mode(self):
@@ -151,7 +156,7 @@ class LLMBridge:
         if isinstance(nodes, list):
             nodes = {str(item.get("name", "")): item for item in nodes}
         aliases = {"HOME": ("NODE_HOME", "HOME"), "P_1": ("P_1", "PICK1"),
-                   "P_2": ("P_2", "PICK2"), "D_1": ("D_1", "DROP")}
+                   "D_2": ("D_2", "DROP2"), "D_1": ("D_1", "DROP")}
         node_pose = next((value for key, value in nodes.items()
                           if str(key).upper() in aliases[target]
                           or str(value.get("name", "")).upper() in aliases[target]), None)
@@ -208,7 +213,8 @@ class LLMBridge:
             data = json.loads(msg.data)
         except Exception:  # noqa: BLE001
             data = {"state": "info", "msg": msg.data}
-        self.last_status = data
+        if not data.get("observational"):
+            self.last_status = data
         self._broadcast({"type": "llm_status", "data": data})
 
     def reset(self):
@@ -245,7 +251,7 @@ class LLMBridge:
                     confidence = float(confidence)
                 except (TypeError, ValueError):
                     confidence = None
-                problem = self._precheck() if self._precheck else None
+                problem = self._precheck() if self._precheck and not classify_query(text) else None
                 if problem:
                     return self._resp(name, "error", problem)
                 self._session_reset = False

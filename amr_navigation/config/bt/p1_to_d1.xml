@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <!--
-  Mission: P_1 → D_1
-  start_id = 1 (P_1)
-  goal_id  = 3 (D_1)
+  Mission: P_1 → D_1 - P_1 di D_1 (lưu kho vào kệ)
+  start_id = 1
+  goal_id  = 2
 
   Hybrid navigation (Route → Free):
     1. Nhanh: ComputeRoute + FollowPath  (di theo route graph, tuan thu luong giao thong)
@@ -12,9 +12,8 @@
 
   QUAN TRONG: tach 2 blackboard key rieng ({route_path} va {free_path}).
   Khong dung chung {path} cho ca 2 nhanh - tranh xung dot bo nho controller.
-
   ID phai khop thu tu node trong 'D203B Route.yaml':
-    0=NODE_HOME 1=P_1 2=P_2 3=D_1
+    0=NODE_HOME 1=P_1 2=D_1 3=D_2
   (mission_manager_node.py kiem tra (start_id, goal_id) truoc khi gui goal.)
 -->
 <root main_tree_to_execute="MainTree">
@@ -23,7 +22,7 @@
       <!-- CHINH: uu tien di theo route -->
       <Sequence name="route_nav">
         <SetBlackboard value="1" output_key="my_start_id"/>
-        <SetBlackboard value="3" output_key="my_goal_id"/>
+        <SetBlackboard value="2" output_key="my_goal_id"/>
 
         <ComputeRoute
           start_id="{my_start_id}"

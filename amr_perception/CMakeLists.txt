@@ -60,6 +60,11 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME} RENAME pallet_detector_ov
 )
 
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_perception/pallet_detector_htonet_node.py
+  DESTINATION lib/${PROJECT_NAME} RENAME pallet_detector_htonet
+)
+
 # =========================================================================
 # Install Launch Files
 # =========================================================================

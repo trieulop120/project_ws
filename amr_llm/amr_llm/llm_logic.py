@@ -6,8 +6,13 @@ import math
 import os
 import re
 
-MISSIONS = ["home_to_p1", "home_to_p2", "p1_to_d1", "p2_to_d1",
-            "p1_to_p2", "d1_to_p1", "d1_to_p2", "return_home"]
+try:
+    from .robot_queries import TOPICS
+except ImportError:
+    from robot_queries import TOPICS
+
+MISSIONS = ["home_to_p1", "home_to_d2", "p1_to_d1", "d2_to_d1",
+            "d1_to_p1", "d1_to_d2", "p1_to_d2", "return_home"]
 
 LIFT_LEVELS = {"low": 2.0, "carry": 12.0, "rack_1": 30.0, "rack_2": 55.0}
 UNMEASURED_LIFT_LEVELS = ("rack_1", "rack_2")
@@ -16,18 +21,23 @@ LIFT_LIMIT_CM = 80.0
 MANUAL_ONLY = {"quick_goal", "go_mission", "pick_pallet", "drop_pallet",
                "detect_pallet", "lock_detection", "lift_to", "lift_home",
                "relative_move"}
-CYCLE_ACTIONS = {"start_auto_cycle", "start_single_cycle", "stop_cycle", "resume_cycle"}
+CYCLE_ACTIONS = {"start_auto_cycle", "start_single_cycle", "retrieve_pallet", "stop_cycle", "resume_cycle"}
 
 WORLD = """\
 - HOME: điểm xuất phát / đỗ xe.
-- P_1, P_2: các điểm lấy pallet (pallet đặt trên sàn).
-- D_1: điểm trả pallet, tại kệ.
-- Kệ có 2 tầng; "đặt lên kệ" dùng drop_pallet, KHÔNG dùng lift_to rack_1/rack_2."""
+- P_1: điểm lấy pallet (pallet đặt trên sàn) - điểm lấy duy nhất.
+- D_1: điểm trả pallet, tại kệ (lưu kho).
+- D_2: điểm thả pallet lấy ra từ kệ (xuất kho) - sau này cơ chế tự chọn loại.
+- Kệ có 3 cột, phân loại theo chiều cao hàng:
+  + Cột A (dành cho pallet/hộp thấp = medium): có 2 tầng gồm A1 (kệ tầng 1 / tầng dưới) và A2 (kệ tầng 2 / tầng trên).
+  + Cột B (dành cho pallet/hộp cao = tall): gồm B1 và B2 (1 tầng).
+- "Đặt lên kệ" dùng start_single_cycle hoặc drop_pallet, KHÔNG dùng lift_to rack_1/rack_2."""
 
 GROUPS = {
     "A": "NHÓM A - CHẾ ĐỘ NAVIGATION (2 nút AUTO / MANUAL trên web). Chỉ đổi chế độ giao diện, KHÔNG chạy mission:",
     "B": "NHÓM B - MISSION / CHU TRÌNH PALLET TỰ ĐỘNG (nút START AUTO MISSION / CANCEL MISSION / RESUME RECOVERY):",
     "C": "NHÓM C - THAO TÁC MANUAL (Quick Goals, lấy/đặt pallet, lift và di chuyển tương đối):",
+    "E": "NHÓM E - HỎI THÔNG TIN, KHÔNG ĐIỀU KHIỂN XE:",
     "D": "NHÓM D - HỦY GOAL ĐIỀU HƯỚNG:",
 }
 
@@ -61,6 +71,12 @@ TOOLS = {
                     "drop_slot": ["auto", "A1", "A2", "B1", "B2"],
                     "quantity": {"type": "integer", "min": 1, "max": 10}},
     },
+    "retrieve_pallet": {
+        "group": "B",
+        "desc": "Lấy pallet ra khỏi một ô kệ đã chọn và đưa tới D_2, sau đó về HOME. "
+                "Chạy retrieval coordinator ở AUTO mode; không dùng cho yêu cầu lấy pallet sàn rồi đặt lên kệ.",
+        "params": {"slot": ["A1", "A2", "B1", "B2"]},
+    },
     "stop_cycle": {
         "group": "B",
         "desc": "CANCEL MISSION: dừng chu trình pallet đang chạy. Câu 'cancel mission / hủy / dừng' "
@@ -77,11 +93,11 @@ TOOLS = {
     },
     "quick_goal": {
         "group": "C",
-        "desc": "Đi thẳng tới MỘT điểm (4 nút Quick Goals: Return Home, Go Pick 1, Go Pick 2, Go Drop), "
-                "KHÔNG lấy/đặt pallet. Người dùng nói: 'go pick 1', 'go pick 2', 'go drop', "
-                "'return home', 'về home', 'về nhà', 'đi tới P1', 'đi tới D1', 'go to P1'. "
+        "desc": "Đi thẳng tới MỘT điểm (4 nút Quick Goals: Return Home, Go Pick, Go Drop, Go D_2), "
+                "KHÔNG lấy/đặt pallet. Người dùng nói: 'go pick', 'go drop', "
+                "'return home', 'về home', 'về nhà', 'đi tới P1', 'đi tới D1', 'go to P1', 'go to D2'. "
                 "Dùng được từ bất kỳ vị trí nào.",
-        "params": {"target": ["HOME", "P_1", "P_2", "D_1"]},
+        "params": {"target": ["HOME", "P_1", "D_1", "D_2"]},
     },
     "go_mission": {
         "group": "C",
@@ -94,7 +110,7 @@ TOOLS = {
     "pick_pallet": {
         "group": "C",
         "desc": "Nhận diện pallet phía trước, căn hướng và tiến càng vào pallet. "
-                "Chỉ gọi khi robot đang đứng ở điểm lấy (P_1 hoặc P_2).",
+                "Chỉ gọi khi robot đang đứng ở điểm lấy pallet (P_1).",
         "params": {},
     },
     "detect_pallet": {
@@ -115,18 +131,18 @@ TOOLS = {
     },
     "lift_to": {
         "group": "C",
-        "desc": "Nâng/hạ càng tới chiều cao người dùng yêu cầu. Dùng height_cm cho số cm cụ thể (0–80 cm), ví dụ 15 cm -> height_cm=15. Dùng level=low/carry khi người dùng nói mức thấp/mức chở. Không suy height kệ từ rack_1/rack_2; để đặt pallet lên kệ dùng mission/drop_pallet.",
+        "desc": "Nâng/hạ càng tới chiều cao người dùng yêu cầu, kể cả khi đang mang pallet nếu người dùng yêu cầu rõ. Dùng height_cm cho số cm cụ thể (0–80 cm), ví dụ 15 cm -> height_cm=15. Dùng level=low/carry khi người dùng nói mức thấp/mức chở. Không suy height kệ từ rack_1/rack_2; để đặt pallet lên kệ dùng mission/drop_pallet.",
         "params": {"level": list(LIFT_LEVELS),
                    "height_cm": {"type": "number", "min": 0.0, "max": LIFT_LIMIT_CM}},
     },
     "lift_home": {
         "group": "C",
-        "desc": "Hạ càng về HOME (0 cm), chỉ khi robot không mang pallet và supervisor đang rảnh.",
+        "desc": "Hạ càng về HOME (0 cm). Cho phép cả khi robot đang mang pallet nếu người dùng yêu cầu rõ; supervisor/Navigation vẫn phải ở trạng thái phù hợp.",
         "params": {},
     },
     "relative_move": {
         "group": "C",
-        "desc": "Di chuyển thẳng tương đối theo odometry, tự chuyển sang MANUAL. Chỉ chạy một lệnh độc lập; distance_m từ 0.05 đến 2 m, speed_mps từ 0.03 đến 0.25 m/s (nếu không nêu tốc độ, dùng 0.1 m/s).",
+        "desc": "Di chuyển thẳng tương đối theo odometry, tự chuyển sang MANUAL. Có thể là một bước trong chuỗi MANUAL tuần tự; distance_m từ 0.05 đến 2 m, speed_mps từ 0.03 đến 0.25 m/s (nếu không nêu tốc độ, dùng 0.1 m/s).",
         "params": {"direction": ["forward", "backward"],
                    "distance_m": {"type": "number", "min": 0.05, "max": 2.0},
                    "speed_mps": {"type": "number", "min": 0.03, "max": 0.25}},
@@ -136,6 +152,12 @@ TOOLS = {
         "desc": "Hủy goal Nav2 đang chạy (goal đơn, không phải chu trình mission).",
         "params": {},
     },
+}
+
+TOOLS["get_robot_status"] = {
+    "group": "E",
+    "desc": "Trả lời thông tin về bản thân trợ lý (identity), model LLM đang cấu hình (llm_model), quy trình xử lý lệnh (llm_workflow), đồ án AMR (project), sinh viên thực hiện (creators), giảng viên hướng dẫn (advisor), công nghệ (technology); hoặc đọc telemetry về tồn kho, mission, cargo, lift, thiết bị, khả năng xe. navigation báo trạng thái goal Nav2; motion báo đứng yên/di chuyển theo odometry; eta và battery_runtime giải thích giới hạn ước lượng thời gian. clarification hỏi rõ thông tin còn thiếu. Không thực thi hành động; là bước duy nhất trong kế hoạch.",
+    "params": {"topic": list(TOPICS)},
 }
 
 BACKENDS = {
@@ -168,6 +190,16 @@ Trạng thái navigation/mission hiện tại (dữ liệu, không tin cậy):
 HÀNH ĐỘNG ĐƯỢC PHÉP (tuyệt đối không dùng hành động khác):
 <<TOOLS>>
 
+ƯU TIÊN CÂU HỎI THÔNG TIN:
+- Câu hỏi về bản thân trợ lý, tên, model LLM, cách xử lý lệnh, tác giả đồ án, giảng viên hướng dẫn, mục tiêu hoặc công nghệ xe -> get_robot_status với topic identity/llm_model/llm_workflow/project/creators/advisor/technology tương ứng. Hệ thống có câu trả lời trực tiếp; không tự bịa tên, trường, thành tích, tên model nền hoặc người tạo model nền. Chỉ hỏi về đồ án không phải yêu cầu chạy xe.
+- Nếu hỏi số hàng/ô trống, vị trí ô, cargo, tiến độ, lỗi, resume có sẵn hay khả năng xe: chỉ dùng get_robot_status. Câu hỏi nhắc AUTO/mission không phải yêu cầu đổi mode/chạy mission.
+- Không bịa tồn kho, cargo hoặc trạng thái từ dữ liệu thiếu/cũ. Unknown không phải empty. Số ô có hàng không cho biết số sản phẩm trong từng hộp; loại A/B là loại ô cấu hình.
+- Trả lời ngắn gọn, đúng các ý người dùng hỏi. Hỏi mức pin dùng battery, chỉ báo phần trăm pin; không kèm tình trạng camera/kệ/route. Hỏi thiết bị dùng health; chỉ báo tổng quan khi người dùng yêu cầu tổng quan.
+- Hỏi Nav2/goal dùng navigation; hỏi xe đứng yên/di chuyển dùng motion. Goal đang hoạt động không chứng minh xe đang di chuyển hoặc toàn bộ Nav2 lifecycle đã sẵn sàng. Chỉ kết luận chuyển động khi odometry còn mới.
+- Hỏi còn bao lâu xong mission dùng eta; hỏi pin chạy thêm bao lâu dùng battery_runtime. Hệ thống chưa có ước lượng thời gian đáng tin cậy; không tự suy từ phần trăm tiến độ hoặc pin. Câu hỏi thiếu đối tượng dùng clarification.
+- Hỏi thông tin không cần xác nhận và không ngắt mission đang chạy. Không ghép get_robot_status với thao tác cơ khí; yêu cầu vừa hỏi vừa điều khiển thì clarify để tách yêu cầu, không âm thầm bỏ một phần.
+- Resume retrieval hoặc chuỗi MANUAL chỉ dùng checkpoint hợp lệ do hệ thống báo; không tự lập lại thao tác đã xong. Không hứa chạy song song hai mission vật lý.
+
 RÀO CHẮN PHÂN BIỆT BẮT BUỘC (ĐỌC KỸ TRƯỚC KHỊ CHỌN TOOL):
 1. TẤT CẢ các câu lệnh có chứa từ "auto", "bật auto", "bật chế độ auto", "mode auto", "chế độ auto", "chuyển auto", "manual", "auto mode", "manual mode" MÀ KHÔNG CÓ từ "mission" hoặc "chu trình" -> BẮT BUỘC CHỌN set_mode.
    - Ví dụ: "bật auto", "bật chế độ auto", "mode auto", "auto mode", "switch to auto" -> set_mode với mode="AUTO".
@@ -178,7 +210,8 @@ RÀO CHẮN PHÂN BIỆT BẮT BUỘC (ĐỌC KỸ TRƯỚC KHỊ CHỌN TOOL):
 ƯU TIÊN QUY TRÌNH TƯỜNG MINH: Nếu người dùng liệt kê các thao tác cụ thể theo thứ tự (đi tới, detect, chốt, pick, đi tới kệ, drop, về HOME), hãy sinh đủ các steps manual tương ứng theo đúng thứ tự. Quy tắc này ưu tiên hơn các quy tắc nhận diện yêu cầu chung bằng từ "lấy hàng", "đặt lên kệ", "mission" hoặc "chu trình". Không được rút quy trình nhiều bước thành action đầu tiên hay thay bằng auto/single cycle.
 
 BẢNG CHỌN LỆNH - phân loại toàn bộ yêu cầu; nếu có nhiều thao tác thì giữ tất cả theo thứ tự:
-1. Yêu cầu lấy N sản phẩm/hộp rồi đặt lên kệ, hoặc yêu cầu có loại medium/tall/high/cao -> start_single_cycle. quantity=N (mặc định 1); cargo_class="medium" cho medium/vừa, "tall" cho high/cao/tall, nếu không nêu loại dùng "any". Nếu nêu ô cụ thể A1/A2 thì chọn medium; B1/B2 thì chọn tall; đặt drop_slot tương ứng. Từ chối nếu số lượng >1 với ô cố định. Mission chỉ báo hoàn tất sau khi đủ số lượng đã đặt thành công lên kệ.
+1. Yêu cầu lấy pallet ra khỏi ô kệ, xuất kho, lấy hàng ở A1/A2/B1/B2 hoặc đưa về D_2 -> retrieve_pallet với slot tương ứng. Đây là retrieval ở AUTO, không phải lấy pallet sàn rồi đặt lên kệ.
+2. Yêu cầu lấy N sản phẩm/hộp/pallet rồi đặt lên kệ, hoặc yêu cầu có loại thấp/medium/tall/high/cao -> start_single_cycle. quantity=N (mặc định 1); cargo_class="medium" cho thấp/low/medium/vừa, "tall" cho high/cao/tall, nếu không nêu loại dùng "any". Nếu nêu ô cụ thể hoặc tầng kệ: "kệ tầng 1"/"tầng dưới"/"A1" -> drop_slot="A1" (medium); "kệ tầng 2"/"tầng trên"/"A2" -> drop_slot="A2" (medium); "B1"/"B2" -> drop_slot tương ứng (tall). Từ chối nếu số lượng >1 với ô cố định. Mission chỉ báo hoàn tất sau khi đủ số lượng đã đặt thành công lên kệ.
 2. Câu chỉ nói "one cycle / một chu trình / một lần / single" mà không yêu cầu nhiều sản phẩm -> start_single_cycle với quantity=1, cargo_class="any".
 3. Câu có từ "mission" hoặc "chu trình" (start mission, start auto mission, bật mission, chạy mission, bắt đầu mission, chạy chu trình auto) -> start_auto_cycle.
 4. Câu có "resume / tiếp tục" -> resume_cycle.
@@ -188,16 +221,16 @@ BẢNG CHỌN LỆNH - phân loại toàn bộ yêu cầu; nếu có nhiều tha
    - Nếu Vietnamese: "Bạn muốn Start Mission hay chuyển Navigation sang AUTO?"
 PHÂN RÃ CÂU LỆNH NHIỀU BƯỚC (BẮT BUỘC):
 - Không dừng ở ý định đầu tiên. Tạo một step cho MỖI thao tác người dùng yêu cầu, giữ nguyên thứ tự; giữ các thao tác độc lập thành steps riêng.
-- Khi người dùng nêu quy trình manual rõ ràng như đi tới Pick 1, detect, dừng/chốt detect, lấy pallet, đi tới kệ, đặt pallet, về HOME: dùng lần lượt quick_goal(P_1), detect_pallet, lock_detection, pick_pallet, go_mission(p1_to_d1), drop_pallet, go_mission(return_home). Không thay quy trình rõ ràng này bằng start_single_cycle.
-- Với các câu lệnh ở nhiều lượt: nếu vị trí hiện tại đã là P_1/P_2 và người dùng chỉ nói lấy/pick, gọi pick_pallet trực tiếp để dùng pose READY đã chốt; không điều hướng hoặc detect lại. Nếu vị trí là P_1/P_2 và người dùng nói đem pallet tới kệ, đặt xuống rồi về HOME, tạo đủ go_mission(p1_to_d1/p2_to_d1), drop_pallet, go_mission(return_home). Nếu đã ở D_1 và đang mang pallet, chỉ cần drop_pallet rồi return_home theo yêu cầu.
+- Khi người dùng nêu quy trình manual rõ ràng như đi tới Pick, detect, dừng/chốt detect, lấy pallet, đi tới kệ, đặt pallet, về HOME: dùng lần lượt quick_goal(P_1), detect_pallet, lock_detection, pick_pallet, go_mission(p1_to_d1), drop_pallet, go_mission(return_home). Không thay quy trình rõ ràng này bằng start_single_cycle.
+- Với các câu lệnh ở nhiều lượt: nếu vị trí hiện tại đã là P_1 và người dùng chỉ nói lấy/pick, gọi pick_pallet trực tiếp để dùng pose READY đã chốt; không điều hướng hoặc detect lại. Nếu vị trí là P_1 và người dùng nói đem pallet tới kệ, đặt xuống rồi về HOME, tạo đủ go_mission(p1_to_d1), drop_pallet, go_mission(return_home). Nếu đã ở D_1 và đang mang pallet, chỉ cần drop_pallet rồi return_home theo yêu cầu.
 - Nếu người dùng chỉ nói lấy pallet và đặt lên kệ mà không yêu cầu các thao tác riêng, có thể dùng start_single_cycle.
 
-7. Chỉ nhận diện/detect pallet, KHÔNG lấy -> detect_pallet. Nếu yêu cầu vừa đi tới Pick 1/2 vừa detect thì dùng quick_goal tới P_1/P_2 rồi detect_pallet; tuyệt đối không dùng pick_pallet nếu người dùng không bảo lấy/nâng pallet.
+7. Chỉ nhận diện/detect pallet, KHÔNG lấy -> detect_pallet. Nếu yêu cầu vừa đi tới Pick vừa detect thì dùng quick_goal tới P_1 rồi detect_pallet; tuyệt đối không dùng pick_pallet nếu người dùng không bảo lấy/nâng pallet.
 8. Dừng detect/chốt mẫu -> lock_detection; nếu người dùng đồng thời yêu cầu các bước tiếp theo, thêm tiếp các action tương ứng.
-9. Đi tới MỘT điểm đơn thuần (go pick 1, go pick 2, go drop, return home, về home, về nhà, đi tới P1/P2/D1, go to P1/P2/D1) -> quick_goal.
-10. Thao tác pallet tay khi người dùng nói rõ muốn lấy/pick hoặc đặt/drop -> chỉ thêm go_mission nếu robot chưa ở điểm cần thiết; tại P_1/P_2 dùng pick_pallet trực tiếp, tại D_1 dùng drop_pallet trực tiếp. Giữ nguyên các bước đi/chốt/return được nêu. Detect đơn thuần không phải pick.
+9. Đi tới MỘT điểm đơn thuần (go pick, go drop, go D_2, return home, về home, về nhà, đi tới P1/D1/D2, go to P1/D1/D2) -> quick_goal.
+10. Thao tác pallet tay khi người dùng nói rõ muốn lấy/pick hoặc đặt/drop -> chỉ thêm go_mission nếu robot chưa ở điểm cần thiết; tại P_1 dùng pick_pallet trực tiếp, tại D_1 dùng drop_pallet trực tiếp. Giữ nguyên các bước đi/chốt/return được nêu. Detect đơn thuần không phải pick.
 11. Hạ càng về HOME/0 -> lift_home. Nếu người dùng nói nâng/hạ mà không nêu mức hoặc chiều cao thì hỏi lại; không tự đoán độ cao. Yêu cầu chiều cao số cụ thể như 15 cm -> lift_to height_cm=15. Mọi height_cm phải trong [0, 80]; ngoài giới hạn thì hỏi lại. Nếu người dùng nêu rõ preset low/carry thì dùng level tương ứng; carry=12 cm chỉ là preset phần mềm hiện có, chưa được xác nhận hiệu chuẩn phần cứng.
-12. Đi tiến/lùi một khoảng theo mét (ví dụ "tiến 1m tốc độ 0.1m/s") -> relative_move, direction forward/backward và dùng đúng distance_m, speed_mps người dùng nêu; nếu không nêu tốc độ thì dùng 0.1 m/s. Nếu yêu cầu tốc độ ngoài 0.03–0.25 m/s thì hỏi lại. Đây là lệnh MANUAL độc lập, không tự ghép với nhiệm vụ khác.
+12. Đi tiến/lùi một khoảng theo mét (ví dụ "tiến 1m tốc độ 0.1m/s") -> relative_move, direction forward/backward và dùng đúng distance_m, speed_mps người dùng nêu; nếu không nêu tốc độ thì dùng 0.1 m/s. Nếu yêu cầu tốc độ ngoài 0.03–0.25 m/s thì hỏi lại. Có thể ghép theo thứ tự với lift_home/lift_to và quick_goal HOME; đổi 50 cm thành distance_m=0.5. Mỗi bước phải hoàn tất mới chạy bước tiếp theo. Sau relative_move, vị trí node được coi là unknown; dùng quick_goal cho điểm tiếp theo, không đoán tên leg graph.
 13. Hủy goal điều hướng đang chạy (không phải mission, cancel navigation) -> cancel_navigation.
 14. Hủy / dừng mission (stop mission, cancel mission) -> stop_cycle.
 
@@ -207,10 +240,14 @@ PHÂN RÃ CÂU LỆNH NHIỀU BƯỚC (BẮT BUỘC):
 
 VÍ DỤ SONG NGỮ (BẮT BUỘC TUÂN THỦ NGÔN NGỮ <<LANGUAGE>>):
 - Khi <<LANGUAGE>> = Vietnamese:
+  User: lấy pallet ở A2 đưa về D_2
+  {"say":"Tôi sẽ chuyển sang AUTO, lấy pallet ở ô A2 đưa tới D_2 rồi về HOME.","clarify":null,"steps":[{"action":"retrieve_pallet","args":{"slot":"A2"}}]}
   User: lấy 2 box high rồi đặt lên kệ
   {"say":"Tôi sẽ lấy và đặt 2 hộp cao lên kệ, sau đó về HOME.","clarify":null,"steps":[{"action":"start_single_cycle","args":{"cargo_class":"tall","quantity":2}}]}
   User: lấy một hộp medium đặt ở A2
   {"say":"Tôi sẽ lấy một hộp medium và đặt vào ô A2.","clarify":null,"steps":[{"action":"start_single_cycle","args":{"cargo_class":"medium","quantity":1,"drop_slot":"A2"}}]}
+  User: lấy pallet thấp và đưa lên kệ tầng 2 dù kệ tầng 1 trống
+  {"say":"Tôi sẽ lấy một pallet thấp (medium) và đặt lên kệ tầng 2 (ô A2).","clarify":null,"steps":[{"action":"start_single_cycle","args":{"cargo_class":"medium","quantity":1,"drop_slot":"A2"}}]}
   User: tiến 1 mét với tốc độ 0.1 mét mỗi giây
   {"say":"Tôi sẽ chuyển sang MANUAL và đi tiến 1 mét với tốc độ 0.1 mét mỗi giây.","clarify":null,"steps":[{"action":"relative_move","args":{"direction":"forward","distance_m":1.0,"speed_mps":0.1}}]}
   User: hạ lift về HOME
@@ -219,6 +256,8 @@ VÍ DỤ SONG NGỮ (BẮT BUỘC TUÂN THỦ NGÔN NGỮ <<LANGUAGE>>):
   {"say":"Tôi sẽ tới P_1 và bật nhận diện pallet, không thực hiện thao tác lấy.","clarify":null,"steps":[{"action":"quick_goal","args":{"target":"P_1"}},{"action":"detect_pallet","args":{}}]}
   User: đi tới Pick 1, detect, chốt mẫu, lấy pallet, đem tới kệ đặt xuống rồi về Home
   {"say":"Tôi sẽ tới P_1, nhận diện và chốt pose pallet, lấy hàng, đem tới kệ đặt xuống rồi về HOME.","clarify":null,"steps":[{"action":"quick_goal","args":{"target":"P_1"}},{"action":"detect_pallet","args":{}},{"action":"lock_detection","args":{}},{"action":"pick_pallet","args":{}},{"action":"go_mission","args":{"name":"p1_to_d1"}},{"action":"drop_pallet","args":{}},{"action":"go_mission","args":{"name":"return_home"}}]}
+  User: hạ càng về HOME, lùi 50cm sau đó về home
+  {"say":"Tôi sẽ hạ càng về 0 cm, lùi 0,5 m rồi đi HOME, thực hiện lần lượt.","clarify":null,"steps":[{"action":"lift_home","args":{}},{"action":"relative_move","args":{"direction":"backward","distance_m":0.5,"speed_mps":0.1}},{"action":"quick_goal","args":{"target":"HOME"}}]}
   User: nâng càng lên 15cm
   {"say":"Tôi sẽ nâng càng lên 15 cm.","clarify":null,"steps":[{"action":"lift_to","args":{"height_cm":15}}]}
   User: bật chế độ auto
@@ -300,6 +339,8 @@ def validate_plan(plan, location, max_steps=8, allow_unmeasured_lift=False):
     clean, loc = [], location
     if any(isinstance(s, dict) and s.get("action") in CYCLE_ACTIONS for s in steps) and len(steps) != 1:
         raise ValueError("Lệnh cycle phải là hành động duy nhất trong kế hoạch")
+    if any(isinstance(s, dict) and s.get("action") == "get_robot_status" for s in steps) and len(steps) != 1:
+        raise ValueError("Câu hỏi trạng thái phải tách khỏi kế hoạch điều khiển")
     mode_after_steps = None
     for s in steps:
         if not isinstance(s, dict):
@@ -325,7 +366,7 @@ def validate_plan(plan, location, max_steps=8, allow_unmeasured_lift=False):
                         "height_cm" in args and key not in args):
                     continue
                 if key not in args or args[key] not in constraint:
-                    raise ValueError(f"{action}.{key}={args[key]!r} không hợp lệ")
+                    raise ValueError(f"{action}.{key}={args.get(key)!r} không hợp lệ")
             elif key in args:
                 value = args[key]
                 if (constraint.get("type") == "integer" and
@@ -341,8 +382,12 @@ def validate_plan(plan, location, max_steps=8, allow_unmeasured_lift=False):
                     raise ValueError(
                         f"{action}.{key} phải là số từ {constraint['min']} "
                         f"đến {constraint['max']}")
-        if action in {"relative_move", "lift_home"} and len(steps) != 1:
-            raise ValueError(f"{action} phải là hành động duy nhất trong kế hoạch")
+        if action == "relative_move" and "distance_m" not in args:
+            raise ValueError("relative_move cần distance_m")
+        if action == "relative_move":
+            loc = "unknown"
+        elif action == "quick_goal":
+            loc = {"HOME": "home", "P_1": "p1", "D_1": "d1", "D_2": "d2"}[args["target"]]
         if action == "lift_to":
             if ("level" in args) == ("height_cm" in args):
                 raise ValueError("lift_to cần đúng một trong level hoặc height_cm")

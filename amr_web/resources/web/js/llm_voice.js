@@ -5,19 +5,24 @@
 // - Dùng lại sendCommand() / WebSocket sẵn có. Nhận trạng thái qua window.handleLLMStatus().
 // - KHÔNG có nút dừng khẩn riêng: dashboard đã có nút dừng tổng.
 // Nạp SAU navigation.js:  <script src="js/llm_voice.js"></script>
+//
+// Bản sửa (chỉ 3 việc, các chức năng khác giữ nguyên):
+//   1) Giọng đọc: chọn giọng NỮ theo ngôn ngữ đang chọn (VI -> vi-VN, EN -> en-US).
+//   2) Bước chờ xác nhận: đọc câu diễn giải `say` đúng ngôn ngữ (không đọc mã "review_required").
+//   3) Mic KHÔNG tự bật sau khi trợ lý đọc xong; chỉ bật khi người dùng bấm nút mic.
 (function () {
     'use strict';
 
     // ============================================
     // Cấu hình
     // ============================================
-    const REQUIRE_NAV = true;    // phải bật Navigation (Nav2) mới cho LLM chạy lệnh
-    const LOCATIONS = ['home', 'p1', 'p2', 'd1', 'unknown'];
+    const LOCATIONS = ['home', 'p1', 'd2', 'd1', 'unknown'];
     // STOP intent at the start of a compound command still stops immediately;
     // trailing requests are discarded and can be sent again after the stop.
     const STOP_RE = /^(dừng( lại)?|dung( lai)?|stop( the robot)?|emergency stop|khẩn cấp|hủy|huỷ|cancel|thôi)(?=$|[\s,;.!?:])/i;
     const CANCEL_RE = /^(hủy|huỷ|không|thôi|cancel|no)$/i;
-    const YES_RE = /^(xác nhận|đồng ý|ok|okay|oke|chạy đi|làm đi|được|confirm|yes|go ahead)(\s|$)/i;
+    const YES_RE = /^(xác nhận|đồng ý|ok|okay|oke|chạy đi|làm đi|được|confirm|yes|go ahead)$/i;
+    const CONTINUE_RE = /^(tiếp tục|tiep tuc|tiếp|giữ nguyên|đừng hủy|không hủy|không|continue|keep|resume|no)$/i;
     const WATCHDOG_MS = 6000;
 
     // ============================================
@@ -27,6 +32,7 @@
         en: {
             status: {
                 planning: 'Thinking…', waiting_confirm: 'Waiting for confirmation',
+                confirm_interrupt: 'Confirm interrupt', non_interruptible: 'Cannot interrupt',
                 running: 'Running', done: 'Done', started: 'Cycle started', simulated: 'Preview complete; no robot commands were sent', failed: 'Failed', error: 'Error',
                 clarify: 'Robot asks', stopped: 'Stopped', noop: 'Nothing to do',
                 cancelled: 'Cancelled', idle: 'Ready', busy: 'Busy'
@@ -64,6 +70,11 @@
             btnNo: 'Cancel',
             okYes: '✔ confirmed',
             okNo: '✖ cancelled',
+            btnInterruptYes: 'Cancel & run new',
+            btnInterruptNo: 'Continue current',
+            okInterruptYes: '✔ cancelled previous, running new command',
+            okInterruptNo: '▶ continuing current action',
+            speakInterrupt: "Say 'confirm' to cancel and run the new command, or 'continue' to keep the current action.",
             noteNew: '(replaced by a new plan)',
             noteDone: '(handled)',
             step: 'Step',
@@ -78,6 +89,7 @@
         vi: {
             status: {
                 planning: 'Đang suy nghĩ…', waiting_confirm: 'Chờ bạn xác nhận',
+                confirm_interrupt: 'Xác nhận hủy lệnh đang chạy', non_interruptible: 'Không thể hủy giữa chừng',
                 running: 'Đang chạy', done: 'Hoàn thành', started: 'Đã khởi động chu trình', simulated: 'Xem trước hoàn tất; robot không nhận lệnh điều khiển', failed: 'Thất bại', error: 'Lỗi',
                 clarify: 'Robot hỏi lại', stopped: 'Đã dừng',
                 noop: 'Không có hành động', cancelled: 'Đã hủy',
@@ -116,6 +128,11 @@
             btnNo: 'Hủy',
             okYes: '✔ đã xác nhận',
             okNo: '✖ đã hủy',
+            btnInterruptYes: 'Hủy & chạy lệnh mới',
+            btnInterruptNo: 'Tiếp tục lệnh cũ',
+            okInterruptYes: '✔ đã hủy lệnh cũ, chạy lệnh mới',
+            okInterruptNo: '▶ tiếp tục hành động đang chạy',
+            speakInterrupt: "Nói 'xác nhận' để hủy và chạy lệnh mới, hoặc 'tiếp tục' để giữ lệnh cũ.",
             noteNew: '(đã thay bằng kế hoạch mới)',
             noteDone: '(đã xử lý)',
             step: 'Bước',
@@ -462,14 +479,27 @@
         planBubble = { el: b, row: row };
     }
 
+    function showInterruptConfirm(s) {
+        closePlan(T().noteNew);
+        const b = h('div', 'llm-msg llm-plan');
+        b.appendChild(h('div', null, '⚠ ' + (s.msg || '')));
+        const row = h('div', 'llm-row');
+        row.style.marginTop = '6px';
+        const yes = h('button', 'llm-btn ok', T().btnInterruptYes);
+        const no = h('button', 'llm-btn', T().btnInterruptNo);
+        yes.onclick = () => { send({ command: 'llm_confirm', ok: true }); closePlan(T().okInterruptYes); };
+        no.onclick = () => { send({ command: 'llm_confirm', ok: false }); closePlan(T().okInterruptNo); };
+        row.appendChild(yes);
+        row.appendChild(no);
+        b.appendChild(row);
+        el.chat.appendChild(b);
+        scrollToBottom();
+        planBubble = { el: b, row: row };
+    }
+
     // ============================================
     // Điều kiện an toàn + gửi lệnh
     // ============================================
-    function preflight() {
-        if (REQUIRE_NAV && !window.isNavigationActive) return T().navWarn;
-        return null;
-    }
-
     function stopAll() {
         if (window.speechSynthesis) window.speechSynthesis.cancel();
         speaking = false;
@@ -483,8 +513,7 @@
     }
 
     function sendLLM(text, speechConfidence) {
-        const problem = preflight();
-        if (problem) { addMsg('sys', '⚠ ' + problem, 'err'); toast(problem, 'warn'); speak(problem); return; }
+        // Server applies motion readiness; read-only questions also work with Nav2 stopped.
         addMsg('user', text);
         activity('info', 'LLM lệnh: ' + text);
         const command = { command: 'llm_command', text: text, language: lang };
@@ -504,7 +533,12 @@
         el.input.value = '';
         const t = text.toLowerCase().replace(/[.,!?]/g, '').trim();
         const waiting = state === 'waiting_confirm';
+        const waitingInterrupt = state === 'confirm_interrupt';
         if (STOP_RE.test(t)) { stopAll(); return; }
+        if (waitingInterrupt && (!fromVoice || el.vconfirm.checked)) {
+            if (YES_RE.test(t)) { addMsg('user', text); send({ command: 'llm_confirm', ok: true }); closePlan(T().okInterruptYes); return; }
+            if (CONTINUE_RE.test(t)) { addMsg('user', text); send({ command: 'llm_confirm', ok: false }); closePlan(T().okInterruptNo); return; }
+        }
         if (waiting && (!fromVoice || el.vconfirm.checked)) {
             if (YES_RE.test(t)) { addMsg('user', text); send({ command: 'llm_confirm', ok: true }); closePlan(T().okYes); return; }
             if (CANCEL_RE.test(t)) { addMsg('user', text); send({ command: 'llm_confirm', ok: false }); closePlan(T().okNo); return; }
@@ -516,14 +550,107 @@
     // ============================================
     // Giọng nói
     // ============================================
+
+    // ---- Chọn giọng đọc: ưu tiên giọng NỮ theo ngôn ngữ đang chọn ----
+    // Web Speech API không có thuộc tính giới tính, nên đoán theo tên giọng.
+    // Có thể ép đúng giọng bằng Console, ví dụ:
+    //   localStorage.setItem('llm_voice_vi', 'Microsoft HoaiMy Online (Natural) - Vietnamese (Vietnam)')
+    //   localStorage.setItem('llm_voice_en', 'Microsoft Zira - English (United States)')
+    let ttsVoices = [];
+    function loadVoices() {
+        if (window.speechSynthesis) ttsVoices = window.speechSynthesis.getVoices() || [];
+    }
+    if (window.speechSynthesis) {
+        loadVoices();
+        window.speechSynthesis.onvoiceschanged = loadVoices;   // Chrome nạp danh sách giọng chậm
+    }
+    const FEMALE_RE = /female|woman|nữ|hoai ?my|linh|zira|aria|jenny|samantha|hazel|susan|eva|libby|sonia|serena|karen|moira|tessa|google/i;
+    const MALE_RE = /\bmale\b|\bman\b|nam ?minh|\bdavid\b|\bmark\b|\bguy\b|\bdaniel\b|\balex\b|\bfred\b|\bgeorge\b|\bjames\b|\brichard\b|\bthomas\b/i;
+
+    // Ưu tiên giọng nữ tiếng Việt tự nhiên nhất trên trình duyệt Web:
+    // 1. Microsoft HoaiMy Online (Natural) - Edge
+    // 2. Google Tiếng Việt - Chrome
+    // 3. Linh - Safari (macOS/iOS)
+    const VI_FEMALE_PRIORITY = [
+        /hoai ?my|hoài ?my/i,
+        /google\s*tiếng\s*việt|google\s*vietnamese/i,
+        /\blinh\b/i,
+        /female|woman|nữ|mai|lan|ngọc|ngoc|thảo|thao|vy|nhi|trâm|tram|hương|huong/i
+    ];
+    const VI_MALE_RE = /\bmale\b|\bman\b|nam ?minh|microsoft\s*an|\ban\b/i;
+
+    function normLang(l) { return (l || '').toLowerCase().replace('_', '-'); }
+
+    function pickViFemaleVoice() {
+        if (!ttsVoices.length) loadVoices();
+        const cand = ttsVoices.filter((v) => normLang(v.lang).startsWith('vi') || /tiếng\s*việt|vietnamese/i.test(v.name));
+        if (!cand.length) return null;
+        const forced = loadStr('voice_vi', '');
+        if (forced) {
+            const f = cand.find((v) => v.name === forced);
+            if (f) return f;
+        }
+        const scoreVi = (v) => {
+            if (VI_MALE_RE.test(v.name)) return -10;
+            for (let i = 0; i < VI_FEMALE_PRIORITY.length; i++) {
+                if (VI_FEMALE_PRIORITY[i].test(v.name)) {
+                    return (VI_FEMALE_PRIORITY.length - i) * 10 + (/natural|online/i.test(v.name) ? 3 : 0);
+                }
+            }
+            return normLang(v.lang) === 'vi-vn' ? 1 : 0;
+        };
+        return cand.slice().sort((a, b) => scoreVi(b) - scoreVi(a))[0];
+    }
+
+    function pickVoice(code) {
+        const base = code.slice(0, 2).toLowerCase();
+        if (base === 'vi') return pickViFemaleVoice();
+        const cand = ttsVoices.filter((v) => normLang(v.lang).startsWith(base));
+        if (!cand.length) return null;
+        const forced = loadStr('voice_' + base, '');   // tùy chọn: ép tên giọng qua localStorage
+        if (forced) { const f = cand.find((v) => v.name === forced); if (f) return f; }
+        const score = (v) => (FEMALE_RE.test(v.name) ? 2 : 0) - (MALE_RE.test(v.name) ? 3 : 0)
+            + (normLang(v.lang) === code.toLowerCase() ? 1 : 0) + (/natural|online/i.test(v.name) ? 1 : 0);
+        return cand.slice().sort((a, b) => score(b) - score(a))[0];
+    }
+
     function speak(text, cb) {
         if (!el.tts || !el.tts.checked || !text || !window.speechSynthesis) { if (cb) cb(); return; }
         window.speechSynthesis.cancel();
-        const u = new SpeechSynthesisUtterance(text);
-        u.lang = lang === 'vi' ? 'vi-VN' : 'en-US';
-        speaking = true;
-        u.onend = u.onerror = () => { speaking = false; if (cb) cb(); };
-        window.speechSynthesis.speak(u);
+        const code = lang === 'vi' ? 'vi-VN' : 'en-US';
+
+        const runSpeak = () => {
+            const u = new SpeechSynthesisUtterance(text);
+            u.lang = code;
+            const v = pickVoice(code);
+            if (v) {
+                u.voice = v;
+                u.lang = v.lang || code;
+                if (lang === 'vi' && !/hoai ?my|hoài ?my|google|linh/i.test(v.name)) {
+                    u.pitch = 1.1;
+                }
+            }
+            speaking = true;
+            u.onend = u.onerror = () => { speaking = false; if (cb) cb(); };
+            window.speechSynthesis.speak(u);
+        };
+
+        if (lang === 'vi' && !ttsVoices.length) {
+            loadVoices();
+            if (!ttsVoices.length) {
+                let done = false;
+                const once = () => {
+                    if (done) return;
+                    done = true;
+                    loadVoices();
+                    runSpeak();
+                };
+                window.speechSynthesis.addEventListener('voiceschanged', once, { once: true });
+                setTimeout(once, 250);
+                return;
+            }
+        }
+        runSpeak();
     }
 
     function setMic(on) {
@@ -600,6 +727,12 @@
     window.handleLLMStatus = function (msg) {
         const s = (msg && msg.data) ? msg.data : msg;
         if (!s || !s.state || !el.chat) return;
+        if (s.state === 'answer' && s.observational === true) {
+            clearTimeout(watchdog);
+            addMsg('robot', s.msg || '');
+            speak(s.msg);
+            return; // Preserve running state and confirmation/interrupt controls.
+        }
         clearTimeout(watchdog);
         const prev = state;
         state = s.state;
@@ -608,7 +741,7 @@
         renderStatus();
         if (LOCATIONS.includes(s.location)) el.locsel.value = s.location;
 
-        if (s.state !== 'waiting_confirm') closePlan(T().noteDone);
+        if (s.state !== 'waiting_confirm' && s.state !== 'confirm_interrupt') closePlan(T().noteDone);
 
         if (s.state === 'running') {
             if (s.step !== lastStep) {
@@ -619,17 +752,28 @@
         } else {
             lastStep = -1;
         }
-        if (prev === s.state) return;
+        if (prev === s.state && s.state !== 'confirm_interrupt' && s.state !== 'non_interruptible') return;
 
         const t = T();
         switch (s.state) {
             case 'waiting_confirm':
                 showPlan(s);
-                speak((s.msg || '') + ' ' + t.speakConfirm, () => { if (el.vconfirm.checked) startListen(); });
+                // Đọc câu diễn giải `say` (đúng ngôn ngữ đã chọn), không đọc mã "review_required".
+                // Không tự bật mic: người dùng bấm nút Xác nhận/Hủy, hoặc tự bấm mic rồi nói.
+                speak((s.say || '') + ' ' + t.speakConfirm);
+                break;
+            case 'confirm_interrupt':
+                showInterruptConfirm(s);
+                speak((s.msg || '') + ' ' + t.speakInterrupt);
+                break;
+            case 'non_interruptible':
+                addMsg('robot', '⚠ ' + (s.msg || t.status.non_interruptible), 'err');
+                speak(s.msg || t.status.non_interruptible);
+                toast(s.msg || t.status.non_interruptible, 'warn');
                 break;
             case 'clarify':
                 addMsg('robot', '❓ ' + s.msg);
-                speak(s.msg, startListen);
+                speak(s.msg);   // không tự bật mic; người dùng tự bấm mic để trả lời
                 break;
             case 'done':
                 const doneText = s.msg || t.status.done;

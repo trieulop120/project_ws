@@ -24,6 +24,10 @@ Luong:
                    -> DONE    : xong 1 chu trinh
     [STOP]       -> huy Nav2, dung xe, DUNG LIFT (M0), pause detector inference
 
+Drop / retrieval: xoay + di ngang (ke ca map trim) TRUOC khi nang cang.
+Sau nang cang: CONVERGE -> GATE -> LOCK, bu goc/ngang trong luc tien.
+Sai lech qua nguong hoac khong qua cong -> dung; khong lui/xoay canh lai.
+
 Bo dieu khien (class ApproachController) la python thuan, khong phu thuoc ROS,
 da duoc mo phong kiem tra rieng.
 
@@ -53,6 +57,7 @@ import shutil
 import signal
 import subprocess
 import time
+import uuid
 from collections import deque
 from typing import Optional, Tuple
 
@@ -63,12 +68,14 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.time import Time
 from rclpy.parameter import Parameter
-from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, qos_profile_sensor_data
+from amr_mission_manager.pallet_recovery import PalletRecovery
 
-from action_msgs.msg import GoalStatus
+from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import PoseStamped, Twist, Point
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState, Range
 from std_msgs.msg import String, ColorRGBA, Int8MultiArray, Bool
 from std_srvs.srv import SetBool, Trigger
@@ -103,10 +110,13 @@ BUSY_STATES = (NAVIGATING, SETTLING, ALIGNING, INSERTING, LIFTING,
 
 # Tham so (gia tri mac dinh). Launch chi truyen mot phan; phan con lai lay o day.
 DEFAULTS = {
+    'resume_max_pause_s': 120.0,
+    'resume_pose_tol_m': 0.03,
+    'resume_yaw_tol_deg': 3.0,
     # detector
     'detector_package': 'amr_perception',
     'detector_executable': 'pallet_detector_ov',   # OpenVINO; 'pallet_detector' = best.pt
-    'detector_prewarm': True,       # preload weights at startup; inference stays paused until Detect ON
+    'detector_prewarm': False,       # preload weights; keep inference paused until Detect ON
     'detector_prewarm_retry_s': 5.0,
     'detector_camera_info_in': '/camera/color/camera_info',
     'detector_camera_info_out': '/color/camera_info',
@@ -165,7 +175,7 @@ DEFAULTS = {
     'rot_settle_s': 0.5,
     'lat_tol_cm': 2.5,              # lech ngang > nguong -> di ngang (cong gate_lat_cm van bat 2cm)
     'max_sidestep_m': 0.30,
-    'max_sidesteps': 2,
+    'max_sidesteps': 1,
     'side_speed': 0.05,
     'side_tol_deg': 3.0,
     'side_accept_deg': 6.0,
@@ -194,7 +204,7 @@ DEFAULTS = {
     'lock_lat_abort_cm': 3.0,
     'lock_yaw_abort_deg': 4.0,
     # dung (sieu am)
-    'stop_dist_cm': 7.0,
+    'stop_dist_cm': 4.5,
     'confirm_count': 10,
     'us_arm_m': 0.10,               # chi tin sieu am sau khi da di vao >= 10 cm tu cong
     'us_below_min_is_close': True,  # doc < min_range cung tinh la "sat"
@@ -212,8 +222,8 @@ DEFAULTS = {
     'auto_lift': True,              # True: vao pallet xong tu nang -> lui -> Home -> ha lift
     'lift_height_cm': 5.0,          # chieu cao nang (cm)
     'lift_tol_cm': 1.0,
-    'lift_timeout_s': 150.0,
-    'lift_start_timeout_s': 6.0,
+    'lift_timeout_s': 180.0,
+    'lift_start_timeout_s': 10.0,
     'lift_move_eps_cm': 0.3,
     'lift_settle_s': 0.5,            # sau khi lift dat du chieu cao (nang/ha): cho
                                       # on dinh `lift_settle_s` (vung bi, lech vai mm)
@@ -238,13 +248,20 @@ DEFAULTS = {
     'drop_stop_dist_cm': 3.0,       # sieu am dung; shelf.yaml insert.stop_dist_cm uu tien neu co
     'drop_start_tol_m': 0.40,       # xe phai o gan D_1: sai so doc/ngang toi da so voi vi tri mong doi
     'drop_start_yaw_deg': 25.0,
-    'drop_stage_m': 0.90,           # base_footprint -> mat ke luc bat dau (= D_1 -> mat ke)
+    'drop_stage_m': 0.65,           # khoang lui khi can cho xoay; vi tri ke lay tu shelf.yaml
+    # DROP Nav2 staging and local retreat use the same base-to-rack distance.
+    'drop_nav_timeout_s': 180.0,
+    'drop_stop_timeout_s': 10.0,
+    'drop_odom_topic': '/odometry/filtered',
+    'drop_odom_stale_s': 0.5,
+    'drop_stop_linear_mps': 0.02,
+    'drop_stop_angular_rps': 0.04,
     'drop_rot_clear_m': 0.60,       # cho de xoay tai cho khi dang mang pallet
     'drop_max_sidestep_m': 0.80,    # cho phep di ngang toi 0.60 m (cot A / B2)
     'drop_side_speed': 0.05,
     'drop_gate_margin_m': 0.10,     # cong cach mat ke (tinh tu mui cang)
     'drop_insert_speed': 0.08,
-    'drop_max_insert_m': 1.20,      # chot an toan, KHONG phai do sau ke
+    'drop_max_insert_m': 0.60,      # chot an toan, KHONG phai do sau ke
     'drop_clear_m': 0.30,           # lui ra cho mui cang cach mat ke >= nay roi ha lift
     'drop_backoff_min_m': 0.50,
     'drop_backoff_timeout_s': 40.0,
@@ -260,12 +277,19 @@ DEFAULTS = {
     'map_yaw_trim': False,          # True: truoc khi tien vao, chinh lai huong theo yaw MAP hien tai
                                     # (AMCL) thay vi yaw odom da dong bang luc detect
     'amcl_shift_fail_m': 0.60,
-    # Drop: chup lai pose o ke theo map->odom MOI NHAT khi toi CONVERGE (sau khi xe xoay/di ngang).
-    # Luon LOG do dich; chi AP DUNG khi drop_map_trim=True. Tach rieng voi map_yaw_trim (pick).
-    'drop_map_trim': True,
-    'drop_trim_shift_cm': 2.0,      # dich > nguong -> canh lai
-    'drop_trim_yaw_deg': 1.0,       # xoay > nguong -> canh lai
-    'drop_trim_max_shift_m': 0.15,  # dich > nguong nay: nghi ngo AMCL nhay -> KHONG ap dung, chi canh bao
+    # Legacy TF-based trim, once BEFORE committing the lateral manoeuvre.
+    'drop_map_trim': False,
+    # Retrieval rack alignment keeps its previous trim default independently.
+    'retrieval_map_trim': False,
+    # Observation alignment is local to the selected Nav2 stance, not D_1.
+    'retrieval_align_max_offset_m': 0.20,
+    'retrieval_stage_m': 0.65,      # base_footprint -> detected pallet face
+    'retrieval_nav_position_tol_m': 0.10,
+    'retrieval_nav_timeout_s': 180.0,
+    'retrieval_stop_timeout_s': 10.0,
+    'drop_trim_shift_cm': 2.0,
+    'drop_trim_yaw_deg': 1.0,
+    'drop_trim_max_shift_m': 0.15,  # larger jump: warn and keep the original line
     # marker
     'face_width_m': 1.2,
 }
@@ -394,14 +418,16 @@ class ApproachController:
     CONVERGE, GATE, LOCK = 'CONVERGE', 'GATE', 'LOCK'
     ALIGN_PHASES = (ENTER, RETREAT, ALIGN, SIDE_TURN, SIDE_DRIVE)
 
-    def __init__(self, p: dict, stage_m: float):
+    def __init__(self, p: dict, stage_m: float, align_only: bool = False):
         self.p = p
         self.stage_m = stage_m
+        self.align_only = bool(align_only)
         self.log = []
         self.reset()
 
     def reset(self):
         self.phase = self.ENTER
+        self.insertion_only = False
         self.t_start = None
         self.t_phase = 0.0
         self._wait_t0 = None
@@ -438,8 +464,9 @@ class ApproachController:
     def restart_align(self, now):
         self._goto(self.ALIGN, now)
 
-    def resume_converge(self, now):
-        """Tiep tuc tien toi cong sau khi nang lift (reset dong ho phase)."""
+    def resume_converge(self, now, insertion_only=False):
+        """Resume driving; raised forks may steer, but never turn/side-step."""
+        self.insertion_only = bool(insertion_only)
         self._goto(self.CONVERGE, now)
 
     def _min_wz(self, wz, e_h):
@@ -519,6 +546,9 @@ class ApproachController:
 
         ph = self.phase
 
+        if self.insertion_only and ph in self.ALIGN_PHASES:
+            return self._fail('Sau lift chi duoc tien bu sai lech, khong xoay/di ngang')
+
         if ph == self.ENTER:
             if a + fork > -0.02:
                 return self._fail(f'Mui cang da toi/qua mat pallet (a={a*100:.0f} cm) -> khong tu dong')
@@ -562,6 +592,8 @@ class ApproachController:
                     return 0.0, 0.0, None, None
                 if abs(e_lat) > p['gate_lat_cm'] / 100.0:
                     return self._fail(f'Di ngang {self.sidesteps} lan van lech {e_lat*100:+.1f} cm')
+            if self.align_only:
+                return 0.0, 0.0, 'TF alignment complete', None
             self._goto(self.CONVERGE, now)
             return 0.0, 0.0, None, None
 
@@ -597,6 +629,9 @@ class ApproachController:
                 self._goto(self.GATE, now)
                 return 0.0, 0.0, None, None
             if abs(e_yaw) > math.radians(p['realign_deg']):
+                if self.insertion_only:
+                    return self._fail(
+                        f'Lech goc sau lift {math.degrees(e_yaw):+.1f} deg -> dung, khong xoay lai')
                 self.log.append(f'Lech goc {math.degrees(e_yaw):+.1f} deg khi tien -> dung xoay lai')
                 self._goto(self.ALIGN, now)
                 return 0.0, 0.0, None, None
@@ -613,6 +648,9 @@ class ApproachController:
                 self._a_lock0 = a
                 self._goto(self.LOCK, now)
                 return 0.0, 0.0, None, None
+            if self.insertion_only:
+                return self._fail(f'Khong qua cong sau lift: lat={lat_cm:+.1f} cm '
+                                  f'yaw={yaw_deg:+.1f} deg -> dung, khong lui canh lai')
             if self.gate_retries < int(p['max_gate_retries']):
                 self.gate_retries += 1
                 self.sidesteps = 0
@@ -657,7 +695,7 @@ PHASE_TEXT = {
 }
 
 
-class PalletMission(Node):
+class PalletMission(PalletRecovery, Node):
 
     def __init__(self):
         super().__init__(NODE_NAME)
@@ -675,6 +713,21 @@ class PalletMission(Node):
                 f"-> dung {self.stage_m:.2f} m (mat pallet -> base_footprint)")
 
         # ---------------- State ----------------
+        self._session_id = uuid.uuid4().hex
+        self._operation_id = 0
+        self._resume_operation_id = None
+        self._last_resumed_checkpoint_id = 0
+        self._checkpoint = None
+        self._manager_busy = None
+        self._manager_status_t = 0.0
+        self._nav_epoch = 0
+        self._nav_pending = None
+        self._nav_results = []
+        self._stop_request_futures = []
+        self._resume_still_since = None
+        self._lift_still_since = None
+        self._lift_still_anchor = None
+        self._lift_resume_after = None
         self._state = IDLE
         self._msg = 'San sang'
         self._samples = deque(maxlen=600)
@@ -691,6 +744,8 @@ class PalletMission(Node):
         self._settle_t0 = 0.0
         self._settle_tf = []
         self._handoff_t0 = None
+        self._retrieval_pick_nav = None
+        self._retrieval_pick_nav_elapsed = 0.0
         self._tf_miss = 0
         self._ctl = ApproachController(self.p, self.stage_m)
         self._phase_shown = None
@@ -734,11 +789,25 @@ class PalletMission(Node):
 
         # ---------------- Drop / cargo / shelf ----------------
         self._mode = 'pick'             # 'pick' | 'drop' (dung chung ApproachController)
+        self._retrieval_mode = False
+        self._retrieval_align_only = False
+        self._retrieval_nav_active = None
+        self._retrieval_nav_t = 0.0
+        self._retrieval_slot = ''
+        self._retrieval_pose = None
+        self._retrieval_pose_t = 0.0
+        self._retrieval_carry_height_cm = None
+        self._retrieval_pick_lift_cm = None
         self._lift_next = 'pick_backoff'
         self._bo_after = 'pick'
         self._bo_timeout = float(self.p['backoff_timeout_s'])
         self._drop = None               # dict thong tin lan drop hien tai
+        self._drop_nav = None           # per-goal ownership; late callbacks cannot resume DROP
+        self._drop_odom_t = 0.0
+        self._drop_odom_speed = None
         self._drop_lifted = False
+        self._rack_trimmed = False
+        self._rack_trim_frame = None
         self._drop_back_m = 0.0
         self._cargo_samples = deque(maxlen=300)   # (t, class, height_m) tu /pallet/cargo
         self._cargo_class = None        # 'medium' | 'tall' | 'unknown' | None
@@ -774,9 +843,18 @@ class PalletMission(Node):
         self.pub_detector_enable.publish(Bool(data=False))
 
         self.create_subscription(PoseStamped, self.p['pose_topic'], self._on_pose, 10)
+        self.create_subscription(PoseStamped, '/pallet_retrieval/selected_pose',
+                                 self._on_retrieval_pose, 10)
+        self.create_subscription(String, '/pallet_retrieval/selected_slot',
+                                 self._on_retrieval_slot, 10)
         self.create_subscription(Range, self.p['range_topic'], self._on_range, 10)
+        self.create_subscription(String, self.p['esp32_cmd_topic'], self._on_lift_command, 10)
         self.create_subscription(JointState, self.p['joint_states_topic'],
-                                 self._on_joint_states, 10)
+                                 self._on_joint_states, qos_profile_sensor_data)
+        self.create_subscription(Odometry, self.p['drop_odom_topic'],
+                                 self._on_drop_odom, qos_profile_sensor_data)
+        self.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status',
+                                 self._on_retrieval_nav_status, 10)
         self.create_subscription(String, self.p['cargo_topic'], self._on_cargo, 10)
         self.create_subscription(Int8MultiArray, self.p['shelf_topic'], self._on_shelf, 10)
 
@@ -784,6 +862,8 @@ class PalletMission(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self._nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._manager_stop_cli = self.create_client(Trigger, '/mission_manager/stop')
+        self.create_subscription(String, '/mission/status', self._on_manager_status, 10)
         self._cancel_all_cli = self.create_client(
             CancelGoal, '/navigate_to_pose/_action/cancel_goal')
 
@@ -791,10 +871,27 @@ class PalletMission(Node):
         self.create_service(Trigger, f'{NODE_NAME}/go_to_pallet', self._srv_go)
         self.create_service(Trigger, f'{NODE_NAME}/lift_home', self._srv_lift_home)
         self.create_service(Trigger, f'{NODE_NAME}/stop', self._srv_stop)
+        self.create_service(Trigger, f'{NODE_NAME}/resume', self._srv_resume)
+        self.create_service(Trigger, f'{NODE_NAME}/confirm_empty', self._srv_confirm_empty)
         self.create_service(Trigger, f'{NODE_NAME}/reset', self._srv_reset)
+        self.create_service(Trigger, f'{NODE_NAME}/discard_recovery', self._srv_discard_recovery)
         self.create_service(Trigger, f'{NODE_NAME}/calibrate', self._srv_calibrate)
         self.create_service(Trigger, f'{NODE_NAME}/set_home', self._srv_set_home)
         self.create_service(Trigger, f'{NODE_NAME}/drop', self._srv_drop)
+        self.create_service(Trigger, f'{NODE_NAME}/retrieval_pick',
+                            self._srv_retrieval_pick)
+        self.create_service(Trigger, f'{NODE_NAME}/retrieval_home',
+                            self._srv_retrieval_home)
+        self.create_service(Trigger, f'{NODE_NAME}/retrieval_align',
+                            self._srv_retrieval_align)
+        self.create_service(Trigger, f'{NODE_NAME}/retrieval_release',
+                            self._srv_retrieval_release)
+        self.create_service(Trigger, f'{NODE_NAME}/retrieval_backoff',
+                            self._srv_retrieval_backoff)
+        self.create_service(Trigger, f'{NODE_NAME}/retrieval_detector_start',
+                            self._srv_retrieval_detector_start)
+        self.create_service(Trigger, f'{NODE_NAME}/retrieval_detector_stop',
+                            self._srv_retrieval_detector_stop)
 
         self.create_timer(0.05, self._tick)
         self.create_timer(0.5, self._slow_tick)
@@ -815,6 +912,15 @@ class PalletMission(Node):
 
     # ==================================================================
     def _set_state(self, state: str, msg: str = '', fail_phase=None):
+        if state in (*BUSY_STATES, DETECTING) and self._state not in (*BUSY_STATES, DETECTING):
+            if self._resume_operation_id is None:
+                self._operation_id += 1
+            self._resume_operation_id = None
+        if state in (FAILED, STOPPED):
+            self._capture_recovery()
+            self._cancel_all_nav()
+            self._halt()
+            self._lift_stop()
         self._state = state
         self._msg = msg
         # pha ApproachController luc FAILED (None neu khong phai loi approach) -> supervisor
@@ -851,7 +957,8 @@ class PalletMission(Node):
             err = {'lat_cm': round(e_lat * 100, 1), 'yaw_deg': round(math.degrees(e_yaw), 1),
                    'to_face_cm': round(-a * 100, 0),
                    'yaw_map_deg': None if my is None else round(my, 1)}
-        d = {'state': self._state, 'msg': self._msg, 'samples': len(self._samples),
+        d = {'session_id': self._session_id, 'operation_id': self._operation_id,
+             'last_resumed_checkpoint_id': self._last_resumed_checkpoint_id, 'state': self._state, 'msg': self._msg, 'samples': len(self._samples),
              'live': live, 'pallet': pallet, 'pre': pre, 'us_cm': us,
              'us_count': self._us_count, 'us_fresh': us_fresh,
              'us_pick_confirmed': self._us_pick_confirmed,
@@ -864,7 +971,10 @@ class PalletMission(Node):
              'sel': {'cargo': str(self.get_parameter('cargo_type_override').value),
                      'slot': str(self.get_parameter('drop_slot').value)},
              'phase': self._ctl.phase if self._state in (ALIGNING, INSERTING) else None,
+             'rack_trimmed': self._rack_trimmed,
+             'insertion_only': self._ctl.insertion_only,
              'fail_phase': getattr(self, '_fail_phase', None),
+             'recovery': self._recovery_status(),
              'err': err}
         m = String()
         m.data = json.dumps(d)
@@ -895,16 +1005,65 @@ class PalletMission(Node):
                 close = True
         self._us_count = self._us_count + 1 if close else 0
 
+    def _on_manager_status(self, msg):
+        try:
+            data = json.loads(msg.data)
+            self._manager_busy = data.get('busy')
+            self._manager_status_t = time.monotonic()
+        except (ValueError, TypeError):
+            pass
+
+    def _on_lift_command(self, msg):
+        cp = self._checkpoint
+        command = msg.data.strip().upper()
+        if cp is not None and self._state in (STOPPED, FAILED) and command != 'M0':
+            if command == 'HOME' or command.startswith(('H', 'M')):
+                cp['invalidated'] = 'Lift was commanded outside the paused operation; inspect and reset'
+
     def _on_joint_states(self, msg: JointState):
         try:
             i = msg.name.index(self.p['lift_joint_name'])
-            self._lift_cm = float(msg.position[i]) * 100.0
-            self._lift_t = time.monotonic()
+            cm = float(msg.position[i]) * 100.0
+            now = time.monotonic()
+            if not math.isfinite(cm):
+                self._lift_cm = None
+                self._lift_still_since = None
+                return
+            if (self._lift_cm is None or now - self._lift_t > self.p['joint_stale_s']
+                    or self._lift_still_anchor is None
+                    or abs(cm - self._lift_still_anchor) > float(self.p['lift_move_eps_cm'])):
+                self._lift_still_anchor = cm
+                self._lift_still_since = now
+            elif self._lift_still_since is None:
+                self._lift_still_since = now
+            self._lift_cm, self._lift_t = cm, now
         except (ValueError, IndexError):
             pass
 
+    def _on_drop_odom(self, msg: Odometry):
+        """Measured stop confirmation for DROP only; PICK handoff is unchanged."""
+        twist = msg.twist.twist
+        speed = (math.hypot(twist.linear.x, twist.linear.y), abs(twist.angular.z))
+        now = time.monotonic()
+        ctx = self._drop_nav
+        if ctx is not None and (self._drop_odom_t <= 0.0
+                or now - self._drop_odom_t > float(self.p['drop_odom_stale_s'])
+                or not all(math.isfinite(v) for v in speed)
+                or speed[0] > float(self.p['drop_stop_linear_mps'])
+                or speed[1] > float(self.p['drop_stop_angular_rps'])):
+            ctx['stopped_since'] = None
+        if (now - self._drop_odom_t > self.p['drop_odom_stale_s']
+                or not all(math.isfinite(v) for v in speed)
+                or speed[0] > self.p['drop_stop_linear_mps']
+                or speed[1] > self.p['drop_stop_angular_rps']):
+            self._resume_still_since = None
+        elif self._resume_still_since is None:
+            self._resume_still_since = now
+        self._drop_odom_t = now
+        self._drop_odom_speed = speed
+
     def _lift_height_now(self) -> Optional[float]:
-        if self._lift_cm is None:
+        if self._lift_cm is None or not math.isfinite(self._lift_cm):
             return None
         if time.monotonic() - self._lift_t > self.p['joint_stale_s']:
             return None
@@ -924,17 +1083,453 @@ class PalletMission(Node):
         res.success, res.message = self._go_to_pallet()
         return res
 
-    def _srv_lift_home(self, req, res):
-        if self._state in BUSY_STATES:
+    def _on_retrieval_slot(self, msg: String):
+        self._retrieval_slot = str(msg.data).strip().upper()
+
+    def _on_retrieval_pose(self, msg: PoseStamped):
+        if msg.header.frame_id != self.p['map_frame']:
+            return
+        q = msg.pose.orientation
+        self._retrieval_pose = (
+            float(msg.pose.position.x), float(msg.pose.position.y),
+            float(msg.pose.position.z), yaw_from_quat(q))
+        self._retrieval_pose_t = time.monotonic()
+
+    def _on_retrieval_nav_status(self, msg):
+        # Action status is event-driven; keep the last known ownership state.
+        self._retrieval_nav_active = any(s.status in (1, 2, 3) for s in msg.status_list)
+        self._retrieval_nav_t = time.monotonic()
+
+    def _retrieval_navigation_idle(self):
+        return (self._retrieval_nav_t > 0.0 and self._retrieval_nav_active is False
+                and self._goal_handle is None and self._drop_nav is None)
+
+    def _retrieval_alignment_error(self, pose):
+        """Bound the existing align-only controller around its frozen stance."""
+        if not self._retrieval_navigation_idle():
+            return 'Nav2 is active or its ownership is unknown'
+        if (not self._ctl.align_only or self._ctl.phase not in self._ctl.ALIGN_PHASES
+                or not all(math.isfinite(v) for v in (*pose, *self._line))):
+            return 'Invalid retrieval observation alignment state/TF'
+        _, lateral, along = line_errors(*pose, *self._line, 0.0)
+        if math.hypot(lateral, along + self._ctl.stage_m) > self._ctl.p['max_sidestep_m'] + 1e-9:
+            return 'Retrieval alignment exceeded the small-correction stance window'
+        return None
+
+    def _srv_retrieval_align(self, _req, res):
+        if self._checkpoint is not None:
+            res.success, res.message = False, 'Saved pallet operation retained; Resume or explicitly reset first'
+            return res
+        """Align to the selected rack TF with Drop's controller, without insertion."""
+        self._reload_params(recompute_stage=False)
+        if self._state in BUSY_STATES or self._cargo is True:
             res.success = False
-            res.message = f'dang ban ({self._state}), khong the ha lift'
-        else:
-            self._esp32('HOME')
-            if self._state == CARRYING or self._cargo is True:
-                self._cargo = False
-                self._set_state(IDLE, 'Da ha lift tai cho, bo pallet')
+            res.message = f'pallet mission busy or carrying (state={self._state})'
+            return res
+        if self._shelf is None or self._retrieval_slot not in self._shelf._slot_by_id:
+            res.success = False
+            res.message = f'invalid retrieval slot: {self._retrieval_slot!r}'
+            return res
+
+        model, p = self._shelf, self.p
+        frame = model.slot_tf_frame(self._retrieval_slot)
+        slot_map = self._tf_pose(p['map_frame'], frame)
+        rp = self._robot_pose(p['map_frame'])
+        if (slot_map is None or rp is None
+                or not all(math.isfinite(v) for v in (*slot_map, *rp))):
+            res.success = False
+            res.message = f'missing rack or robot TF for retrieval alignment ({frame})'
+            return res
+
+        e_yaw, e_lat, a = line_errors(
+            rp[0], rp[1], rp[2], slot_map[0], slot_map[1], slot_map[2], 0.0)
+        expected_a = -float(model.front_distance_m)
+        # The column offset is already handled by Nav2. Only residual error
+        # around this slot's waiting pose may be corrected, never a full pitch.
+        tol = min(float(p['retrieval_align_max_offset_m']),
+                  float(p['drop_max_sidestep_m']), abs(float(model.col_pitch_m)) / 2.0)
+        if (not math.isfinite(tol) or tol <= 0.0 or
+                math.hypot(a - expected_a, e_lat) > tol + 1e-9 or
+                abs(math.degrees(e_yaw)) > float(p['drop_start_yaw_deg'])):
+            res.success = False
+            res.message = (
+                f'robot is not at the waiting pose for {self._retrieval_slot}: '
+                f'shelf distance {-a:.2f} m (expected {-expected_a:.2f} m), '
+                f'lateral error {e_lat * 100:+.0f} cm, '
+                f'yaw error {math.degrees(e_yaw):+.0f} deg')
+            return res
+
+        if not self._retrieval_navigation_idle():
+            res.success, res.message = False, 'Nav2 must finish before retrieval alignment'
+            return res
+        speed = self._drop_odom_speed
+        if (self._drop_odom_t <= 0.0 or time.monotonic() - self._drop_odom_t > 0.5
+                or speed is None or not all(math.isfinite(v) for v in speed)
+                or speed[0] > 0.02 or speed[1] > 0.04):
+            res.success, res.message = False, 'Fresh stopped odometry is required for retrieval alignment'
+            return res
+
+        ins = self._map_to_ins(*slot_map)
+        if ins is None or not all(math.isfinite(v) for v in ins):
+            res.success = False
+            res.message = 'cannot transform selected rack TF from map to odom'
+            return res
+        if self._lift_height_now() is None:
+            res.success = False
+            res.message = 'no fresh lift joint state for retrieval alignment'
+            return res
+
+        pd = dict(p)
+        pd.update({
+            'face_offset_m': 0.0,
+            'max_sidestep_m': tol,
+            'max_sidesteps': 1,
+            'side_speed': float(p['drop_side_speed']),
+            'rot_clear_m': float(p['drop_rot_clear_m']),
+            'total_timeout_s': float(p['drop_total_timeout_s']),
+        })
+        self._retrieval_mode = False
+        self._retrieval_align_only = True
+        self._retrieval_pose = None
+        self._retrieval_pose_t = 0.0
+        self._line = ins
+        self._mode = 'retrieval_align'
+        self._rack_trim_frame = frame
+        self._rack_trimmed = False
+        self._ctl = ApproachController(
+            pd, float(model.front_distance_m), align_only=True)
+        self._tf_miss = 0
+        self._phase_shown = None
+        self._set_state(ALIGNING, f'Aligning with rack TF for {self._retrieval_slot}')
+        res.success = True
+        res.message = f'Drop-style TF alignment started for {self._retrieval_slot}'
+        return res
+
+    def _srv_retrieval_home(self, _req, res):
+        if self._checkpoint is not None:
+            res.success, res.message = False, 'Saved pallet operation retained; Resume or explicitly reset first'
+            return res
+        """Home the lift and report completion through pallet_mission status."""
+        if self._state in BUSY_STATES or self._cargo is True:
+            res.success = False
+            res.message = f'pallet mission busy or carrying (state={self._state})'
+            return res
+        self._lift_next = 'retrieval_home_ready'
+        self._begin_lift(0.0, home=True, nxt='retrieval_home_ready',
+                         label='Homing lift before pallet retrieval')
+        res.success = self._state == LOWERING
+        res.message = ('Lift homing started' if res.success else self._msg)
+        return res
+
+    def _srv_retrieval_pick(self, _req, res):
+        if self._checkpoint is not None:
+            res.success, res.message = False, 'Saved pallet operation retained; Resume or explicitly reset first'
+            return res
+        """Retrieval-only entry point; reuses the existing approach controller."""
+        if self._state in BUSY_STATES or self._cargo is True:
+            res.success = False
+            res.message = f'pallet_mission busy or carrying (state={self._state})'
+            return res
+        if self._shelf is None or self._retrieval_slot not in self._shelf._slot_by_id:
+            res.success = False
+            res.message = f'invalid retrieval slot: {self._retrieval_slot!r}'
+            return res
+        if (self._retrieval_pose is None or
+                time.monotonic() - self._retrieval_pose_t > 2.0):
+            res.success = False
+            res.message = 'no fresh slot-matched retrieval pose'
+            return res
+        error = self._retrieval_pick_navigation_error()
+        if error:
+            res.success, res.message = False, error
+            return res
+
+        slot = self._shelf._slot_by_id[self._retrieval_slot]
+        level = (self._shelf_cfg.get('slot_level') or {}).get(slot.id)
+        level_cfg = (self._shelf_cfg.get('levels') or {}).get(level, {})
+        if not level_cfg or 'insert_lift_cm' not in level_cfg:
+            res.success = False
+            res.message = f'missing fork insertion height for {slot.id}'
+            return res
+        x, y, z, yaw = self._retrieval_pose
+        if not all(math.isfinite(v) for v in (x, y, z, yaw)):
+            res.success, res.message = False, 'invalid detected retrieval pose'
+            return res
+        ins = self._map_to_ins(x, y, yaw)
+        if ins is None:
+            res.success = False
+            res.message = 'cannot transform selected pallet pose from map to odom'
+            return res
+
+        self._retrieval_mode = True
+        self._retrieval_align_only = False
+        # Reverse the configured drop levels: enter at release height, then
+        # lift the pallet to insert height before backing out.
+        release_height_cm = float(level_cfg['release_lift_cm'])
+        self._retrieval_carry_height_cm = float(level_cfg['insert_lift_cm'])
+        self._result = {'x': x, 'y': y, 'z': z, 'yaw': yaw,
+                        'stable': True, 'pos_std_m': 0.0, 'yaw_std_deg': 0.0}
+        self._pallet_ins = ins
+        self._line = ins
+        self._pre = approach_pose(x, y, yaw, self.p['retrieval_stage_m'] - self.p['face_offset_m'])
+        self._mode = 'pick'
+        self._cargo = False
+        self._cargo_type = slot.product_type
+        self._cargo_class = 'medium' if slot.product_type == 'A' else 'tall'
+        self._cargo_h = None
+        self._us_pick_confirmed = False
+        self._ins_msg = f'Retrieval pick from {slot.id}'
+        # Finish alignment to the detected pallet with forks still lowered.
+        # CONVERGE pauses for lift, then resumes without another alignment.
+        self._retrieval_pick_lift_cm = release_height_cm
+        self._retrieval_pick_nav_elapsed = 0.0
+        res.success, res.message = self._start_retrieval_pick_navigation()
+        # A failure after entering NAVIGATING retains an operation checkpoint;
+        # the coordinator must keep its issued-step record and await status.
+        if self._checkpoint is not None:
             res.success = True
-            res.message = 'Da gui HOME: lift dang ha ve 0 cm (bam STOP de dung)'
+        return res
+
+    def _retrieval_pick_navigation_error(self):
+        """Preflight without changing the previously completed observation step."""
+        for key in ('retrieval_nav_position_tol_m', 'retrieval_nav_timeout_s', 'retrieval_stop_timeout_s'):
+            value = float(self.p[key])
+            if not math.isfinite(value) or value <= 0.0:
+                return f'Invalid retrieval navigation parameter: {key}'
+        stage = float(self.p['retrieval_stage_m'])
+        if (not math.isfinite(stage) or stage < float(self.p['rot_clear_m']) + 0.03
+                or stage <= float(self.p['fork_front_m']) + float(self.p['gate_margin_m'])):
+            return 'Retrieval staging is too close for rotation/gate clearance'
+        if not self._nav.server_is_ready():
+            return 'NavigateToPose server is not ready for retrieval staging'
+        if (self._nav_pending is not None or any(not f.done() for f in self._nav_results)
+                or not self._retrieval_navigation_idle()):
+            return 'Previous navigation must finish before retrieval staging'
+        height = self._lift_height_now()
+        if height is None or abs(height) > float(self.p['lift_home_tol_cm']):
+            return 'Fresh lift HOME feedback is required before retrieval staging'
+        return ''
+
+    def _start_retrieval_pick_navigation(self):
+        """Navigate to the camera-derived staging pose with forks still at HOME."""
+        error = self._retrieval_pick_navigation_error()
+        if error:
+            return False, error
+        if not self._retrieval_mode or self._mode != 'pick' or self._pre is None or self._pallet_ins is None:
+            return False, 'Missing locked retrieval staging context'
+        if not all(math.isfinite(v) for v in (*self._pre, *self._pallet_ins)):
+            return False, 'Invalid retrieval staging geometry'
+        if self._retrieval_pick_lift_cm is None or self._cargo is not False:
+            return False, 'Retrieval navigation cannot restart after insertion/lift'
+        if self._retrieval_pick_nav_elapsed >= float(self.p['retrieval_nav_timeout_s']):
+            return False, 'Retrieval staging active-time budget exhausted'
+        self._nav_epoch += 1
+        ctx = {'started': time.monotonic(), 'handoff': False, 'cancel_at': None,
+               'terminal': False, 'stopped_since': None, 'near_since': None}
+        self._retrieval_pick_nav = ctx
+        self._set_state(NAVIGATING, f'Retrieval staging: {self.p["retrieval_stage_m"]:.2f} m from detected pallet face')
+        try:
+            future = self._nav.send_goal_async(self._staging_goal())
+            self._nav_pending = future
+            future.add_done_callback(lambda future: self._on_retrieval_pick_goal(future, ctx))
+        except Exception as exc:
+            self._fail_retrieval_pick_navigation(f'Cannot send retrieval staging goal: {exc}')
+            return False, self._msg
+        return True, 'Retrieval staging started; align and lift will follow after Nav2 stops'
+
+    def _fail_retrieval_pick_navigation(self, message, state=FAILED):
+        ctx, self._retrieval_pick_nav = self._retrieval_pick_nav, None
+        if ctx is not None:
+            self._retrieval_pick_nav_elapsed += time.monotonic() - ctx['started']
+        self._nav_epoch += 1
+        handle, self._goal_handle = self._goal_handle, None
+        if handle is not None:
+            try:
+                handle.cancel_goal_async()
+            except Exception as exc:
+                self.get_logger().warn(f'Retrieval staging cancel failed: {exc}')
+        self._finish(state, message, fail_phase='RETRIEVAL_NAV')
+
+    def _on_retrieval_pick_goal(self, future, ctx):
+        if self._nav_pending is future:
+            self._nav_pending = None
+        try:
+            handle = future.result()
+        except Exception as exc:
+            if self._retrieval_pick_nav is ctx and self._state == NAVIGATING:
+                self._fail_retrieval_pick_navigation(f'Retrieval goal response error: {exc}')
+            return
+        if self._retrieval_pick_nav is not ctx or self._state != NAVIGATING:
+            if handle is not None and handle.accepted:
+                self._nav_results.append(handle.get_result_async())
+                handle.cancel_goal_async()
+            return
+        if handle is None or not handle.accepted:
+            self._fail_retrieval_pick_navigation('Nav2 rejected retrieval staging goal')
+            return
+        self._goal_handle = handle
+        try:
+            result = handle.get_result_async()
+            self._nav_results.append(result)
+            result.add_done_callback(lambda future: self._on_retrieval_pick_nav_result(future, ctx))
+        except Exception as exc:
+            self._fail_retrieval_pick_navigation(f'Retrieval result subscription error: {exc}')
+
+    def _retrieval_staging_reached(self):
+        """Bound map staging AND frozen-odom clearance before local alignment."""
+        mapped = self._robot_pose(self.p['map_frame'])
+        local = self._robot_pose(self.p['insertion_frame'])
+        if (mapped is None or local is None or self._pre is None or self._pallet_ins is None
+                or not all(math.isfinite(v) for v in (*mapped, *local, *self._pre, *self._pallet_ins))):
+            return False
+        _, _, along = line_errors(*local, *self._pallet_ins, self.p['face_offset_m'])
+        return (math.hypot(mapped[0] - self._pre[0], mapped[1] - self._pre[1])
+                <= float(self.p['retrieval_nav_position_tol_m']) + 1e-9
+                and abs(math.degrees(norm_angle(mapped[2] - self._pre[2])))
+                <= float(self.p['drop_start_yaw_deg'])
+                and -along >= float(self.p['rot_clear_m']))
+
+    def _on_retrieval_pick_nav_result(self, future, ctx):
+        if self._retrieval_pick_nav is not ctx or self._state != NAVIGATING:
+            return
+        self._goal_handle = None
+        try:
+            status = future.result().status
+        except Exception as exc:
+            self._fail_retrieval_pick_navigation(f'Retrieval Nav2 result error: {exc}')
+            return
+        if status == GoalStatus.STATUS_CANCELED and not ctx['handoff']:
+            self._fail_retrieval_pick_navigation('Retrieval staging canceled', state=STOPPED)
+            return
+        if status not in (GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED,
+                          GoalStatus.STATUS_CANCELED) or not self._retrieval_staging_reached():
+            self._fail_retrieval_pick_navigation('Retrieval staging outside position/yaw/clearance limits')
+            return
+        # Only a terminal result, not a cancel acknowledgement, releases Nav2.
+        ctx['terminal'] = True
+        self._start_settling('Retrieval staging reached; waiting for measured stop')
+
+    def _retrieval_pick_staging_tick(self, now):
+        ctx = self._retrieval_pick_nav
+        if ctx is None:
+            self._fail_retrieval_pick_navigation('Missing retrieval staging navigation context')
+            return
+        if self._retrieval_pick_nav_elapsed + now - ctx['started'] > float(self.p['retrieval_nav_timeout_s']):
+            self._fail_retrieval_pick_navigation('Retrieval staging navigation/settle timeout')
+            return
+        height = self._lift_height_now()
+        if height is None or abs(height) > float(self.p['lift_home_tol_cm']):
+            self._fail_retrieval_pick_navigation('Lift HOME feedback lost during retrieval staging')
+            return
+        if self._state == NAVIGATING:
+            if ctx['cancel_at'] is not None:
+                if now - ctx['cancel_at'] > float(self.p['retrieval_stop_timeout_s']):
+                    self._fail_retrieval_pick_navigation('Retrieval Nav2 cancellation not confirmed')
+                return
+            distance = self._dist_to_pre()
+            near = (float(self.p['handoff_m']) > 0.0 and self._goal_handle is not None
+                    and distance is not None and distance <= float(self.p['handoff_m'])
+                    and self._retrieval_staging_reached())
+            if not near:
+                ctx['near_since'] = None
+                return
+            if ctx['near_since'] is None:
+                ctx['near_since'] = now
+            if now - ctx['near_since'] >= float(self.p['handoff_hold_s']):
+                ctx['handoff'], ctx['cancel_at'] = True, now
+                try:
+                    self._goal_handle.cancel_goal_async()
+                except Exception as exc:
+                    self._fail_retrieval_pick_navigation(f'Retrieval handoff cancel error: {exc}')
+            return
+        self._halt()
+        if now - self._settle_t0 > float(self.p['retrieval_stop_timeout_s']):
+            self._fail_retrieval_pick_navigation('Retrieval measured stop timed out')
+            return
+        speed = self._drop_odom_speed
+        stopped = (ctx['terminal'] and self._nav_pending is None and self._retrieval_navigation_idle()
+                   and self._drop_odom_t >= self._settle_t0
+                   and now - self._drop_odom_t <= float(self.p['drop_odom_stale_s'])
+                   and speed is not None and all(math.isfinite(v) for v in speed)
+                   and speed[0] <= float(self.p['drop_stop_linear_mps'])
+                   and speed[1] <= float(self.p['drop_stop_angular_rps']))
+        if not stopped or not self._retrieval_staging_reached():
+            ctx['stopped_since'] = None
+            return
+        if ctx['stopped_since'] is None:
+            ctx['stopped_since'] = now
+        if now - ctx['stopped_since'] < float(self.p['settle_s']):
+            return
+        current = self._map_to_ins(self._result['x'], self._result['y'], self._result['yaw'])
+        stored = self._pallet_ins
+        if (current is None or not all(math.isfinite(v) for v in current)
+                or math.hypot(current[0] - stored[0], current[1] - stored[1]) > float(self.p['max_tf_jump_m'])
+                or abs(math.degrees(norm_angle(current[2] - stored[2]))) > float(self.p['max_tf_jump_deg'])):
+            self._fail_retrieval_pick_navigation('Locked retrieval pallet pose no longer agrees with map/odom')
+            return
+        self._retrieval_pick_nav = None
+        self._begin_alignment()
+
+    def _srv_retrieval_detector_start(self, _req, res):
+        if self._state in BUSY_STATES or self._cargo is True:
+            res.success = False
+            res.message = f'pallet mission busy or carrying (state={self._state})'
+            return res
+        ok, message = self._start_detector()
+        if ok:
+            # Use this node's latched publisher as the single authority for
+            # detector enable. Retrieval must not publish a competing value
+            # on the same transient-local topic from another node.
+            self.pub_detector_enable.publish(Bool(data=True))
+        res.success, res.message = ok, message
+        return res
+
+    def _srv_retrieval_detector_stop(self, _req, res):
+        self.pub_detector_enable.publish(Bool(data=False))
+        if not self.p['detector_prewarm']:
+            self._terminate_detector()
+        res.success, res.message = True, 'retrieval inference stopped'
+        return res
+
+    def _srv_retrieval_release(self, _req, res):
+        if self._checkpoint is not None:
+            res.success, res.message = False, 'Saved pallet operation retained; Resume or explicitly reset first'
+            return res
+        if not self._retrieval_mode or self._state != CARRYING or self._cargo is not True:
+            res.success = False
+            res.message = f'not carrying a retrieval pallet (state={self._state})'
+            return res
+        self._begin_lift(0.0, home=True, nxt='retrieval_released',
+                         label='Lower pallet onto the D_2 drop area')
+        res.success = self._state == LOWERING
+        res.message = 'lowering pallet at D_2' if res.success else self._msg
+        return res
+
+    def _srv_retrieval_backoff(self, _req, res):
+        if self._checkpoint is not None:
+            res.success, res.message = False, 'Saved pallet operation retained; Resume or explicitly reset first'
+            return res
+        if not self._retrieval_mode or self._state != DONE or self._cargo is not False:
+            res.success = False
+            res.message = f'retrieval pallet is not released (state={self._state})'
+            return res
+        self._begin_backoff(dist=0.40, after='retrieval_release', cargo=False,
+                            msg='Pallet released at D_2; backing off 40 cm')
+        res.success = self._state == BACKING
+        res.message = 'backing off 40 cm' if res.success else self._msg
+        return res
+
+    def _srv_lift_home(self, req, res):
+        if self._checkpoint is not None:
+            res.success, res.message = False, 'Saved pallet operation retained; Resume or explicitly reset first'
+            return res
+        if self._state in BUSY_STATES:
+            res.success, res.message = False, f'Pallet mission busy ({self._state})'
+            return res
+        self._begin_lift(0.0, home=True, nxt='manual_home_done',
+                         label='Lowering forks to HOME; waiting for joint_states')
+        res.success = self._state == LOWERING
+        res.message = 'Lift HOME started; cargo is retained until confirmed empty' if res.success else self._msg
         return res
 
     def _srv_calibrate(self, req, res):
@@ -970,6 +1565,26 @@ class PalletMission(Node):
         res.success, res.message = self._emergency_stop()
         return res
 
+    def _srv_confirm_empty(self, req, res):
+        """Operator attestation after manual unloading; never moves robot/lift."""
+        if self._state not in (IDLE, DONE, FAILED, STOPPED, CARRYING):
+            res.success, res.message = False, 'Stop pallet handling before confirming empty forks'
+            return res
+        res = self._srv_reset(req, res)
+        if not res.success:
+            return res
+        self._cargo = False
+        self._cargo_class = self._cargo_type = self._cargo_h = None
+        self._cargo_why = 'operator_confirmed_empty'
+        self._retrieval_mode = self._retrieval_align_only = False
+        self._retrieval_slot = ''
+        self._retrieval_pose = None
+        self._retrieval_pose_t = 0.0
+        self._retrieval_carry_height_cm = self._retrieval_pick_lift_cm = None
+        self._set_state(IDLE, 'Operator confirmed forks empty; lift position preserved')
+        res.success, res.message = True, 'Forks confirmed empty; lift position preserved'
+        return res
+
     def _srv_reset(self, req, res):
         if self._state in BUSY_STATES:
             res.success = False
@@ -980,9 +1595,26 @@ class PalletMission(Node):
             res.message = f'Cannot reset pallet state {self._state}'
             return res
 
-        cargo = self._cargo
+        # Keep cargo ownership/type when resetting navigation logic while the
+        # robot is still carrying a pallet.  Entering MANUAL must not make a
+        # loaded robot look empty or erase medium/tall classification.
+        carrying = self._cargo is True or self._state == CARRYING
         self.pub_detector_enable.publish(Bool(data=False))
+        if not self.p['detector_prewarm']:
+            self._terminate_detector()
+        if not carrying:
+            self._retrieval_mode = False
+            self._retrieval_align_only = False
+            self._retrieval_slot = ''
+            self._retrieval_pose = None
+            self._retrieval_pose_t = 0.0
+            self._retrieval_carry_height_cm = None
+            self._retrieval_pick_lift_cm = None
+        self._rack_trimmed = False
+        self._rack_trim_frame = None
         self._goal_handle = None
+        self._session_id = uuid.uuid4().hex
+        self._checkpoint = None
         self._samples.clear()
         self._tf_hist.clear()
         self._result = self._pre = self._pallet_ins = self._line = None
@@ -997,6 +1629,7 @@ class PalletMission(Node):
         self._bo_t0 = self._bo_dist = 0.0
         self._bo_tf_miss = 0
         self._drop = None
+        self._drop_nav = None
         self._drop_lifted = False
         self._drop_back_m = 0.0
         self._lift_next = 'pick_backoff'
@@ -1012,9 +1645,17 @@ class PalletMission(Node):
         self._us_count = 0
         self._us_pick_confirmed = False
         self._cargo_samples.clear()
-        if cargo is not True:
+        if not carrying:
+            # Robot is empty: clear stale cargo/type data on MANUAL reset.
+            self._cargo = False
             self._cargo_class = self._cargo_type = self._cargo_h = None
             self._cargo_why = ''
+        else:
+            # Robot is loaded: preserve cargo ownership and classification.
+            # Switching navigation mode must not make a loaded robot appear
+            # empty or lose its medium/tall type.
+            self._cargo = True
+
         params = self.set_parameters([
             Parameter('drop_slot', value=''),
             Parameter('cargo_type_override', value=''),
@@ -1025,11 +1666,13 @@ class PalletMission(Node):
             return res
         self.p['drop_slot'] = ''
         self.p['cargo_type_override'] = ''
-        state = CARRYING if cargo is True else IDLE
-        self._set_state(state, 'Logic reset by operator; cargo and lift position preserved')
-        cargo_label = 'true' if cargo is True else 'false' if cargo is False else 'unknown'
+        state = CARRYING if carrying else IDLE
+        self._set_state(state, 'Entered MANUAL; cargo/type preserved' if carrying
+                        else 'Logic reset by operator entering MANUAL; cargo state cleared')
         res.success, res.message = True, (
-            f'{state}; cargo={cargo_label}; cargo/lift unchanged; reserved slot cleared')
+            f'{state}; cargo={str(carrying).lower()}; '
+            f'cargo class={self._cargo_class or "none"}; lift position preserved; '
+            'reserved slot cleared')
         return res
 
     def _srv_set_home(self, req, res):
@@ -1178,6 +1821,8 @@ class PalletMission(Node):
     # Detect on / off
     # ==================================================================
     def _start_detect(self) -> Tuple[bool, str]:
+        if self._checkpoint is not None and self._checkpoint['state'] not in (DETECTING, READY, NAVIGATING, SETTLING):
+            return False, 'Interrupted mechanical operation retained; Resume or explicitly reset before detecting again'
         if self._state in BUSY_STATES:
             return False, f'dang ban ({self._state}), khong the detect'
         if self._state == CARRYING or self._cargo is True:
@@ -1185,10 +1830,13 @@ class PalletMission(Node):
         if self._state == DETECTING:
             return True, 'dang detect'
         self._reload_params(recompute_stage=True)
+        self._retrieval_mode = False
+        self._retrieval_align_only = False
         ok, why = self._start_detector()
         if not ok:
             self._set_state(FAILED, why)
             return False, why
+        self._checkpoint = None
         self._samples.clear()
         self._tf_hist.clear()
         self._result = None
@@ -1226,8 +1874,11 @@ class PalletMission(Node):
     def _stop_detect(self) -> Tuple[bool, str]:
         if self._state != DETECTING:
             return False, 'khong o trang thai detect'
-        # Pause inference but keep the loaded model resident for the next cycle.
+        # Pause inference. With prewarm enabled, keep weights resident for the
+        # next Auto cycle; on-demand mode still releases the child process.
         self.pub_detector_enable.publish(Bool(data=False))
+        if not self.p['detector_prewarm']:
+            self._terminate_detector()
         self._reload_params(recompute_stage=True)
         est, why = estimate_pallet(
             list(self._samples), time.monotonic(),
@@ -1314,6 +1965,26 @@ class PalletMission(Node):
             return False, 'NavigateToPose server chua san sang'
 
         px, py, pyaw = self._pre
+        goal = self._staging_goal()
+
+        self._nav_epoch += 1
+        epoch = self._nav_epoch
+        self._handoff_t0 = None
+        self._set_state(NAVIGATING,
+                        f'Dang toi diem dem ({px:.2f}, {py:.2f}, {math.degrees(pyaw):.0f}deg), '
+                        f'cach mat pallet {self.stage_m:.2f} m')
+        try:
+            fut = self._nav.send_goal_async(goal)
+            self._nav_pending = fut
+            fut.add_done_callback(lambda future: self._on_goal_sent(future, epoch))
+        except Exception as exc:
+            self._set_state(FAILED, f'Cannot send pallet staging goal: {exc}')
+            return False, self._msg
+        return True, 'dang toi pallet'
+
+    def _staging_goal(self):
+        """Shared PICK/DROP goal construction; staging is already in map."""
+        px, py, pyaw = self._pre
         pose = PoseStamped()
         pose.header.frame_id = self.p['map_frame']
         pose.header.stamp = self.get_clock().now().to_msg()
@@ -1324,14 +1995,7 @@ class PalletMission(Node):
         goal = NavigateToPose.Goal()
         goal.pose = pose
         goal.behavior_tree = self._bt_path()
-
-        fut = self._nav.send_goal_async(goal)
-        fut.add_done_callback(self._on_goal_sent)
-        self._handoff_t0 = None
-        self._set_state(NAVIGATING,
-                        f'Dang toi diem dem ({px:.2f}, {py:.2f}, {math.degrees(pyaw):.0f}deg), '
-                        f'cach mat pallet {self.stage_m:.2f} m')
-        return True, 'dang toi pallet'
+        return goal
 
     def _bt_path(self) -> str:
         try:
@@ -1345,22 +2009,28 @@ class PalletMission(Node):
             self.get_logger().warn(f'Khong lay duoc BT path: {e} -> dung BT mac dinh')
         return ''
 
-    def _on_goal_sent(self, future):
+    def _on_goal_sent(self, future, epoch=None):
+        if self._nav_pending is future:
+            self._nav_pending = None
         try:
             handle = future.result()
         except Exception as e:
-            if self._state == NAVIGATING:
+            if epoch == self._nav_epoch and self._mode != 'drop' and self._state == NAVIGATING:
                 self._set_state(FAILED, f'Loi gui goal: {e}')
             return
-        if self._state != NAVIGATING:
+        if (epoch != self._nav_epoch or self._mode == 'drop'
+                or self._state != NAVIGATING):
             if handle and handle.accepted:
+                self._nav_results.append(handle.get_result_async())
                 handle.cancel_goal_async()
             return
         if not handle or not handle.accepted:
             self._set_state(FAILED, 'Nav2 tu choi goal')
             return
         self._goal_handle = handle
-        handle.get_result_async().add_done_callback(self._on_nav_result)
+        result = handle.get_result_async()
+        self._nav_results.append(result)
+        result.add_done_callback(lambda future: self._on_nav_result(future, epoch))
 
     def _dist_to_pre(self) -> Optional[float]:
         pose = self._robot_pose(self.p['map_frame'])
@@ -1373,7 +2043,9 @@ class PalletMission(Node):
         self._settle_tf = []
         self._set_state(SETTLING, msg)
 
-    def _on_nav_result(self, future):
+    def _on_nav_result(self, future, epoch=None):
+        if epoch != self._nav_epoch or self._mode == 'drop':
+            return  # DROP owns a separate goal/result pair, including late PICK results.
         self._goal_handle = None
         if self._state != NAVIGATING:
             return
@@ -1456,9 +2128,12 @@ class PalletMission(Node):
         if stored is None:
             self._set_state(FAILED, 'Khong doi duoc pose pallet sang khung odom (TF)')
             return
+        self._rack_trimmed = False
+        self._rack_trim_frame = None
         self._line = stored
         self._mode = 'pick'
-        self._ctl = ApproachController(self.p, self.stage_m)
+        stage = float(self.p['retrieval_stage_m']) if self._retrieval_mode else self.stage_m
+        self._ctl = ApproachController(self.p, stage)
         self._tf_miss = 0
         self._phase_shown = None
         self._trimmed = False
@@ -1478,17 +2153,92 @@ class PalletMission(Node):
         self._halt()
         self._set_state(state, msg, fail_phase=fail_phase)
 
+    def _approach_fail_phase(self):
+        # Do not let the supervisor create a fresh drop (and another sidestep)
+        # after the one physical lateral manoeuvre has already been consumed.
+        if (self._mode in ('drop', 'retrieval_align') or self._retrieval_mode):
+            if not self._ctl.insertion_only and self._ctl.sidesteps >= 1:
+                return 'ALIGN_BUDGET'
+        return self._ctl.phase
+
+    def _trim_rack_before_sidestep(self, now, previous_sidesteps):
+        """Legacy TF trim once; True means this tick must stay stopped."""
+        if self._rack_trimmed or self._ctl.insertion_only:
+            return False
+        self._rack_trimmed = True
+        trim_enabled = self.p['drop_map_trim'] if self._mode == 'drop' else self.p['retrieval_map_trim']
+        # With DROP trim disabled, keep the frozen line but retain diagnostics.
+        if not trim_enabled and self._mode != 'drop':
+            return False
+        slot_map = self._tf_pose(self.p['map_frame'], self._rack_trim_frame)
+        now_ins = self._map_to_ins(*slot_map) if slot_map is not None else None
+        if now_ins is None:
+            if not trim_enabled:
+                self.get_logger().warn('[diag] DROP: missing rack TF; frozen odom target retained (trim off)')
+                return False
+            self._finish(FAILED, 'Khong doc duoc TF o ke de map trim truoc di ngang',
+                         fail_phase='MAP_TRIM')
+            return True
+        shift = math.hypot(now_ins[0] - self._line[0], now_ins[1] - self._line[1])
+        dyaw = math.degrees(norm_angle(now_ins[2] - self._line[2]))
+        self.get_logger().info(
+            f'[diag] {self._mode.upper()} truoc luot di ngang: map->odom dich '
+            f'{shift * 100:.1f} cm / {dyaw:+.1f} deg (trim 1 lan truoc lift)')
+        if not trim_enabled:
+            self.get_logger().info('[diag] drop_map_trim=False: giu nguyen muc tieu odom da chot')
+            return False
+        if shift > float(self.p['drop_trim_max_shift_m']):
+            # Same policy as the legacy drop: a large localization jump is
+            # not a new rack target. Keep the existing reference and guards.
+            self.get_logger().warn(
+                f'drop_map_trim: dich {shift * 100:.0f} cm qua lon, nghi AMCL nhay -> bo qua')
+            return False
+        if (shift * 100 <= float(self.p['drop_trim_shift_cm'])
+                and abs(dyaw) <= float(self.p['drop_trim_yaw_deg'])):
+            return False
+        self._line = now_ins
+        self._ctl.sidesteps = previous_sidesteps
+        self._ctl.log.clear()  # SIDE_TURN was proposed, never physically issued.
+        self._ctl.restart_align(now)
+        self._phase_shown = None
+        self._halt()
+        self.get_logger().warn(
+            f'drop_map_trim: cap nhat {shift * 100:.1f} cm / {dyaw:+.1f} deg '
+            'TRUOC luot di ngang; giu tham chieu sau luot nay va sau lift')
+        return True
+
     def _control(self, now: float):
         pose = self._robot_pose(self.p['insertion_frame'])
         if pose is None:
             self._cmd(0.0, 0.0)
             self._tf_miss += 1
             if self._tf_miss >= int(self.p['tf_miss_max']):
-                self._finish(FAILED, 'Mat TF robot -> dung xe', fail_phase=self._ctl.phase)
+                self._finish(FAILED, 'Mat TF robot -> dung xe',
+                             fail_phase=self._approach_fail_phase())
             return
         self._tf_miss = 0
+        if self._mode == 'retrieval_align':
+            # Keep these checks outside the shared controller: PICK/DROP keep
+            # their algorithms, while observation alignment cannot insert or
+            # follow a large map-trim/odometry displacement into another column.
+            error = self._retrieval_alignment_error(pose)
+            if error:
+                self._finish(FAILED, error, fail_phase='RETRIEVAL_ALIGN')
+                return
+        previous_phase = self._ctl.phase
+        previous_sidesteps = self._ctl.sidesteps
         us_fresh = (now - self._us_t) <= self.p['range_stale_s']
         vx, wz, done, fail = self._ctl.step(now, pose, self._line, self._us_count, us_fresh)
+
+        # ALIGN has settled the initial heading. Refresh the legacy map->odom
+        # reference once, BEFORE any SIDE_TURN command is emitted. A changed
+        # reference must not spend the pending physical sidestep budget.
+        if (not fail and not self._rack_trimmed
+                and self._mode in ('drop', 'retrieval_align')
+                and previous_phase == self._ctl.ALIGN
+                and (self._ctl.phase in (self._ctl.SIDE_TURN, self._ctl.CONVERGE) or done)):
+            if self._trim_rack_before_sidestep(now, previous_sidesteps):
+                return
 
         for line in self._ctl.log:
             self.get_logger().info(line)
@@ -1497,10 +2247,15 @@ class PalletMission(Node):
         if fail:
             e_lat, e_yaw, a = self._ctl.err
             self._finish(FAILED, f'{fail} [lat={e_lat * 100:+.1f}cm yaw={math.degrees(e_yaw):+.1f}deg]',
-                         fail_phase=self._ctl.phase)
+                         fail_phase=self._approach_fail_phase())
             return
         if done:
             self._ins_msg = done
+            if self._retrieval_align_only:
+                self._halt()
+                self._retrieval_align_only = False
+                self._set_state(READY, f'Retrieval rack alignment ready for {self._retrieval_slot}')
+                return
             # In pick mode ApproachController only completes after the fresh
             # ultrasonic samples confirm contact in the LOCK phase.
             if self._mode == 'pick':
@@ -1508,6 +2263,8 @@ class PalletMission(Node):
             self._halt()
             if self._mode == 'drop':
                 self._drop_inserted()       # ha lift -> lui ra -> ha lift ve 0 -> DONE
+            elif self._retrieval_mode:
+                self._begin_lift(self._retrieval_carry_height_cm)
             elif self.p['auto_lift']:
                 self._begin_lift()          # nang -> lui -> Home/CARRYING
             else:
@@ -1515,14 +2272,6 @@ class PalletMission(Node):
             return
 
         ph = self._ctl.phase
-        if self._mode == 'drop' and ph == 'CONVERGE' and not self._drop_lifted:
-            # Da can xong o D_1: nang lift len muc "dut vao ke" de sieu am thoang, roi moi tien.
-            self._drop_lifted = True
-            self._halt()
-            d = self._drop
-            self._begin_lift(d['insert_cm'], nxt='drop_insert',
-                             label=f"Nang lift len {d['insert_cm']:.0f} cm truoc khi vao o {d['slot']}")
-            return
         if self._mode == 'pick' and ph == 'CONVERGE' and not self._trimmed:
             self._trimmed = True
             my = self._map_yaw_err()
@@ -1539,31 +2288,22 @@ class PalletMission(Node):
                     self.get_logger().warn(f'map_yaw_trim: chinh huong duong pallet {delta:+.1f} deg theo yaw MAP, canh lai')
                     self._phase_shown = None
                     return
-        if self._mode == 'drop' and ph == 'CONVERGE' and self._drop_lifted and not self._trimmed:
-            self._trimmed = True
-            slot_map = self._tf_pose(self.p['map_frame'], self._drop['frame'])
-            now_ins = self._map_to_ins(*slot_map) if slot_map is not None else None
-            if now_ins is not None:
-                shift = math.hypot(now_ins[0] - self._line[0], now_ins[1] - self._line[1])
-                dyaw = math.degrees(norm_angle(now_ins[2] - self._line[2]))
-                self.get_logger().info(
-                    f'[diag] DROP truoc khi vao: pose o ke theo map->odom hien tai dich '
-                    f'{shift * 100:.1f} cm / {dyaw:+.1f} deg so voi luc bat dau '
-                    f'(drop_map_trim={self.p["drop_map_trim"]})')
-                if self.p['drop_map_trim']:
-                    if shift > float(self.p['drop_trim_max_shift_m']):
-                        self.get_logger().warn(
-                            f'drop_map_trim: dich {shift * 100:.0f} cm qua lon, nghi AMCL nhay -> bo qua')
-                    elif (shift * 100.0 > float(self.p['drop_trim_shift_cm'])
-                          or abs(dyaw) > float(self.p['drop_trim_yaw_deg'])):
-                        self._line = now_ins
-                        self._halt()
-                        self._ctl.restart_align(now)
-                        self.get_logger().warn(
-                            f'drop_map_trim: cap nhat pose o ke theo AMCL (dich {shift * 100:.1f} cm, '
-                            f'xoay {dyaw:+.1f} deg) -> CANH LAI')
-                        self._phase_shown = None
-                        return
+        if self._mode == 'drop' and ph == 'CONVERGE' and not self._drop_lifted:
+            # Da can xong o D_1: nang lift len muc "dut vao ke" de sieu am thoang, roi moi tien.
+            self._drop_lifted = True
+            self._halt()
+            d = self._drop
+            self._begin_lift(d['insert_cm'], nxt='drop_insert',
+                             label=f"Nang lift len {d['insert_cm']:.0f} cm truoc khi vao o {d['slot']}")
+            return
+        if (self._retrieval_mode and self._mode == 'pick' and ph == 'CONVERGE'
+                and self._retrieval_pick_lift_cm is not None):
+            target = self._retrieval_pick_lift_cm
+            self._retrieval_pick_lift_cm = None
+            self._halt()
+            self._begin_lift(target, nxt='retrieval_insert',
+                             label=f'Alignment complete; raise forks to {target:.1f} cm')
+            return
         if self._mode == 'pick' and ph in ('GATE', 'LOCK') and ph != self._phase_shown:
             my = self._map_yaw_err()
             self.get_logger().info(f'[diag] {ph}: lech yaw theo odom={math.degrees(self._ctl.err[1]):+.1f} deg, '
@@ -1611,6 +2351,10 @@ class PalletMission(Node):
 
     def _lift_control(self, now: float):
         h = self._lift_height_now()
+        if h is not None and self._lift_resume_after is not None:
+            if self._lift_t <= self._lift_resume_after:
+                return
+            self._lift_resume_after = None
         if h is None:
             self._lift_stop()
             self._set_state(FAILED, 'Mat du lieu /joint_states (lift) -> dung lift')
@@ -1651,6 +2395,7 @@ class PalletMission(Node):
         self._bo_timeout = float(self.p['drop_backoff_timeout_s'] if after == 'drop'
                                  else self.p['backoff_timeout_s'])
         self._bo_ref = (pose[0], pose[1])
+        self._bo_yaw = pose[2]
         self._bo_t0 = time.monotonic()
         self._bo_tf_miss = 0
         self._cargo = cargo               # pick: box tren thang | drop: box da o tren ke
@@ -1666,12 +2411,30 @@ class PalletMission(Node):
                 self._finish(FAILED, 'Mat TF robot khi lui -> dung xe')
             return
         self._bo_tf_miss = 0
-        d = math.hypot(pose[0] - self._bo_ref[0], pose[1] - self._bo_ref[1])
+        dx, dy = pose[0] - self._bo_ref[0], pose[1] - self._bo_ref[1]
+        lateral = -math.sin(self._bo_yaw) * dx + math.cos(self._bo_yaw) * dy
+        yaw_error = abs(norm_angle(pose[2] - self._bo_yaw))
+        if abs(lateral) > float(self.p['lock_lat_abort_cm']) / 100. or yaw_error > math.radians(self.p['lock_yaw_abort_deg']):
+            self._finish(FAILED, 'Backoff deviated from its saved direction')
+            return
+        d = -(math.cos(self._bo_yaw) * dx + math.sin(self._bo_yaw) * dy)
         if d >= self._bo_dist:
             self._halt()
             if self._bo_after == 'drop':
                 self._begin_lift(0.0, home=True, nxt='drop_done',
                                  label='Da lui khoi ke -> ha lift ve 0')
+            elif self._bo_after == 'retrieval_release':
+                self._retrieval_mode = False
+                self._retrieval_slot = ''
+                self._retrieval_carry_height_cm = None
+                self._set_state(DONE, 'Retrieval complete; pallet released and robot clear')
+            elif self._retrieval_mode:
+                # Lower to transit height (5 cm) before the D_2 leg so the
+                # robot does not travel at the shelf carry height.
+                self._begin_lift(float(self.p['lift_height_cm']),
+                                 nxt='retrieval_transit',
+                                 label=f'Lower to {self.p["lift_height_cm"]:.0f} cm '
+                                       f'transit height before D_2')
             elif str(self.p['after_pick']).lower() == 'hold':
                 lift = self._lift_height_now()
                 self._set_state(CARRYING,
@@ -1707,28 +2470,41 @@ class PalletMission(Node):
         goal = NavigateToPose.Goal()
         goal.pose = pose
         goal.behavior_tree = self._bt_path()
-        fut = self._nav.send_goal_async(goal)
-        fut.add_done_callback(self._on_home_goal_sent)
+        self._nav_epoch += 1
+        epoch = self._nav_epoch
         self._set_state(HOMING, f'Ve Home ({hx:.2f}, {hy:.2f}, {math.degrees(hyaw):.0f}deg)')
+        try:
+            fut = self._nav.send_goal_async(goal)
+            self._nav_pending = fut
+            fut.add_done_callback(lambda future: self._on_home_goal_sent(future, epoch))
+        except Exception as exc:
+            self._set_state(FAILED, f'Cannot send HOME goal: {exc}')
 
-    def _on_home_goal_sent(self, future):
+    def _on_home_goal_sent(self, future, epoch=None):
+        if self._nav_pending is future:
+            self._nav_pending = None
         try:
             handle = future.result()
         except Exception as e:
-            if self._state == HOMING:
+            if epoch == self._nav_epoch and self._mode != 'drop' and self._state == HOMING:
                 self._set_state(FAILED, f'Loi gui goal Home: {e}')
             return
-        if self._state != HOMING:
+        if epoch != self._nav_epoch or self._mode == 'drop' or self._state != HOMING:
             if handle and handle.accepted:
+                self._nav_results.append(handle.get_result_async())
                 handle.cancel_goal_async()
             return
         if not handle or not handle.accepted:
             self._set_state(FAILED, 'Nav2 tu choi goal Home')
             return
         self._goal_handle = handle
-        handle.get_result_async().add_done_callback(self._on_home_result)
+        result = handle.get_result_async()
+        self._nav_results.append(result)
+        result.add_done_callback(lambda future: self._on_home_result(future, epoch))
 
-    def _on_home_result(self, future):
+    def _on_home_result(self, future, epoch=None):
+        if epoch != self._nav_epoch or self._mode == 'drop':
+            return
         self._goal_handle = None
         if self._state != HOMING:
             return
@@ -1772,7 +2548,9 @@ class PalletMission(Node):
         self._shelf_t = time.monotonic()
 
     def _stop_cm_now(self) -> float:
-        return self._drop_stop_cm if self._mode == 'drop' else float(self.p['stop_dist_cm'])
+        if self._mode == 'drop' or self._retrieval_mode:
+            return self._drop_stop_cm
+        return float(self.p['stop_dist_cm'])
 
     @staticmethod
     def _default_shelf_path() -> str:
@@ -1870,7 +2648,170 @@ class PalletMission(Node):
         self.get_logger().warn(f'[drop] tu choi: {why}')
         return False, why
 
+    def _drop_staging_error(self, target=None):
+        """Check base_footprint position AND yaw, even after Nav2 success."""
+        target = self._pre if target is None else target
+        pose = self._robot_pose(self.p['map_frame'])
+        if pose is None or target is None or not all(math.isfinite(v) for v in (*pose, *target)):
+            return None
+        return (math.hypot(pose[0] - target[0], pose[1] - target[1]),
+                abs(math.degrees(norm_angle(pose[2] - target[2]))))
+
+    def _drop_staging_reached(self, target=None, position_tol=None):
+        error = self._drop_staging_error(target)
+        # Use PICK's existing handoff/abort radii. The existing DROP yaw
+        # admission bound rejects a wrong heading; ApproachController does
+        # the precision alignment with its unchanged angular/gate tolerances.
+        tol = float(self.p['nav_abort_ok_m'] if position_tol is None else position_tol)
+        return (error is not None and error[0] <= tol
+                and error[1] <= float(self.p['drop_start_yaw_deg']))
+
+    def _fail_drop_navigation(self, msg, state=FAILED):
+        # Invalidate ownership BEFORE cancelling: pending/late goal responses
+        # must cancel themselves and can never restart local control.
+        self._drop_nav = None
+        handle, self._goal_handle = self._goal_handle, None
+        if handle is not None:
+            try:
+                handle.cancel_goal_async()
+            except Exception as e:
+                self.get_logger().warn(f'DROP cancel failed: {e}')
+        self._lift_stop()
+        self._finish(state, msg, fail_phase='DROP_NAV')
+
+    def _on_drop_goal_sent(self, future, ctx):
+        if self._nav_pending is future:
+            self._nav_pending = None
+        try:
+            handle = future.result()
+        except Exception as e:
+            if self._drop_nav is ctx:
+                self._fail_drop_navigation(f'DROP staging goal error: {e}')
+            return
+        if self._drop_nav is not ctx or self._state != NAVIGATING:
+            if handle is not None and handle.accepted:
+                self._nav_results.append(handle.get_result_async())
+                handle.cancel_goal_async()
+            return
+        if handle is None or not handle.accepted:
+            self._fail_drop_navigation('Nav2 rejected DROP staging goal')
+            return
+        self._goal_handle = handle
+        try:
+            result = handle.get_result_async()
+            self._nav_results.append(result)
+            result.add_done_callback(lambda result: self._on_drop_nav_result(result, ctx))
+        except Exception as e:
+            self._fail_drop_navigation(f'DROP result subscription error: {e}')
+
+    def _on_drop_nav_result(self, future, ctx):
+        if self._drop_nav is not ctx or self._state != NAVIGATING:
+            return
+        self._goal_handle = None
+        try:
+            status = future.result().status
+        except Exception as e:
+            self._fail_drop_navigation(f'DROP Nav2 result error: {e}')
+            return
+        # A cancel acknowledgement alone is insufficient: this callback must
+        # receive the terminal action result before local control can start.
+        acceptable = status == GoalStatus.STATUS_SUCCEEDED
+        if status == GoalStatus.STATUS_CANCELED:
+            if not ctx['handoff']:
+                self._fail_drop_navigation('DROP staging canceled', state=STOPPED)
+                return
+            acceptable = True
+        elif status == GoalStatus.STATUS_ABORTED:
+            acceptable = self._drop_staging_reached(position_tol=self.p['nav_abort_ok_m'])
+        if not acceptable or not self._drop_staging_reached():
+            self._fail_drop_navigation(
+                f'DROP staging outside position/yaw tolerance (Nav2 status={status}, '
+                f'error={self._drop_staging_error()})')
+            return
+        ctx['stopped_since'] = None
+        self._start_settling('DROP staging reached; verifying stopped odometry and rack TF')
+
+    def _drop_staging_tick(self, now):
+        ctx = self._drop_nav
+        if ctx is None:
+            self._fail_drop_navigation('DROP staging has no owned navigation goal')
+            return
+        if now - ctx['started'] > float(self.p['drop_nav_timeout_s']):
+            self._fail_drop_navigation('DROP staging navigation/settle timeout')
+            return
+        if self._state == NAVIGATING:
+            if ctx['cancel_at'] is not None:
+                self._halt()
+                if now - ctx['cancel_at'] > float(self.p['drop_stop_timeout_s']):
+                    self._fail_drop_navigation('DROP Nav2 cancellation not confirmed')
+                return
+            if (float(self.p['handoff_m']) <= 0.0 or self._goal_handle is None
+                    or not self._drop_staging_reached(position_tol=self.p['handoff_m'])):
+                self._handoff_t0 = None
+                return
+            if self._handoff_t0 is None:
+                self._handoff_t0 = now
+            if now - self._handoff_t0 >= float(self.p['handoff_hold_s']):
+                ctx['handoff'], ctx['cancel_at'] = True, now
+                self._halt()
+                try:
+                    self._goal_handle.cancel_goal_async()
+                except Exception as e:
+                    self._fail_drop_navigation(f'DROP handoff cancel error: {e}')
+            return
+
+        # Terminal Nav2 result was received; keep the mission velocity zero
+        # until measured odometry stays fresh and stopped for settle_s.
+        self._halt()
+        if now - self._settle_t0 > float(self.p['drop_stop_timeout_s']):
+            self._fail_drop_navigation('DROP stop/pose confirmation timeout')
+            return
+        speed = self._drop_odom_speed
+        stopped = (self._drop_odom_t >= self._settle_t0
+                   and now - self._drop_odom_t <= float(self.p['drop_odom_stale_s'])
+                   and speed is not None and all(math.isfinite(v) for v in speed)
+                   and speed[0] <= float(self.p['drop_stop_linear_mps'])
+                   and speed[1] <= float(self.p['drop_stop_angular_rps']))
+        if not stopped or not self._drop_staging_reached():
+            ctx['stopped_since'] = None
+            return
+        if ctx['stopped_since'] is None:
+            ctx['stopped_since'] = now
+        if now - ctx['stopped_since'] >= max(0.0, float(self.p['settle_s'])):
+            self._begin_drop_alignment()
+
+    def _begin_drop_alignment(self):
+        # Re-read the selected slot ONLY at handoff, then freeze in odom.
+        # D_1 is an entry precondition, not a constraint after reaching staging.
+        slot_map = self._tf_pose(self.p['map_frame'], self._drop['frame'])
+        if slot_map is None:
+            self._fail_drop_navigation('Missing rack TF at DROP handoff')
+            return
+        current_pre = approach_pose(*slot_map, float(self.p['drop_stage_m']))
+        if not self._drop_staging_reached(current_pre):
+            self._fail_drop_navigation('Updated rack TF is outside DROP staging tolerance')
+            return
+        ins = self._map_to_ins(*slot_map)
+        robot_ins = self._robot_pose(self.p['insertion_frame'])
+        if (ins is None or robot_ins is None
+                or not all(math.isfinite(v) for v in (*ins, *robot_ins))):
+            self._fail_drop_navigation('Missing map/odom/base TF at DROP handoff')
+            return
+        if self._lift_height_now() is None:
+            self._fail_drop_navigation('No fresh lift state at DROP handoff')
+            return
+        self._line = ins
+        self._drop_nav = None
+        self._tf_miss = 0
+        self._phase_shown = None
+        self._rack_trimmed = False
+        self._set_state(ALIGNING, 'DROP staging settled; target frozen in odom for ' + self._drop['slot'])
+
     def _start_drop(self) -> Tuple[bool, str]:
+        if self._checkpoint is not None:
+            return False, 'Interrupted pallet operation retained; use Resume or explicit reset after inspection'
+        if self._drop_nav is not None:
+            return self._fail_drop('Previous DROP navigation has not been released; STOP first')
         if self._cargo is not True or self._state not in (CARRYING, FAILED, STOPPED):
             return self._fail_drop(f'chi Drop khi dang giu pallet (state={self._state}, cargo={self._cargo})')
         self._reload_params(recompute_stage=False)
@@ -1907,8 +2848,6 @@ class PalletMission(Node):
             if sid is None:
                 return self._fail_drop(why)
         slot = [s for s in model.slots if s.id == sid][0]
-        if not slot.sensor_confirmed:
-            self.get_logger().warn(f'[drop] cam bien o {sid} CHUA xac nhan (sensor_confirmed=false)')
 
         # ---- tang / lift ----
         levels = cfg.get('levels') or {}
@@ -1924,7 +2863,8 @@ class PalletMission(Node):
         frame = model.slot_tf_frame(sid)
         slot_map = self._tf_pose(p['map_frame'], frame)
         front_map = self._tf_pose(p['map_frame'], 'shelf_front')
-        if slot_map is None or front_map is None:
+        if (slot_map is None or front_map is None
+                or not all(math.isfinite(v) for v in (*slot_map, *front_map))):
             return self._fail_drop(f"chua co TF map->{frame} / shelf_front (rack_tf_publisher chay chua?)")
 
         # ---- xe co dang o gan D_1 khong ----
@@ -1939,17 +2879,23 @@ class PalletMission(Node):
                 f'xe khong o gan D_1: cach mat ke {-a:.2f} m (can ~{-exp_a:.2f}), lech ngang {e_lat * 100:+.0f} cm, '
                 f'lech goc {math.degrees(e_yaw):+.0f} deg -> bam P_x -> D_1 truoc')
 
-        ins = self._map_to_ins(*slot_map)
-        if ins is None:
-            return self._fail_drop('khong doi duoc pose o ke sang khung odom (TF map->odom)')
+        stage = float(p['drop_stage_m'])
+        if (not math.isfinite(stage) or stage < float(p['drop_rot_clear_m']) + 0.03
+                or stage <= float(p['fork_front_m']) + float(p['drop_gate_margin_m'])):
+            return self._fail_drop('DROP staging is too close for rotation/gate clearance')
+        if not self._nav.server_is_ready():
+            return self._fail_drop('NavigateToPose server chua san sang cho DROP staging')
         if self._lift_height_now() is None:
             return self._fail_drop('khong co /joint_states cua lift')
 
         # ---- bo dieu khien (tham so rieng cho drop) ----
+        self._retrieval_mode = False
+        self._retrieval_align_only = False
         pd = dict(p)
         pd.update({
             'face_offset_m': 0.0,                       # goc khung o = MAT TRUOC ke
             'max_sidestep_m': float(p['drop_max_sidestep_m']),
+            'max_sidesteps': 1,
             'side_speed': float(p['drop_side_speed']),
             'gate_margin_m': float(p['drop_gate_margin_m']),
             'insert_speed': float(p['drop_insert_speed']),
@@ -1957,11 +2903,14 @@ class PalletMission(Node):
             'rot_clear_m': float(p['drop_rot_clear_m']),
             'total_timeout_s': float(p['drop_total_timeout_s']),
         })
-        self._ctl = ApproachController(pd, float(p['drop_stage_m']))
-        self._line = ins
+        self._ctl = ApproachController(pd, stage)
+        self._line = None           # freeze only AFTER Nav2 has stopped at staging
+        self._pre = approach_pose(*slot_map, stage)
         self._mode = 'drop'
+        self._rack_trim_frame = frame
+        self._rack_trimmed = False
         self._drop_lifted = False
-        self._trimmed = False       # moi lan Drop (ke ca thu lai) deu duoc trim 1 lan
+        self._trimmed = False       # pick yaw-trim flag; rack trim is separate
         self._drop = {'slot': sid, 'level': lvl, 'type': ctype, 'frame': frame,
                       'insert_cm': insert_cm, 'release_cm': release_cm}
         self._tf_miss = 0
@@ -1971,7 +2920,20 @@ class PalletMission(Node):
         msg = (f"DROP o {sid} (tang {lvl}, loai {ctype} theo {src}): nang {insert_cm:.0f} cm khi vao, "
                f"dat o {release_cm:.0f} cm, sieu am dung {self._drop_stop_cm:.1f} cm")
         self.get_logger().info('[drop] ' + msg)
-        self._set_state(ALIGNING, 'Bat dau canh chinh vao o ' + sid)
+        ctx = {'started': time.monotonic(), 'handoff': False,
+               'cancel_at': None, 'stopped_since': None}
+        self._drop_nav = ctx
+        self._goal_handle = None
+        self._handoff_t0 = None
+        self._set_state(NAVIGATING, f'DROP {sid}: Nav2 toi staging cach mat ke {stage:.2f} m')
+        self._publish_pose(self.pub_pre, *self._pre)
+        try:
+            future = self._nav.send_goal_async(self._staging_goal())
+            self._nav_pending = future
+            future.add_done_callback(lambda future: self._on_drop_goal_sent(future, ctx))
+        except Exception as e:
+            self._fail_drop_navigation(f'Cannot send DROP staging goal: {e}')
+            return False, self._msg
         return True, msg
 
     def _drop_inserted(self):
@@ -1988,7 +2950,24 @@ class PalletMission(Node):
 
     def _on_lift_reached(self, h: float):
         nxt = self._lift_next
-        if nxt == 'pick_done':
+        if nxt == 'manual_home_done':
+            self._set_state(CARRYING if self._cargo is True else IDLE,
+                            f'Forks at HOME ({h:.1f} cm); cargo state retained')
+        elif nxt == 'retrieval_home_ready':
+            self._set_state(IDLE, f'Retrieval lift homed at {h:.1f} cm')
+        elif nxt == 'retrieval_insert':
+            self._us_count = 0
+            self._phase_shown = None
+            self._ctl.resume_converge(time.monotonic(), insertion_only=True)
+            self._set_state(INSERTING, f'Retrieval forks ready at {h:.1f} cm; inserting with steering')
+        elif nxt == 'retrieval_transit':
+            self._set_state(CARRYING,
+                           f'Retrieved pallet from {self._retrieval_slot}; '
+                           f'lift at transit {h:.1f} cm, ready for D_2')
+        elif nxt == 'retrieval_released':
+            self._cargo = False
+            self._set_state(DONE, f'Pallet lowered at D_2 ({h:.1f} cm)')
+        elif nxt == 'pick_done':
             self._cargo = False
             self._set_state(DONE, f'XONG chu trinh: {self._ins_msg} | lift ve {h:.1f} cm')
         elif nxt == 'pick_backoff':
@@ -1996,7 +2975,7 @@ class PalletMission(Node):
         elif nxt == 'drop_insert':
             self._us_count = 0
             self._phase_shown = None
-            self._ctl.resume_converge(time.monotonic())
+            self._ctl.resume_converge(time.monotonic(), insertion_only=True)
             self._set_state(INSERTING, f'Lift {h:.1f} cm -> tien vao ke')
         elif nxt == 'drop_release':
             # Giu `cargo=True` cho toi khi lui xong + lift ve 0 (drop_done).
@@ -2018,21 +2997,32 @@ class PalletMission(Node):
     # ==================================================================
     def _cancel_all_nav(self):
         try:
+            if self._manager_stop_cli.service_is_ready():
+                self._stop_request_futures.append(self._manager_stop_cli.call_async(Trigger.Request()))
             if self._cancel_all_cli.service_is_ready():
-                self._cancel_all_cli.call_async(CancelGoal.Request())
+                self._nav_cancel_future = self._cancel_all_cli.call_async(CancelGoal.Request())
+                self._stop_request_futures.append(self._nav_cancel_future)
         except Exception as e:
             self.get_logger().warn(f'Cancel all Nav2 goals failed: {e}')
 
     def _emergency_stop(self):
         """Issue drive zero and lift M0 without changing cargo or lift target."""
+        self._capture_recovery()
+        self._nav_epoch += 1
+        self._drop_nav = None
+        if self._retrieval_pick_nav is not None:
+            self._retrieval_pick_nav_elapsed += time.monotonic() - self._retrieval_pick_nav['started']
+            self._retrieval_pick_nav = None
         if self._goal_handle is not None:
             try:
                 self._goal_handle.cancel_goal_async()
             except Exception:
                 pass
             self._goal_handle = None
-        self._cancel_all_nav()
         self.pub_detector_enable.publish(Bool(data=False))
+        if not self.p['detector_prewarm']:
+            self._terminate_detector()
+        # Retain operation context, insertion-only guard and consumed alignment budget.
         self._halt()
         self._lift_stop()
         missing = []
@@ -2053,8 +3043,14 @@ class PalletMission(Node):
     def _tick(self):
         self._reap_detector()
         now = time.monotonic()
+        if self._retrieval_mode and self._mode == 'pick' and self._state in (NAVIGATING, SETTLING):
+            self._retrieval_pick_staging_tick(now)
+            return
         if self._state == DETECTING and self._det_proc is None:
             self._set_state(FAILED, 'Detector tu thoat bat ngo')
+            return
+        if self._mode == 'drop' and self._state in (NAVIGATING, SETTLING):
+            self._drop_staging_tick(now)
             return
         if self._state == NAVIGATING:
             self._handoff_check()
@@ -2071,6 +3067,8 @@ class PalletMission(Node):
         # HOMING: do callback cua Nav2 xu ly, khong can lam gi trong tick
 
     def _slow_tick(self):
+        self._nav_results = [future for future in self._nav_results if not future.done()]
+        self._stop_request_futures = [future for future in self._stop_request_futures if not future.done()]
         if (self.p.get('detector_prewarm', True)
                 and not self._detector_alive()
                 and time.monotonic() >= self._det_prewarm_retry_t):

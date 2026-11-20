@@ -18,15 +18,18 @@ import glob
 import math
 import os
 import signal
+import shlex
 import subprocess
 import threading
 import time
+import uuid
 from functools import wraps
 from typing import Optional, Dict, Any
 
 from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
 from action_msgs.msg import GoalStatus
 from action_msgs.srv import CancelGoal
+from lifecycle_msgs.srv import GetState
 # History (HISTORY_RESULTS_PLAN.md §6, Phase 3): nav-run lifecycle.
 try:
     from amr_web.history import events as _history_events
@@ -53,7 +56,21 @@ def _serialize_cancel_and_goal_submission(method):
     """Keep goal submission from racing a cancel state update."""
     @wraps(method)
     def wrapped(self, *args, **kwargs):
+        with self._lock:
+            generation = self._cancel_generation
+            if self._cancel_in_progress:
+                return False, 'Cancel is pending; wait for the navigation result'
         with self._cancel_lock:
+            if generation != self._cancel_generation:
+                return False, 'Command superseded by Cancel'
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
+def _serialize_process_management(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._process_lock:
             return method(self, *args, **kwargs)
     return wrapped
 
@@ -66,6 +83,10 @@ class NavBridge:
     # Navigation states
     STATE_IDLE = 'IDLE'
     STATE_STARTING = 'STARTING'
+    STATE_SENDING = 'SENDING'
+    STATE_ACCEPTED = 'ACCEPTED'
+    STATE_CANCELING = 'CANCELING'
+    STATE_UNKNOWN = 'UNKNOWN'
     STATE_ACTIVE = 'ACTIVE'
     STATE_SUCCEEDED = 'SUCCEEDED'
     STATE_FAILED = 'FAILED'
@@ -88,6 +109,15 @@ class NavBridge:
         self._goal_handle = None
         self._goal_pending = False
         self._cancel_requested = False
+        self._cancel_generation = 0
+        self._cancel_in_progress = False
+        self._goal_context = None
+        self._observed_goals = {}
+        self._last_goal_id = None
+        self._last_result = None
+        self._last_elapsed_s = 0.0
+        self._bridge_session_id = uuid.uuid4().hex
+        self._state_sequence = 0
 
         # Navigation state
         self._current_state = self.STATE_IDLE
@@ -108,11 +138,27 @@ class NavBridge:
 
         # B21 Fix: Cờ báo đang dừng - ngăn frontend nạp lại map trong lúc stop
         self._stopping = False
+        self._initial_pose_pending = False
 
         # P0-1 Fix: Use RLock for deadlock-free locking
         self._lock = threading.RLock()
         # Serialize cancel requests without blocking navigation-state readers.
         self._cancel_lock = threading.Lock()
+        self._process_lock = threading.Lock()
+        self._goal_changed = threading.Condition(self._lock)
+
+        # Discovery of an action server alone does not establish lifecycle readiness.
+        self._lifecycle = {}
+        self._lifecycle_pending = {}
+        self._lifecycle_requested_at = {}
+        self._lifecycle_clients = {
+            name: node.create_client(GetState, f'/{name}/get_state',
+                                     callback_group=ReentrantCallbackGroup())
+            for name in ('bt_navigator', 'controller_server', 'planner_server',
+                         'behavior_server', 'velocity_smoother', 'amcl', 'map_server')
+        } if node is not None else {}
+        self._readiness_timer = (node.create_timer(1.0, self._poll_readiness,
+                                callback_group=ReentrantCallbackGroup()) if node else None)
 
         # Emergency Stop Publisher
         self._cmd_vel_pub = (node.create_publisher(
@@ -184,6 +230,8 @@ class NavBridge:
         """Broadcast navigation result to WebSocket."""
         payload = {
             'type': 'nav_result',
+            'goal_id': self._last_goal_id,
+            'bridge_session_id': self._bridge_session_id,
             'state': state,
             'message': message,
             'timestamp': time.time(),
@@ -267,7 +315,109 @@ class NavBridge:
         Doc duoi lock, KHONG dung de gan state.
         """
         with self._lock:
-            return self._current_state == self.STATE_ACTIVE
+            return self._goal_context is not None or bool(self._active_observed_goals())
+
+    @staticmethod
+    def validate_pose(pose):
+        if not isinstance(pose, dict):
+            raise ValueError('Pose must contain finite x, y and yaw numbers')
+        for key in ('x', 'y', 'yaw'):
+            value = pose.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError('Pose must contain finite x, y and yaw numbers')
+        return dict(pose)
+
+    def _poll_readiness(self):
+        with self._lock:
+            for name, client in self._lifecycle_clients.items():
+                pending = self._lifecycle_pending.get(name)
+                if pending and not pending.done():
+                    if time.monotonic() - self._lifecycle_requested_at.get(name, 0) <= 3.0:
+                        continue
+                    self._lifecycle_pending.pop(name, None)
+                    client.remove_pending_request(pending)
+                    pending.cancel()
+                if not client.service_is_ready():
+                    self._lifecycle.pop(name, None)
+                    continue
+                try:
+                    future = client.call_async(GetState.Request())
+                except Exception as exc:
+                    self._lifecycle.pop(name, None)
+                    if self._logger:
+                        self._logger.warning(f'Lifecycle request {name} failed: {exc}')
+                    continue
+                self._lifecycle_pending[name] = future
+                self._lifecycle_requested_at[name] = time.monotonic()
+                def receive(done, name=name):
+                    with self._lock:
+                        if self._lifecycle_pending.get(name) is not done:
+                            return
+                        try:
+                            self._lifecycle[name] = (done.result().current_state.id, time.monotonic())
+                        except Exception as exc:
+                            self._lifecycle.pop(name, None)
+                            if self._logger:
+                                self._logger.warning(f'Lifecycle query {name} failed: {exc}')
+                future.add_done_callback(receive)
+
+    def _readiness_reason(self):
+        if not self._nav_ready():
+            return 'Nav2 action server unavailable'
+        now = time.monotonic()
+        if any(self._lifecycle.get(name, (None, 0))[0] != 3 or
+               now - self._lifecycle.get(name, (None, 0))[1] > 3.0
+               for name in self._lifecycle_clients):
+            return 'Waiting for active Nav2 lifecycle nodes'
+        check = getattr(self._node, 'navigation_pose_ready', None)
+        if check and not check():
+            return 'Waiting for a fresh map transform and odometry'
+        if self._initial_pose_pending:
+            return 'Initializing localization at HOME'
+        return None
+
+    def _active_observed_goals(self):
+        # Never release ownership merely because a status stream becomes stale.
+        return {key: status for key, status in self._observed_goals.items() if status in (1, 2, 3)}
+
+    def observe_goal_status(self, name, msg):
+        with self._goal_changed:
+            for item in msg.status_list:
+                key = (name, bytes(item.goal_info.goal_id.uuid).hex())
+                old = self._observed_goals.get(key)
+                # Terminal status is final even if an older callback arrives late.
+                if old not in (4, 5, 6):
+                    self._observed_goals[key] = item.status
+                if old in (1, 2, 3) and item.status in (4, 5, 6) and self._goal_context is None:
+                    self._current_state = {4: self.STATE_SUCCEEDED, 5: self.STATE_CANCELED,
+                                           6: self.STATE_FAILED}[item.status]
+                    self._last_goal_id = key[1]
+            # Retain active entries until an explicit terminal status arrives.
+            terminal = [k for k, v in self._observed_goals.items() if v in (4, 5, 6)]
+            for key in terminal[:-256]:
+                self._observed_goals.pop(key, None)
+            self._goal_changed.notify_all()
+
+    def _new_goal_context(self):
+        ctx = {'id': uuid.uuid4().hex, 'handle': None, 'created': time.monotonic()}
+        self._goal_context = ctx
+        self._last_goal_id = ctx['id']
+        self._last_result = None
+        self._goal_pending = True
+        self._cancel_requested = False
+        self._feedback = None
+        self._current_state = self.STATE_SENDING
+        return ctx
+
+    def _goal_uncertain(self, ctx, exc):
+        with self._lock:
+            if self._goal_context is not ctx:
+                return
+            self._current_state = self.STATE_UNKNOWN
+            ctx['message'] = 'Navigation outcome unconfirmed; verify robot state before retrying. Request Cancel or stop the owned Nav2 session.'
+            if self._logger:
+                self._logger.error(f'Navigation goal={ctx["id"]} unconfirmed: {exc}')
+            self._broadcast_state()
 
     def _nav_ready(self) -> bool:
         """Check if navigate_to_pose action server is ready."""
@@ -309,6 +459,7 @@ class NavBridge:
         except Exception:
             return False
 
+    @_serialize_process_management
     def start_nav2(self, map_path: str, route_path: Optional[str] = None,
                     map_id: str = None, route_id: str = None) -> tuple:
         """Start Nav2 launch process with monitoring."""
@@ -318,6 +469,8 @@ class NavBridge:
                 return False, "Nav2 is stopping, retry in a few seconds"
             if self.is_nav_running():
                 return False, "Nav2 process already running"
+            if self._nav_ready() or self._waypoint_ready() or self.is_goal_active():
+                return False, 'Nav2 already detected outside this bridge session; verify its owner first'
 
         map_abs = os.path.abspath(os.path.expanduser(map_path))
         if not os.path.exists(map_abs):
@@ -334,9 +487,9 @@ class NavBridge:
         self._notify_session_end()
 
         ws_setup = os.path.expanduser('~/project_ws/install/setup.bash')
-        cmd = f'source "{ws_setup}" && exec ros2 launch amr_navigation nav_web.launch.py map:="{map_abs}"'
+        cmd = f'source {shlex.quote(ws_setup)} && exec ros2 launch amr_navigation nav_web.launch.py {shlex.quote("map:=" + map_abs)}'
         if route_abs:
-            cmd += f' route:="{route_abs}"'
+            cmd += ' ' + shlex.quote('route:=' + route_abs)
 
         log_handle = self._open_nav_log()
         try:
@@ -344,7 +497,7 @@ class NavBridge:
                 ['bash', '-c', cmd],
                 stdout=log_handle if log_handle else subprocess.DEVNULL,
                 stderr=log_handle if log_handle else subprocess.DEVNULL,
-                preexec_fn=os.setsid
+                start_new_session=True
             )
         except Exception:
             if log_handle:
@@ -358,6 +511,8 @@ class NavBridge:
             self._nav_active = True
             self._session = {'map_id': map_id, 'route_id': route_id}
             self._current_state = self.STATE_IDLE
+            self._lifecycle.clear()
+            self._initial_pose_pending = AUTO_HOME_INITIAL_POSE
 
         # P1-5 Fix: Start monitoring thread instead of just sleep(1.5)
         threading.Thread(target=self._watch_process, args=(self._nav_process,), daemon=True).start()
@@ -377,9 +532,9 @@ class NavBridge:
             self._nav_process = None
             self._nav_active = False
             self._op_mode = 'MANUAL'
-            self._current_state = self.STATE_IDLE
-            self._goal_handle = None
-            self._goal_pending = False
+            # Process exit is not an action terminal result or proof of standstill.
+            self._current_state = self.STATE_UNKNOWN if self.is_goal_active() else self.STATE_FAILED
+            self._initial_pose_pending = False
 
         self._notify_session_end()
         self._emit({
@@ -416,11 +571,16 @@ class NavBridge:
                 return
             except subprocess.TimeoutExpired:
                 continue
+        if proc.poll() is None:
+            raise RuntimeError('Nav2 process termination unconfirmed')
 
+    @_serialize_process_management
     def stop_nav2(self) -> tuple:
         """Stop Nav2 launch process and all child nodes."""
         # B21 Fix: Bật cờ dừng ngay để nav_state báo IDLE trong lúc shutdown
         with self._lock:
+            if not self._nav_process:
+                return False, 'No Nav2 process owned by this bridge; external processes were not stopped'
             self._stopping = True
 
         # Cancel any active goal first
@@ -434,25 +594,15 @@ class NavBridge:
             proc, self._nav_process = self._nav_process, None  # Signal _watch_process
 
         if proc:
-            self._terminate_process_group(proc)
-
-        # P1-6 Fix: Kill specific nodes with exact match, not -f pattern
-        try:
-            nodes = [
-                'lifecycle_manager_navigation',
-                'lifecycle_manager_localization',
-                'map_server', 'amcl',
-                'controller_server', 'planner_server',
-                'bt_navigator', 'waypoint_follower',
-                'velocity_smoother', 'behavior_server',
-                'route_server', 'route_graph_publisher'
-            ]
-            for node_name in nodes:
-                subprocess.run(['pkill', '-x', node_name],
-                             capture_output=True, timeout=1.0)
-        except Exception as e:
-            if self._logger:
-                self._logger.warn(f'Node cleanup warning: {e}')
+            try:
+                self._terminate_process_group(proc)
+            except Exception as exc:
+                with self._lock:
+                    self._nav_process = proc
+                    self._stopping = False
+                    self._current_state = self.STATE_UNKNOWN
+                self._broadcast_state()
+                return False, f'Nav2 shutdown unconfirmed: {exc}'
 
         with self._lock:
             self._nav_active = False
@@ -460,6 +610,11 @@ class NavBridge:
             self._current_state = self.STATE_IDLE
             self._goal_handle = None
             self._goal_pending = False
+            self._goal_context = None
+            self._observed_goals.clear()
+            self._cancel_requested = False
+            self._initial_pose_pending = False
+            self._goal_changed.notify_all()
             self._feedback = None
             self._current_goal_pose = None
             self._session = {'map_id': None, 'route_id': None}
@@ -468,7 +623,7 @@ class NavBridge:
         if _HISTORY_OK:
             try:
                 _history_runs.finish_active_run(
-                    'CANCELED', 'Navigation stopped', self._capture_current_pose())
+                    'INTERRUPTED', 'Nav2 session stopped; action outcome not confirmed', self._capture_current_pose())
             except Exception:
                 pass
 
@@ -507,77 +662,63 @@ class NavBridge:
     # ============================================
 
     @_serialize_cancel_and_goal_submission
-    def send_navigation_goal(self, pose: Dict[str, float],
-                            route_id: Optional[str] = None) -> tuple:
-        """Send navigation goal to Nav2."""
+    def send_navigation_goal(self, pose, route_id=None):
+        try:
+            pose = self.validate_pose(pose)
+        except ValueError as exc:
+            return False, str(exc)
         with self._lock:
-            if not self.is_nav_running():
-                return False, "Nav2 is not running"
-
-            if not self._nav_ready():
-                return False, "Nav2 is not ready"
-
-            if self._goal_pending or (self._goal_handle and
-                    self._goal_handle.status in (GoalStatus.STATUS_ACCEPTED,
-                                                 GoalStatus.STATUS_EXECUTING,
-                                                 GoalStatus.STATUS_CANCELING)):
-                return False, "A goal is running – cancel it first"
-
-            self._initial_distance = None
-            self._cancel_requested = False
-            self._mission_type = 'single'
-            self._goal_pending = True
-
-            # Create goal
+            reason = self._submission_block_reason()
+            if reason:
+                return False, reason
             goal_msg = NavigateToPose.Goal()
             goal_msg.pose.header.stamp = self._node.get_clock().now().to_msg()
             goal_msg.pose.header.frame_id = 'map'
-            goal_msg.pose.pose.position.x = float(pose.get('x', 0.0))
-            goal_msg.pose.pose.position.y = float(pose.get('y', 0.0))
-            goal_msg.pose.pose.position.z = 0.0
-
-            yaw = float(pose.get('yaw', 0.0))
-            q = self._yaw_to_quaternion(yaw)
-            goal_msg.pose.pose.orientation.x = q[0]
-            goal_msg.pose.pose.orientation.y = q[1]
-            goal_msg.pose.pose.orientation.z = q[2]
-            goal_msg.pose.pose.orientation.w = q[3]
-
-            self._current_goal_pose = pose.copy()
-            self._current_goal_pose['route_id'] = route_id
-
-            # P0-2 Fix: Use sync send_goal + async callbacks
-            send_future = self._action_client.send_goal_async(
-                goal_msg, feedback_callback=self._on_navigation_feedback)
-            send_future.add_done_callback(self._on_goal_response)
-
-            self._current_state = self.STATE_ACTIVE
-            # [history] Open a run for this navigation goal. Use the
-            # current pose as the start. Soft-fail; an exception here
-            # must not affect robot control.
+            goal_msg.pose.pose.position.x = float(pose['x'])
+            goal_msg.pose.pose.position.y = float(pose['y'])
+            q = self._yaw_to_quaternion(pose['yaw'])
+            (goal_msg.pose.pose.orientation.x, goal_msg.pose.pose.orientation.y,
+             goal_msg.pose.pose.orientation.z, goal_msg.pose.pose.orientation.w) = q
+            self._mission_type = 'single'
+            self._initial_distance = None
+            self._current_goal_pose = {**pose, 'route_id': route_id}
+            ctx = self._new_goal_context()
             if _HISTORY_OK:
-                try:
-                    _history_runs.begin_goal_run(
-                        goal_pose={"x": float(pose.get("x", 0.0)),
-                                   "y": float(pose.get("y", 0.0)),
-                                   "yaw": float(pose.get("yaw", 0.0))},
-                        start_pose=self._capture_current_pose(),
-                        map_id=(self._session.get("map_id")
-                                if isinstance(self._session, dict) else None),
-                        route_id=route_id,
-                    )
-                except Exception:
-                    pass
+                _history_runs.begin_goal_run(
+                    goal_pose=pose, start_pose=self._capture_current_pose(),
+                    map_id=self._session.get('map_id'), route_id=route_id)
+            try:
+                future = self._action_client.send_goal_async(goal_msg,
+                    feedback_callback=lambda msg: self._on_navigation_feedback(msg, ctx))
+                future.add_done_callback(lambda done: self._on_goal_response(done, ctx))
+            except Exception as exc:
+                self._goal_uncertain(ctx, exc)
+                return False, 'Goal submission unconfirmed; verify navigation state before retrying'
             self._broadcast_state()
-            return True, "Goal accepted"
+            return True, 'Goal submitted; awaiting Nav2 acceptance'
 
-    def _on_navigation_feedback(self, feedback_msg) -> None:
+    def _submission_block_reason(self):
+        if self._stopping:
+            return 'Nav2 is stopping'
+        if not self.is_nav_running():
+            return 'No Nav2 session owned by this bridge'
+        if self.is_goal_active():
+            return 'A goal is pending, active or unconfirmed; cancel it first'
+        return self._readiness_reason()
+
+    def _on_navigation_feedback(self, feedback_msg, ctx) -> None:
         """Handle navigation feedback."""
         try:
             fb = feedback_msg.feedback
             remaining = float(fb.distance_remaining)
+            if not math.isfinite(remaining) or remaining < 0:
+                raise ValueError('Invalid Nav2 distance feedback')
 
             with self._lock:
+                if self._goal_context is not ctx or self._cancel_requested:
+                    return
+                ctx['feedback_received'] = True
+                self._current_state = self.STATE_ACTIVE
                 if self._initial_distance is None or remaining > self._initial_distance:
                     self._initial_distance = remaining
                 self._feedback = {
@@ -590,41 +731,35 @@ class NavBridge:
             if self._logger:
                 self._logger.warn(f'Feedback error: {e}')
 
-    def _on_goal_response(self, future) -> None:
-        """Handle goal acceptance/rejection."""
-        try:
-            self._goal_handle = future.result()
-
-            if not self._goal_handle.accepted:
-                with self._lock:
-                    self._goal_pending = False
-                self._current_state = self.STATE_FAILED
-                self._broadcast_nav_result('FAILED', 'Goal rejected')
-                return
-
-            # Check if cancel was requested while waiting
-            with self._lock:
-                if self._cancel_requested:
-                    self._goal_handle.cancel_goal_async().add_done_callback(
-                        self._on_cancel_response)
-                    self._cancel_requested = False
-                    return
-
-            # Get result
-            result_future = self._goal_handle.get_result_async()
-            result_future.add_done_callback(self._on_result_received)
-
-        except Exception as e:
-            if self._logger:
-                self._logger.error(f'Goal response error: {e}')
-            with self._lock:
-                self._goal_pending = False
-            self._current_state = self.STATE_FAILED
-            self._broadcast_nav_result('FAILED', str(e))
-
-    def _finish_goal(self, status: int, error_code: int, error_msg: str) -> None:
-        """P0-3 Fix: Process goal result using status code correctly."""
+    def _on_goal_response(self, future, ctx):
         with self._lock:
+            try:
+                handle = future.result()
+                if self._goal_context is not ctx:
+                    if handle.accepted:
+                        handle.cancel_goal_async().add_done_callback(self._on_cancel_response)
+                    return
+                if not handle.accepted:
+                    self._finish_goal(GoalStatus.STATUS_ABORTED, 1, 'Nav2 rejected the goal', ctx)
+                    return
+                ctx['handle'] = self._goal_handle = handle
+                ctx['ros_id'] = bytes(handle.goal_id.uuid).hex()
+                self._goal_pending = False
+                self._current_state = (self.STATE_CANCELING if self._cancel_requested else
+                                       self.STATE_ACTIVE if ctx.get('feedback_received') else self.STATE_ACCEPTED)
+                # Always attach the result, including when Cancel preceded acceptance.
+                handle.get_result_async().add_done_callback(lambda done: self._on_result_received(done, ctx))
+                if self._cancel_requested:
+                    handle.cancel_goal_async().add_done_callback(self._on_cancel_response)
+                self._broadcast_state()
+            except Exception as exc:
+                self._goal_uncertain(ctx, exc)
+
+    def _finish_goal(self, status: int, error_code: int, error_msg: str, ctx) -> None:
+        """P0-3 Fix: Process goal result using status code correctly."""
+        with self._goal_changed:
+            if self._goal_context is not ctx:
+                return
             if status == GoalStatus.STATUS_SUCCEEDED and error_code == 0:
                 state, msg = self.STATE_SUCCEEDED, 'Goal reached'
             elif status == GoalStatus.STATUS_CANCELED:
@@ -633,8 +768,19 @@ class NavBridge:
                 state, msg = self.STATE_FAILED, f'Navigation failed: {error_msg}'
 
             self._current_state = state
+            self._last_result = {'state': state, 'message': msg, 'goal_id': ctx['id']}
+            self._last_elapsed_s = max(0.0, time.monotonic() - ctx['created'])
+            ros_id = ctx.get('ros_id')
+            if ros_id:
+                name = 'navigate_to_pose' if self._mission_type == 'single' else 'navigate_through_poses'
+                self._observed_goals[(name, ros_id)] = status
+                for key in list(self._observed_goals):
+                    if key[1] == ros_id:
+                        self._observed_goals[key] = status
             self._broadcast_nav_result(state, msg)
-
+            self._goal_context = None
+            self._cancel_requested = False
+            self._goal_changed.notify_all()
             self._goal_handle = None
             self._goal_pending = False
             self._feedback = None
@@ -646,79 +792,89 @@ class NavBridge:
 
         self._broadcast_state()
 
-    def _on_result_received(self, future) -> None:
-        """Handle navigation result."""
+    def _on_result_received(self, future, ctx):
         try:
             wrapped = future.result()
-            status = wrapped.status
-            error_code = getattr(wrapped.result, 'error_code', 0)
-            error_msg = getattr(wrapped.result, 'error_msg', '') or f'status={status}'
+            self._finish_goal(wrapped.status, getattr(wrapped.result, 'error_code', 0),
+                getattr(wrapped.result, 'error_msg', '') or f'status={wrapped.status}', ctx)
+        except Exception as exc:
+            self._goal_uncertain(ctx, exc)
 
-            self._finish_goal(status, error_code, error_msg)
-        except Exception as e:
-            if self._logger:
-                self._logger.error(f'Result error: {e}')
+    def cancel_navigation(self, emergency_stop=True, timeout_s=3.0):
+        with self._lock:
+            if self._cancel_in_progress:
+                return False, 'Cancel already pending; await terminal navigation state'
+            self._cancel_in_progress = True
+            self._cancel_generation += 1
+        try:
+            return self._cancel_navigation(emergency_stop, timeout_s)
+        finally:
             with self._lock:
-                self._current_state = self.STATE_FAILED
-                self._goal_pending = False
-            self._broadcast_nav_result('FAILED', str(e))
-            self._broadcast_state()
+                self._cancel_in_progress = False
 
-    def cancel_navigation(self, emergency_stop: bool = True) -> tuple:
-        """Stop base motion and wait for Nav2's cancel response."""
+    def _cancel_navigation(self, emergency_stop, timeout_s):
         with self._cancel_lock:
+            with self._lock:
+                ctx = self._goal_context
+                targets = set(self._active_observed_goals())
+                self._cancel_requested = ctx is not None
+                if ctx or targets:
+                    self._current_state = self.STATE_CANCELING
+            self._broadcast_state()
             if emergency_stop:
                 self._emergency_stop()
-
-            # Always use Nav2's cancel service: the active goal may belong to
-            # mission_manager/LLM, not this bridge's ActionClient.
-            cancel_acknowledged = False
-            cancel_failures = []
-            for client in (self._cancel_goal_client, self._cancel_waypoint_goal_client):
+            failures = []
+            for name, client in (('navigate_to_pose', self._cancel_goal_client),
+                                 ('navigate_through_poses', self._cancel_waypoint_goal_client)):
                 if client is None or not client.wait_for_service(timeout_sec=0.5):
-                    cancel_failures.append('cancel service unavailable')
+                    if ctx or any(key[0] == name for key in targets):
+                        failures.append(f'{name}: cancel service unavailable')
                     continue
-                done = threading.Event()
-                result = {}
-
-                def _on_cancel_done(future):
+                # Each future owns its storage; a late response must never wake a
+                # subsequent service wait or replace that service's response.
+                done, reply = threading.Event(), {}
+                def receive(future, done=done, reply=reply):
                     try:
-                        result['response'] = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        result['error'] = str(exc)
+                        reply['response'] = future.result()
+                    except Exception as exc:
+                        reply['error'] = str(exc)
                     finally:
                         done.set()
-
-                client.call_async(CancelGoal.Request()).add_done_callback(_on_cancel_done)
-                if not done.wait(timeout=2.0):
-                    cancel_failures.append('timed out waiting for response')
-                    continue
-                response = result.get('response')
-                if result.get('error'):
-                    cancel_failures.append(result['error'])
-                    continue
-                if response is None:
-                    cancel_failures.append('empty response')
-                    continue
-                cancel_acknowledged |= bool(response.goals_canceling)
-            if cancel_failures:
-                return False, 'Nav2 cancel unconfirmed: ' + '; '.join(cancel_failures)
-            with self._lock:
-                goal_pending = self._goal_pending
-            if goal_pending and not cancel_acknowledged:
-                with self._lock:
-                    self._cancel_requested = True
-                return False, "Nav2 cancel unconfirmed: pending goal was not acknowledged"
-            msg = ("Nav2 cancel acknowledged" if cancel_acknowledged
-                   else "Nav2 responded: no active goal")
-            with self._lock:
-                self._current_goal_pose = None
-                self._feedback = None
-                self._current_state = self.STATE_CANCELED
-                self._goal_pending = False
-            self._broadcast_state()
-            self._broadcast_nav_result('CANCELED', msg)
-            return True, msg
+                try:
+                    client.call_async(CancelGoal.Request()).add_done_callback(receive)
+                    if not done.wait(timeout=2.0):
+                        failures.append(f'{name}: cancel response timeout')
+                        continue
+                    response = reply.get('response')
+                    if response is None or response.return_code != 0:
+                        failures.append(f'{name}: cancel rejected or unavailable')
+                        continue
+                    with self._lock:
+                        for info in response.goals_canceling:
+                            key = (name, bytes(info.goal_id.uuid).hex())
+                            targets.add(key)
+                            if self._observed_goals.get(key) not in (4, 5, 6):
+                                self._observed_goals[key] = 3
+                except Exception as exc:
+                    failures.append(f'{name}: {exc}')
+            deadline = time.monotonic() + timeout_s
+            with self._goal_changed:
+                def outstanding():
+                    return (ctx is not None and self._goal_context is ctx or
+                            any(self._observed_goals.get(key) not in (4, 5, 6) for key in targets))
+                while outstanding():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._current_state = self.STATE_UNKNOWN
+                        self._broadcast_state()
+                        return False, 'Nav2 cancel unconfirmed: awaiting terminal action result; do not retry Start'
+                    self._goal_changed.wait(remaining)
+                if failures and not (ctx or targets):
+                    return False, 'Nav2 cancel unconfirmed: ' + '; '.join(failures)
+                # A service error can race a real terminal result. That terminal
+                # evidence settles the task, without claiming it was CANCELED.
+                self._broadcast_state()
+                return True, 'Navigation task ended' if ctx or targets else 'No active navigation goal'
 
     def _on_cancel_response(self, future) -> None:
         """Handle cancel response."""
@@ -748,89 +904,62 @@ class NavBridge:
     # ============================================
 
     @_serialize_cancel_and_goal_submission
-    def send_waypoint_mission(self, waypoints: list,
-                               mission_type: str = 'waypoints') -> tuple:
-        """Send waypoint/route mission to Nav2."""
+    def send_waypoint_mission(self, waypoints, mission_type='waypoints'):
+        if mission_type not in ('waypoints', 'route'):
+            return False, 'Invalid mission type'
+        if not isinstance(waypoints, list) or not waypoints:
+            return False, 'Provide a non-empty waypoint list'
+        try:
+            waypoints = [self.validate_pose(wp) for wp in waypoints]
+        except ValueError as exc:
+            return False, str(exc)
         with self._lock:
-            if not waypoints:
-                return False, "No waypoints provided"
-
-            if not self.is_nav_running():
-                return False, "Nav2 is not running"
-
+            reason = self._submission_block_reason()
+            if reason:
+                return False, reason
             if not self._waypoint_ready():
-                return False, "Nav2 is not ready"
-
-            if self._goal_pending or (self._goal_handle and
-                    self._goal_handle.status in (GoalStatus.STATUS_ACCEPTED,
-                                                 GoalStatus.STATUS_EXECUTING)):
-                return False, "A goal is running – cancel it first"
-
-            # Build poses
+                return False, 'NavigateThroughPoses action server unavailable'
             from geometry_msgs.msg import PoseStamped
             poses = []
             for wp in waypoints:
                 pose = PoseStamped()
                 pose.header.stamp = self._node.get_clock().now().to_msg()
                 pose.header.frame_id = 'map'
-                pose.pose.position.x = float(wp.get('x', 0.0))
-                pose.pose.position.y = float(wp.get('y', 0.0))
-                pose.pose.position.z = 0.0
-
-                yaw = float(wp.get('yaw', 0.0))
-                q = self._yaw_to_quaternion(yaw)
-                pose.pose.orientation.x = q[0]
-                pose.pose.orientation.y = q[1]
-                pose.pose.orientation.z = q[2]
-                pose.pose.orientation.w = q[3]
+                pose.pose.position.x = float(wp['x'])
+                pose.pose.position.y = float(wp['y'])
+                (pose.pose.orientation.x, pose.pose.orientation.y,
+                 pose.pose.orientation.z, pose.pose.orientation.w) = self._yaw_to_quaternion(wp['yaw'])
                 poses.append(pose)
-
             self._waypoint_poses = waypoints
             self._current_waypoint_index = 0
             self._mission_type = mission_type
             self._initial_distance = None
-            self._cancel_requested = False
-            self._goal_pending = True
-            self._current_goal_pose = {
-                'type': mission_type,
-                'waypoints': waypoints,
-                'total': len(waypoints)
-            }
-
-            # Send goal
-            goal_msg = NavigateThroughPoses.Goal()
-            goal_msg.poses = poses
-
-            send_future = self._waypoint_action_client.send_goal_async(
-                goal_msg, feedback_callback=self._on_waypoint_feedback)
-            send_future.add_done_callback(self._on_waypoint_goal_response)
-
-            self._current_state = self.STATE_ACTIVE
-            # [history] Open a run for this waypoint/route mission (soft-fail).
+            self._current_goal_pose = {'type': mission_type, 'waypoints': waypoints, 'total': len(waypoints)}
+            ctx = self._new_goal_context()
+            goal = NavigateThroughPoses.Goal()
+            goal.poses = poses
             if _HISTORY_OK:
-                try:
-                    _history_runs.begin_waypoint_run(
-                        waypoints=[{"x": float(wp.get("x", 0.0)),
-                                    "y": float(wp.get("y", 0.0)),
-                                    "yaw": float(wp.get("yaw", 0.0)),
-                                    "name": wp.get("name")} for wp in waypoints],
-                        start_pose=self._capture_current_pose(),
-                        map_id=(self._session.get("map_id")
-                                if isinstance(self._session, dict) else None),
-                        route_id=(self._session.get("route_id")
-                                  if isinstance(self._session, dict) else None),
-                        mission_type=mission_type,
-                    )
-                except Exception:
-                    pass
+                _history_runs.begin_waypoint_run(waypoints=waypoints, start_pose=self._capture_current_pose(),
+                    map_id=self._session.get('map_id'), route_id=self._session.get('route_id'), mission_type=mission_type)
+            try:
+                future = self._waypoint_action_client.send_goal_async(goal,
+                    feedback_callback=lambda msg: self._on_waypoint_feedback(msg, ctx))
+                future.add_done_callback(lambda done: self._on_goal_response(done, ctx))
+            except Exception as exc:
+                self._goal_uncertain(ctx, exc)
+                return False, 'Waypoint submission unconfirmed; verify navigation state before retrying'
             self._broadcast_state()
-            return True, f"Mission started: {len(waypoints)} waypoints"
+            return True, 'Waypoint mission submitted; awaiting Nav2 acceptance'
 
-    def _on_waypoint_feedback(self, feedback_msg) -> None:
+    def _on_waypoint_feedback(self, feedback_msg, ctx) -> None:
         """Handle waypoint navigation feedback."""
         try:
             fb = feedback_msg.feedback
             with self._lock:
+                if self._goal_context is not ctx or self._cancel_requested:
+                    return
+                ctx['feedback_received'] = True
+                self._current_state = self.STATE_ACTIVE
                 total = len(self._waypoint_poses)
                 remaining = int(getattr(fb, 'number_of_poses_remaining', total))
                 self._current_waypoint_index = max(0, min(total - 1, total - remaining))
@@ -850,83 +979,22 @@ class NavBridge:
             if self._logger:
                 self._logger.warn(f'Waypoint feedback error: {e}')
 
-    def _on_waypoint_goal_response(self, future) -> None:
-        """Handle waypoint goal response."""
-        try:
-            self._goal_handle = future.result()
-
-            if not self._goal_handle.accepted:
-                with self._lock:
-                    self._goal_pending = False
-                self._current_state = self.STATE_FAILED
-                self._broadcast_nav_result('FAILED', 'Waypoint goal rejected')
-                return
-
-            with self._lock:
-                if self._cancel_requested:
-                    self._goal_handle.cancel_goal_async().add_done_callback(
-                        self._on_cancel_response)
-                    self._cancel_requested = False
-                    return
-
-            result_future = self._goal_handle.get_result_async()
-            result_future.add_done_callback(self._on_waypoint_result_received)
-
-        except Exception as e:
-            if self._logger:
-                self._logger.error(f'Waypoint goal response error: {e}')
-            with self._lock:
-                self._goal_pending = False
-            self._current_state = self.STATE_FAILED
-            self._broadcast_nav_result('FAILED', str(e))
-
-    def _on_waypoint_result_received(self, future) -> None:
-        """Handle waypoint navigation result."""
-        try:
-            wrapped = future.result()
-            status = wrapped.status
-            error_code = getattr(wrapped.result, 'error_code', 0)
-            error_msg = getattr(wrapped.result, 'error_msg', '') or f'status={status}'
-
-            with self._lock:
-                if status == GoalStatus.STATUS_CANCELED:
-                    self._current_state = self.STATE_CANCELED
-                    self._broadcast_nav_result('CANCELED', 'Waypoint mission canceled')
-                elif status == GoalStatus.STATUS_SUCCEEDED and error_code == 0:
-                    self._current_state = self.STATE_SUCCEEDED
-                    self._logger.info(f'Waypoint mission succeeded') if self._logger else None
-                    self._broadcast_nav_result('SUCCEEDED',
-                        f"All {len(self._waypoint_poses)} waypoints reached")
-                else:
-                    self._current_state = self.STATE_FAILED
-                    self._logger.warn('Waypoint mission failed') if self._logger else None
-                    self._broadcast_nav_result('FAILED', error_msg)
-
-                self._goal_handle = None
-                self._goal_pending = False
-                self._feedback = None
-                self._waypoint_poses = []
-                self._current_waypoint_index = 0
-                self._mission_type = 'single'
-
-            self._broadcast_state()
-
-        except Exception as e:
-            if self._logger:
-                self._logger.error(f'Waypoint result error: {e}')
-            with self._lock:
-                self._current_state = self.STATE_FAILED
-                self._goal_pending = False
-            self._broadcast_nav_result('FAILED', str(e))
-            self._broadcast_state()
 
     # ============================================
     # Initial Pose (AMCL)
     # ============================================
 
-    def set_initial_pose(self, pose: Dict[str, float]) -> tuple:
-        """Set initial pose for AMCL localization."""
+    @_serialize_cancel_and_goal_submission
+    def set_initial_pose(self, pose: Dict[str, float], *, initializing=False) -> tuple:
+        """Publish a localization request; publication is not AMCL confirmation."""
         try:
+            pose = self.validate_pose(pose)
+            if not self.is_nav_running():
+                return False, 'No Nav2 session owned by this bridge'
+            if self._initial_pose_pending and not initializing:
+                return False, 'Wait for automatic HOME localization initialization'
+            if self._stopping or self.is_goal_active():
+                return False, 'Cannot reset localization while navigation is pending, active or unconfirmed'
             # B03 Fix: Publisher đã được tạo trong __init__, không cần lazy init
             if self._init_pose_pub is None:
                 return False, "Initial pose publisher not available"
@@ -949,14 +1017,7 @@ class NavBridge:
             msg.pose.pose.position.y = float(pose.get('y', 0.0))
             msg.pose.pose.position.z = 0.0
 
-            # Ensure yaw is a valid float
-            yaw_raw = pose.get('yaw', 0.0)
-            try:
-                yaw = float(yaw_raw)
-                if not (-3.14159 <= yaw <= 3.14159):
-                    yaw = 0.0  # Clamp invalid yaw
-            except (ValueError, TypeError):
-                yaw = 0.0
+            yaw = pose['yaw']
             q = self._yaw_to_quaternion(yaw)
             msg.pose.pose.orientation.x = q[0]
             msg.pose.pose.orientation.y = q[1]
@@ -975,7 +1036,7 @@ class NavBridge:
 
             self._init_pose_pub.publish(msg)
             self._logger.info(f'Initial pose set: ({pose.get("x", 0):.2f}, {pose.get("y", 0):.2f})') if self._logger else None
-            return True, "Initial pose set"
+            return True, "Initial pose published; verify localization on the map"
 
         except Exception as e:
             error_msg = f'Failed to set initial pose: {e}'
@@ -1023,8 +1084,16 @@ class NavBridge:
                 self._logger.warning(f'Không đọc được node HOME ({map_id}/{route_id}): {e}')
             return None
 
-    def _apply_home_initial_pose(self, proc, map_id: Optional[str], route_id: Optional[str],
-                                 timeout: float = 120.0) -> None:
+    def _apply_home_initial_pose(self, proc, map_id, route_id, timeout=120.0):
+        try:
+            self._initialize_home_pose(proc, map_id, route_id, timeout)
+        finally:
+            with self._lock:
+                if self._nav_process is proc:
+                    self._initial_pose_pending = False
+            self._broadcast_state()
+
+    def _initialize_home_pose(self, proc, map_id, route_id, timeout):
         """Chờ Nav2 sẵn sàng rồi publish /initialpose tại node HOME (chạy trong thread riêng)."""
         home = self._load_home_pose(map_id, route_id)
         if home is None:
@@ -1048,12 +1117,11 @@ class NavBridge:
                 self._logger.warning('Nav2 chưa sẵn sàng sau %.0fs: bỏ qua initial pose theo HOME' % timeout)
             return
 
-        time.sleep(1.0)  # để AMCL kịp nhận
         ok, msg = False, ''
         for _ in range(3):
             if not _still_current():
                 return
-            ok, msg = self.set_initial_pose(home)
+            ok, msg = self.set_initial_pose(home, initializing=True)
             if ok:
                 break
             time.sleep(1.0)
@@ -1080,25 +1148,68 @@ class NavBridge:
             feedback = self._feedback
             initial_distance = self._initial_distance
             op_mode = self._op_mode
+            self._state_sequence += 1
+            revision = self._state_sequence
+            active = self._active_observed_goals()
+            busy = self._goal_context is not None or bool(active)
+            owned = bool(process and process.poll() is None)
+            detected = self._nav_ready() or self._waypoint_ready()
+            reason = self._readiness_reason()
+            goal_id = self._last_goal_id
+            if self._goal_context is not None:
+                # A send response timeout never means the request was rejected.
+                if self._goal_pending and time.monotonic() - self._goal_context['created'] > 10.0:
+                    self._current_state = current_state = self.STATE_UNKNOWN
+            elif active:
+                current_state = (self.STATE_UNKNOWN if not detected else
+                    self.STATE_CANCELING if 3 in active.values() else
+                    self.STATE_ACTIVE if 2 in active.values() else self.STATE_ACCEPTED)
+                goal_id = next(iter(active))[1]
+            elif detected and not owned:
+                current_state = self.STATE_UNKNOWN
+            ctx = self._goal_context
+            last_result = dict(self._last_result) if self._last_result else None
+            task_message = (ctx or {}).get('message') or (
+                'Navigation outcome unknown; verify robot state and request cancellation before starting another task.'
+                if current_state == self.STATE_UNKNOWN else '')
+            elapsed_s = (max(0.0, time.monotonic() - ctx['created']) if ctx else
+                         None if active else self._last_elapsed_s)
+            state_source = 'web_action' if ctx else 'action_status' if active else 'bridge'
+            can_set_pose = (owned and not stopping and not busy and not self._initial_pose_pending
+                            and self._init_pose_pub is not None and self._init_pose_pub.get_subscription_count() > 0)
 
-        running = bool(process and process.poll() is None) and not stopping
-        nav_ready = bool(running and self._nav_ready())
+        running = owned or detected
+        nav_ready = bool(owned and reason is None and not stopping)
         state = {
             'type': 'nav_state',
+            'bridge_session_id': self._bridge_session_id,
+            'revision': revision,
             'state': current_state,
             'timestamp': time.time(),
             'nav2_running': running,
             'nav2_ready': nav_ready,
+            'process_owned': owned,
+            'nav2_detected': detected,
+            'stopping': stopping,
+            'goal_active': busy,
+            'goal_id': goal_id,
+            'last_result': last_result,
+            'can_send_goal': owned and nav_ready and not busy,
+            'can_set_initial_pose': can_set_pose,
+            'readiness_reason': reason,
+            'state_source': state_source,
+            'task_message': task_message,
+            'elapsed_s': elapsed_s,
             'map_id': None if stopping else session.get('map_id'),
             'route_id': None if stopping else session.get('route_id'),
             'op_mode': op_mode,
         }
 
-        if stopping or (not running and current_state not in (
-                self.STATE_SUCCEEDED, self.STATE_FAILED, self.STATE_CANCELED)):
-            state['state'] = self.STATE_IDLE
+        if not running and busy:
+            state['state'] = self.STATE_UNKNOWN
 
         if mission_type in ('waypoints', 'route') and waypoint_poses:
+            state['target_pose'] = current_goal_pose
             total = len(waypoint_poses)
             state['mission_type'] = mission_type
             state['waypoint_index'] = waypoint_index
@@ -1113,6 +1224,8 @@ class NavBridge:
                 state['distance_remaining'] = rem
                 state['estimated_time_remaining'] = feedback.get('time_remaining', 0)
                 state['progress'] = 0.0 if ini <= 0 else max(0.0, min(1.0, 1.0 - rem / ini))
+        if state['state'] == self.STATE_SUCCEEDED:
+            state['progress'] = 1.0
         return state
 
     # ============================================

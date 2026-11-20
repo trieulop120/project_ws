@@ -10,15 +10,37 @@ let reconnectTimer = null;
 const maxReconnectDelay = 30000;
 let commandRequestSeq = 0;
 const pendingCommandRequests = new Map();
+const settledCommandRequests = new Set();
+function rememberCommandRequest(requestId) {
+    settledCommandRequests.add(requestId);
+    if (settledCommandRequests.size > 256) settledCommandRequests.delete(settledCommandRequests.values().next().value);
+}
 
-function setWsConnected(c) {
+function setWsConnected(c, phase = c ? 'CONNECTED' : 'DISCONNECTED') {
+    window.navigationTransportState = phase;
+    window.missionTransportConnected = c;
+    if (!c) {
+        window.missionSnapshotReady = false;
+        window.missionDisplaySession = (window.missionDisplaySession || 0) + 1;
+        // Opening a new socket does not make cached ROS messages fresh again.
+        for (const key of ['currentMissionSupervisorStatus', 'currentPalletRetrievalStatus',
+                'currentCargoTelemetry', 'latestNavState', 'robotPose']) {
+            if (window[key]) window[key] = {...window[key], stale: true};
+        }
+        for (const [requestId, resolve] of pendingCommandRequests) {
+            rememberCommandRequest(requestId);
+            resolve({status: 'unknown', uncertain: true,
+                message: 'Command acknowledgement unavailable: connection lost. Verify robot state before retrying.'});
+        }
+        pendingCommandRequests.clear();
+    }
     if (typeof isWsConnected !== 'undefined') {
         isWsConnected = c;
     }
     const badge = document.getElementById('devWebsocket');
     const dot = document.querySelector('#devWebsocket')?.parentElement?.querySelector('.status-dot');
     if (badge) {
-        badge.textContent = c ? 'Connected' : 'Unconnected';
+        badge.textContent = c ? 'Connected' : phase === 'CONNECTING' ? 'Connecting' : 'Unconnected';
         badge.className = 'device-badge ' + (c ? 'online' : 'offline');
     }
     if (dot) {
@@ -27,6 +49,8 @@ function setWsConnected(c) {
     if (typeof updateMapDisplay === 'function') {
         updateMapDisplay();
     }
+    window.updateMissionCycle?.(window.currentMissionSupervisorStatus);
+    window.onNavTransportChange?.(c);
 }
 
 /**
@@ -75,12 +99,13 @@ function connect() {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
     }
-    setWsConnected(false);
+    setWsConnected(false, 'CONNECTING');
     try {
         const sock = new WebSocket(wsUrl);
         ws = sock;
 
         ws.onopen = () => {
+            if (ws !== sock) return;
             setWsConnected(true);
             reconnectDelay = 1000;
             if (typeof addActivity === 'function') addActivity('info', 'WebSocket connection established');
@@ -107,7 +132,7 @@ function connect() {
                 switch (d.type) {
                     case 'pose':
                         if (typeof updatePose === 'function') updatePose(d);
-                        if (typeof updateRobotStatus === 'function') updateRobotStatus(true);
+                        if (typeof updateRobotStatus === 'function') updateRobotStatus(!d.stale);
                         break;
 
                     case 'battery':
@@ -188,11 +213,35 @@ function connect() {
                             updateLiftStatus(d.lift);
                         }
                         // Pallet-mission cargo card (LOADED/EMPTY + US/lift detail)
+                        // Select the owner from the same snapshot before any
+                        // renderer writes the mission card or its clock.
+                        window.currentCargoTelemetry = window.stampMissionStatus(d.mission);
+                        window.acceptMissionSupervisorStatus(d.mission_supervisor);
+                        window.currentPalletRetrievalStatus = window.stampMissionStatus(d.pallet_retrieval);
+                        window.resolveRetrievalResume?.(window.currentPalletRetrievalStatus);
+                        window.missionSnapshotReady = true;
+                        // A new ROS snapshot resolves local start indicators,
+                        // including a run that fails before an active heartbeat.
+                        const supervisor = window.currentMissionSupervisorStatus;
+                        if (window.missionStatusFresh(supervisor) &&
+                                (window.missionActiveStates.supervisor.has(supervisor.state) ||
+                                 ['DONE', 'FAILED', 'STOPPED'].includes(supervisor.state))) {
+                            window.autoMissionStartPending = false;
+                        }
+                        const retrieval = window.currentPalletRetrievalStatus;
+                        if (window.missionStatusFresh(retrieval) &&
+                                (window.missionActiveStates.retrieval.has(retrieval.state) ||
+                                 ['DONE', 'FAILED', 'CANCELED', 'STOPPED'].includes(retrieval.state))) {
+                            window.retrievalStartPending = false;
+                        }
                         if (typeof window.updateCargo === 'function') {
                             window.updateCargo(d.mission);
                         }
+                        if (typeof window.updatePalletRetrievalStatus === 'function') {
+                            window.updatePalletRetrievalStatus(d.pallet_retrieval);
+                        }
                         if (typeof window.updateMissionCycle === 'function') {
-                            window.updateMissionCycle(d.mission_supervisor);
+                            window.updateMissionCycle(window.currentMissionSupervisorStatus);
                         }
                         break;
 
@@ -204,7 +253,6 @@ function connect() {
 
                     case 'nav_state':
                         // Broadcast nav_state to all clients for multi-client sync
-                        window.isNavigationActive = d.nav2_running === true;
                         if (typeof handleNavStateUpdate === 'function') {
                             handleNavStateUpdate(d);
                         }
@@ -229,7 +277,18 @@ function connect() {
                         if (d.request_id && pendingCommandRequests.has(d.request_id)) {
                             const resolve = pendingCommandRequests.get(d.request_id);
                             pendingCommandRequests.delete(d.request_id);
+                            rememberCommandRequest(d.request_id);
+                            d.handled_by_request = true;
                             resolve(d);
+                        } else if (d.request_id && settledCommandRequests.has(d.request_id)) {
+                            // A late/duplicate ACK may provide a newer snapshot,
+                            // but must not repeat the request's notification.
+                            if (d.mission_supervisor) {
+                                window.acceptMissionSupervisorStatus(d.mission_supervisor);
+                                window.updateMissionCycle?.(window.currentMissionSupervisorStatus);
+                            }
+                            if (d.nav_state) window.handleNavStateUpdate?.(d.nav_state);
+                            break;
                         }
                         if (typeof handleCommandResponse === 'function') {
                             handleCommandResponse(d);
@@ -257,6 +316,7 @@ function connect() {
         };
 
         ws.onclose = () => {
+            if (ws !== sock) return;
             setWsConnected(false);
             if (typeof updateRobotStatus === 'function') updateRobotStatus(false);
             if (typeof addActivity === 'function') addActivity('warn', 'WebSocket connection lost. Reconnecting...');
@@ -267,12 +327,14 @@ function connect() {
         };
 
         ws.onerror = err => {
+            if (ws !== sock) return;
+            setWsConnected(false);
             console.error('WS error:', err);
-            if (typeof addActivity === 'function') addActivity('error', 'WebSocket error occurred');
         };
     } catch (e) {
         if (typeof addActivity === 'function') addActivity('error', 'WebSocket connection failed');
-        setTimeout(connect, reconnectDelay);
+        reconnectTimer = setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 1.5, maxReconnectDelay);
     }
 }
 
@@ -295,7 +357,13 @@ function sendCommand(cmd) {
     }
 }
 
-function sendCommandAndWait(cmd, timeoutMs = 15000) {
+// Stop can include coordinator, Nav2 terminal, pallet and process shutdown
+// waits in sequence. These are acknowledgement deadlines, never success timers.
+const commandAckTimeouts = {
+    stop_navigation: 90000, nav_cancel: 20000, emergency_stop: 20000,
+    pallet_retrieval_cancel: 25000, mission_cycle_stop: 30000, mission_cycle_cancel: 30000, set_op_mode: 45000
+};
+function sendCommandAndWait(cmd, timeoutMs = commandAckTimeouts[cmd.command] || 15000) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
         return Promise.resolve({ status: 'error', message: 'WebSocket not connected' });
     }
@@ -303,7 +371,9 @@ function sendCommandAndWait(cmd, timeoutMs = 15000) {
     return new Promise((resolve) => {
         const timer = setTimeout(() => {
             pendingCommandRequests.delete(requestId);
-            resolve({ status: 'error', message: `${cmd.command} timed out` });
+            rememberCommandRequest(requestId);
+            resolve({status: 'unknown', uncertain: true,
+                message: `${cmd.command} timed out; outcome unknown. Verify robot state before retrying.`});
         }, timeoutMs);
         pendingCommandRequests.set(requestId, (response) => {
             clearTimeout(timer);

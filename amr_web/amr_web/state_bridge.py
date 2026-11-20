@@ -52,6 +52,7 @@ class StateBridge:
 
         # === Original State Storage ===
         self._pose: Optional[dict] = None
+        self._pose_received_at = 0.0
         self._battery: Optional[dict] = None
         self._map: Optional[dict] = None
         self._laser: Optional[dict] = None
@@ -170,6 +171,7 @@ class StateBridge:
     def update_pose(self, pose_data: dict) -> None:
         with self._lock:
             self._pose = pose_data
+            self._pose_received_at = time.monotonic()
 
     def update_battery(self, battery_data: dict) -> None:
         with self._lock:
@@ -185,7 +187,8 @@ class StateBridge:
 
     def get_latest_pose(self) -> Optional[dict]:
         with self._lock:
-            return self._pose
+            return ({**self._pose, 'stale': time.monotonic() - self._pose_received_at > 3.0}
+                    if self._pose is not None else None)
 
     def get_latest_battery(self) -> Optional[dict]:
         with self._lock:
@@ -237,7 +240,7 @@ class StateBridge:
         with self._lock:
             result = {}
             if self._pose:
-                result["pose"] = self._pose
+                result["pose"] = self.get_latest_pose()
             if self._battery:
                 result["battery"] = self._battery
             if self._map:

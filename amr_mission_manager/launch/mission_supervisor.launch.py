@@ -39,6 +39,8 @@ def generate_launch_description():
                               description='chay rack_tf_publisher'),
         DeclareLaunchArgument('with_pallet_mission', default_value='true',
                               description='chay luon mission_manager + pallet_mission'),
+        DeclareLaunchArgument('with_retrieval', default_value='true',
+                              description='chay operator-triggered Auto pallet retrieval coordinator'),
     ]
 
     supervisor = Node(
@@ -65,6 +67,14 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('gui')),
     )
 
+    retrieval = Node(
+        package='amr_mission_manager',
+        executable='pallet_retrieval',
+        name='pallet_retrieval',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('with_retrieval')),
+    )
+
     pallet_stack = GroupAction(
         scoped=True,
         condition=IfCondition(LaunchConfiguration('with_pallet_mission')),
@@ -84,4 +94,4 @@ def generate_launch_description():
         ],
     )
 
-    return LaunchDescription(args + [pallet_stack, supervisor, rack_tf, gui])
+    return LaunchDescription(args + [pallet_stack, supervisor, rack_tf, gui, retrieval])

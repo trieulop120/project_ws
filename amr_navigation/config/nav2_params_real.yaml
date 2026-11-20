@@ -154,8 +154,8 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.07     #dont change
-      yaw_goal_tolerance: 0.04    #dont change
+      xy_goal_tolerance: 0.1     #dont change
+      yaw_goal_tolerance: 0.08    #dont change
 
     PathHandler:
       plugin: "nav2_controller::FeasiblePathHandler"
@@ -306,6 +306,7 @@ local_costmap:
           clearing: True
           marking: True
           data_type: "LaserScan"
+          inf_is_valid: true
           raytrace_max_range: 11.5  #3.0
           raytrace_min_range: 0.0
           obstacle_max_range: 10.0    #2.5
@@ -344,12 +345,11 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 6.0    # TĂNG: 5.0 → 6.0
-        inflation_radius: 0.3       # TĂNG: 0.7 → 1.0
+        inflation_radius: 0.5       # TĂNG: 0.7 → 1.0
 
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
-      always_send_full_costmap: True
 
 global_costmap:
   global_costmap:
@@ -375,6 +375,7 @@ global_costmap:
           clearing: True
           marking: True
           data_type: "LaserScan"
+          inf_is_valid: true
           raytrace_max_range: 11.5  #3.0
           raytrace_min_range: 0.0
           obstacle_max_range: 10.0    #2.5

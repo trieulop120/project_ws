@@ -98,7 +98,7 @@ class RouteGraphLoader:
         Resolve logical name thanh actual node name.
 
         Args:
-            logical: HOME, P_1, P_2, D_1, PICK, DROP, hoac node name
+            logical: HOME, P_1, D_1, D_2, PICK, DROP, hoac node name
 
         Returns:
             Node name tu route_graph.yaml, hoac None
@@ -111,15 +111,15 @@ class RouteGraphLoader:
         if logical in self._node_order:
             return logical
 
-        # Specific pickup nodes
+        # Specific pickup node
         if upper in ('P_1', 'PICK1'):
             return 'P_1' if 'P_1' in self._node_order else None
-        if upper in ('P_2', 'PICK2'):
-            return 'P_2' if 'P_2' in self._node_order else None
 
-        # Specific dropoff node
+        # Specific dropoff nodes
         if upper in ('D_1', 'DROP1'):
             return 'D_1' if 'D_1' in self._node_order else None
+        if upper in ('D_2', 'DROP2'):
+            return 'D_2' if 'D_2' in self._node_order else None
 
         # Generic type match
         if upper in ('HOME', 'NODE_HOME'):
@@ -190,7 +190,7 @@ class RouteGraphLoader:
         """Ten cac node ke voi `node_name` qua edge trong graph.
 
         Dung de kiem tra mot node co "nhanh" nao dang hoat dong hay khong:
-        vi du P_2 chi duoc dung khi graph that co edge noi P_2 voi node
+        vi du D_2 chi duoc dung khi graph that co edge noi D_2 voi node
         khac (khong phai node bi bo troi trong YAML).
 
         Quy uoc edge trong YAML:

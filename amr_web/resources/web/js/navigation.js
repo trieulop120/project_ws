@@ -18,6 +18,7 @@
 
     // Operating Mode: MANUAL | AUTO - exported for state.js
     window.currentMissionSupervisorStatus = null;
+    window.currentPalletRetrievalStatus = null;
     window.latestNavState = null;
     let isMissionActive = false;
     let navStarting = false;
@@ -25,11 +26,17 @@
     let missionStartedAt = 0;
     let missionElapsedMs = 0;
     let missionElapsedTimer = null;
-    let autoStartPending = false;
-    let lastSupervisorNotice = '';
+    window.autoMissionStartPending = false;
     let pendingGoalName = '';
     let mapReqTimer = null;
     let lastManualTarget = '--';
+    let retrievalProgressStep = 0;
+    window.navigationRequests = {goal: false, cancel: false};
+    let routeRestoreKey = null;
+    let modalGeneration = 0;
+    let modalLoading = false;
+    const seenNavResults = new Set();
+    const navBusyStates = new Set(['SENDING', 'ACCEPTED', 'ACTIVE', 'CANCELING', 'UNKNOWN']);
 
     // Tool state (RVIZ-style: click to place, move to aim, click/Enter to confirm, ESC to cancel)
     let toolPending = null;      // 'pose' or 'goal' when aiming
@@ -39,6 +46,7 @@
     let toolPendingMouseX = 0;   // screen X when placed
     let toolPendingMouseY = 0;   // screen Y when placed
     let toolPositionSet = false; // true after first click sets position
+    let toolConfirmOnRelease = false;
     // Export for map.js preview
     window.toolPending = null;
     window.toolPendingX = 0;
@@ -60,12 +68,12 @@
         window.currentOpMode = confirmedOpMode;
         if (syncDesired) desiredOpMode = confirmedOpMode;
 
-        if (nextMode === 'AUTO') {
+        if (nextMode === 'AUTO' && previousMode !== 'AUTO') {
             stopManualTeleop();
-            autoStartPending = false;
+            window.autoMissionStartPending = false;
             stopMissionClock(true);
         } else if (previousMode === 'AUTO') {
-            autoStartPending = false;
+            window.autoMissionStartPending = false;
             isMissionActive = false;
             lastManualTarget = '--';
             stopMissionClock(true);
@@ -171,6 +179,11 @@
     }
 
     async function showNavSetupModal() {
+        if (modalLoading || navStarting || navStopping || window.isNavigationActive ||
+                !window.missionStatusFresh(window.latestNavState)) return;
+        modalLoading = true;
+        const generation = ++modalGeneration;
+        if (navSetupModal) navSetupModal.classList.add('active');
         window.selectedNavMap = null;
         window.selectedNavRoute = null;
         window.currentRoute = null;
@@ -194,6 +207,7 @@
         try {
             const mapRes = await fetch('/api/maps');
             const mapData = await mapRes.json();
+            if (generation !== modalGeneration) return;
 
             if (mapData.status === 'ok' && Array.isArray(mapData.maps)) {
                 availableMaps = mapData.maps;
@@ -215,18 +229,19 @@
                     try {
                         const routeRes = await fetch(`/api/routes?map_id=${encodeURIComponent(mapId)}`);
                         const routeData = await routeRes.json();
+                        if (generation !== modalGeneration) return;
 
                         if (routeData.status === 'ok' && Array.isArray(routeData.routes) && routeData.routes.length > 0) {
-                            const route = routeData.routes[0];
-                            const routeId = extractRouteId(route, mapId);
-
-                            mapToRouteMap[mapId] = { id: routeId, rawData: route };
-                            routeToMapMap[routeId] = mapId;
-
-                            const option = document.createElement('option');
-                            option.value = routeId;
-                            option.textContent = `${routeId} (${mapId})`;
-                            navRouteSelect.appendChild(option);
+                            for (const route of routeData.routes) {
+                                const routeId = extractRouteId(route, mapId);
+                                const key = JSON.stringify([mapId, routeId]);
+                                if (!mapToRouteMap[mapId]) mapToRouteMap[mapId] = {id: routeId, rawData: route};
+                                routeToMapMap[key] = {mapId, id: routeId, rawData: route};
+                                const option = document.createElement('option');
+                                option.value = key;
+                                option.textContent = `${routeId} (${mapId})`;
+                                navRouteSelect.appendChild(option);
+                            }
                         }
                     } catch (e) {
                         console.warn(`[Nav] Cannot fetch routes for map ${mapId}:`, e);
@@ -237,10 +252,12 @@
             console.error('[Nav] Failed to load maps or routes:', err);
         }
 
-        if (navSetupModal) navSetupModal.classList.add('active');
+        modalLoading = false;
     }
 
     function hideNavSetupModal() {
+        modalGeneration++;
+        modalLoading = false;
         if (navSetupModal) navSetupModal.classList.remove('active');
     }
 
@@ -266,7 +283,7 @@
 
         if (mapToRouteMap[selectedMapId]) {
             const routeInfo = mapToRouteMap[selectedMapId];
-            if (navRouteSelect) navRouteSelect.value = routeInfo.id;
+            if (navRouteSelect) navRouteSelect.value = JSON.stringify([selectedMapId, routeInfo.id]);
             window.selectedNavRoute = routeInfo.id;
             window.currentRoute = routeInfo.rawData;
 
@@ -300,7 +317,9 @@
         if (isBindingInProgress) return;
         isBindingInProgress = true;
 
-        const selectedRouteId = e.target.value;
+        const selectedRouteKey = e.target.value;
+        const linkedRoute = routeToMapMap[selectedRouteKey];
+        const selectedRouteId = linkedRoute?.id;
         const statusMsg = document.getElementById('navModalStatusMsg');
 
         if (!selectedRouteId) {
@@ -315,14 +334,13 @@
         }
 
         window.selectedNavRoute = selectedRouteId;
-        const linkedMapId = routeToMapMap[selectedRouteId];
+        const linkedMapId = linkedRoute?.mapId;
 
         if (linkedMapId) {
             if (navMapSelect) navMapSelect.value = linkedMapId;
             window.selectedNavMap = linkedMapId;
 
-            const routeInfo = mapToRouteMap[linkedMapId];
-            if (routeInfo) window.currentRoute = routeInfo.rawData;
+            window.currentRoute = linkedRoute.rawData;
 
             if (statusMsg) {
                 statusMsg.style.display = 'block';
@@ -351,7 +369,9 @@
             const json = await res.json();
             if (json.status === 'ok' && json.routes && json.routes.length > 0) {
                 // Tim route khớp với routeId tu backend
-                const route = json.routes.find(r => r.id === routeId) || json.routes[0];
+                if (window.selectedNavMap !== mapId || window.selectedNavRoute !== routeId) return;
+                const route = json.routes.find(r => r.id === routeId);
+                if (!route) return;
                 window.currentRoute = route;
                 window.selectedNavRoute = route.id;
                 console.log('[Nav] Route restored:', route.id);
@@ -361,6 +381,8 @@
             }
         } catch (e) {
             console.error('[Nav] Failed to restore route:', e);
+        } finally {
+            if (routeRestoreKey === key) routeRestoreKey = null;
         }
     }
 
@@ -369,6 +391,8 @@
     // ============================================
 
     function startNavigation() {
+        if (navStarting || navStopping || window.isNavigationActive ||
+                !window.missionStatusFresh(window.latestNavState)) return;
         if (window.isSlamActive) {
             if (typeof window.showToast === 'function') {
                 window.showToast('Please stop SLAM before running Navigation', 'warn');
@@ -396,33 +420,53 @@
 
         if (typeof updateOpModeDisplay === 'function') updateOpModeDisplay();
         if (typeof addActivity === 'function') {
-            addActivity('info', `Navigation started – Map: ${window.selectedNavMap}`);
+            addActivity('info', `Navigation startup requested – Map: ${window.selectedNavMap}`);
         }
 
         // Load PGM map for Navigation (Dual-Source: is_pgm_raw = true)
         loadNavMap();
 
-        if (typeof sendCommand === 'function') {
-            if (!sendCommand({ command: 'start_navigation', map_id: window.selectedNavMap, route_id: window.selectedNavRoute })) {
-                rollbackStart('WebSocket connection lost');
-            }
+        if (typeof window.sendCommandAndWait === 'function') {
+            window.sendCommandAndWait({command: 'start_navigation', map_id: window.selectedNavMap,
+                route_id: window.selectedNavRoute}).then(response => {
+                // Request-ID responses are consumed by the promise layer in
+                // ros_connection.js; the generic command dispatcher never
+                // sees them. Handle both success and failure here.
+                if (response.command === 'start_navigation') {
+                    window.onNavCommandResponse?.(response);
+                } else {
+                    navStarting = false;
+                    updateNavUI();
+                    if (!window.missionStatusFresh(window.latestNavState) || !window.isNavigationActive) {
+                        window.showToast?.('Navigation startup could not be confirmed', 'warn');
+                    }
+                }
+            }).catch(error => {
+                console.error('Navigation startup request failed:', error);
+                navStarting = false;
+                updateNavUI();
+                window.showToast?.('Navigation startup outcome unknown; verify robot state', 'error');
+            });
         } else {
-            rollbackStart('sendCommand not available');
+            rollbackStart('Command acknowledgement unavailable');
         }
     }
 
     // B11: Token để tránh race khi load map
     let navMapLoadSeq = 0;
     let navMapLoading = false;
+    let navMapLoadingId = null;
 
     async function loadNavMap() {
         // B11: Token để tránh race condition
+        const mapId = window.selectedNavMap;
+        if (!mapId || navStopping || (navMapLoading && navMapLoadingId === mapId)) return;
         const seq = ++navMapLoadSeq;
-        if (navMapLoading) return;
         navMapLoading = true;
+        navMapLoadingId = mapId;
 
         try {
-            const res = await fetch(`/api/map/image/${encodeURIComponent(window.selectedNavMap)}`);
+            const res = await fetch(`/api/map/image/${encodeURIComponent(mapId)}`);
             const json = await res.json();
 
             // B11: Kiểm tra token - bỏ qua nếu đã stop hoặc có map mới
@@ -432,7 +476,7 @@
             }
 
             // B11: Kiểm tra navPhase đã chuyển sang STOPPING/IDLE chưa
-            if (!window.isNavigationActive || !window.selectedNavMap) {
+            if ((!window.isNavigationActive && !navStarting) || window.selectedNavMap !== mapId) {
                 console.log('[Nav] Map load aborted - navigation stopped');
                 return;
             }
@@ -461,17 +505,22 @@
         } catch (e) {
             console.error('[Nav] Failed to load PGM map:', e);
         } finally {
-            navMapLoading = false;
+            if (seq === navMapLoadSeq) {
+                navMapLoading = false;
+                navMapLoadingId = null;
+            }
         }
     }
 
     function rollbackStart(msg) {
         navStarting = false;
-        window.isNavigationActive = false;
-        hideNavActiveUI();
+        window.isNavigationActive = window.latestNavState?.nav2_running === true &&
+            window.latestNavState?.process_owned !== false;
+        if (window.isNavigationActive) showNavActiveUI();
+        else hideNavActiveUI();
         updateNavUI();
         // Phase D 6.5: start that bai -> xoa lop
-        if (typeof window.clearNavLayers === 'function') window.clearNavLayers();
+        if (!window.isNavigationActive && typeof window.clearNavLayers === 'function') window.clearNavLayers();
         if (typeof window.showToast === 'function') {
             window.showToast(`Cannot start Navigation: ${msg}`, 'error');
         }
@@ -502,22 +551,27 @@
         navMapLoadSeq++;
         navMapLoading = false;
 
-        // Backend stop_navigation owns the Auto stop/reset transition.
+        // One STOP request owns *all* Auto/Retrieval/Goal cancellation.
+        // A preliminary nav_cancel from the browser would race with the ROS
+        // coordinators and can leave an unintentional Recovery behind.
         let cancelWarning = '';
-        if (currentOpMode === 'MANUAL' && isMissionActive && window.sendCommandAndWait) {
-            const cancelResponse = await window.sendCommandAndWait({ command: 'nav_cancel' });
-            if (cancelResponse.status !== 'canceled') {
-                cancelWarning = cancelResponse.message || 'goal cancel not confirmed';
-            }
-        }
+        const retrieval = window.currentPalletRetrievalStatus;
         const stopResponse = window.sendCommandAndWait
             ? await window.sendCommandAndWait({ command: 'stop_navigation' })
             : { status: 'error', message: 'Command acknowledgement unavailable' };
-        if (stopResponse.status !== 'stopped') {
+        // The stop ACK is only sufficient when the returned snapshot also
+        // confirms this Bridge no longer owns an active Nav2 process.
+        // Discovery may briefly see an old/external action server; that must
+        // not keep the *Web-owned* navigation session on the active page.
+        const confirmedStop = stopResponse.status === 'stopped' &&
+            stopResponse.nav_state?.process_owned === false &&
+            stopResponse.nav_state?.stopping !== true;
+        if (!confirmedStop) {
+            if (stopResponse.nav_state) window.handleNavStateUpdate(stopResponse.nav_state);
             navStopping = false;
             if (btnStopNav) btnStopNav.disabled = false;
             if (typeof window.showToast === 'function') {
-                window.showToast(stopResponse.message || 'Failed to stop Navigation', 'error');
+                window.showToast('Navigation stop not confirmed. Check robot status.', 'error');
             }
             if (typeof sendCommand === 'function') sendCommand({ command: 'get_nav_state' });
             return;
@@ -525,9 +579,13 @@
         // Stop acknowledgement includes the final IDLE nav_state broadcast;
         // accept future state updates again now that shutdown has completed.
         navStopping = false;
+        if (retrieval && !cancelWarning) {
+            window.clearPalletRetrievalMissionStatus?.(true);
+        }
         if (stopResponse.message && stopResponse.message.includes('WARNING:')) {
-            cancelWarning = [cancelWarning, stopResponse.message.split('WARNING:').slice(1).join('WARNING:').trim()]
-                .filter(Boolean).join('; ');
+            // Keep the technical reason in logs, not in the operator toast.
+            console.warn('[Nav] Stop cleanup needs attention:', stopResponse.message);
+            cancelWarning = 'mission cleanup was not fully confirmed';
         }
 
         // Clear tool
@@ -546,7 +604,7 @@
         window.selectedNavRoute = null;
         window.currentRoute = null;
         isMissionActive = false;
-        autoStartPending = false;
+        window.autoMissionStartPending = false;
         lastManualTarget = '--';
         stopMissionClock(true);
 
@@ -558,11 +616,8 @@
         }
         resetNavMapCard();
 
-        // Reset nav state
-        navState = { state: 'IDLE', progress: 0, nav2_running: false, nav2_ready: false,
-                     waypoint_index: 0, waypoint_total: 0, map_id: null, route_id: null,
-                     target_pose: null, distance_remaining: null, estimated_time_remaining: null };
-        window.latestNavState = navState;
+        if (stopResponse.nav_state) window.handleNavStateUpdate(stopResponse.nav_state);
+        else if (typeof sendCommand === 'function') sendCommand({command: 'get_nav_state'});
         const stoppedProgressBar = document.getElementById('navProgressBar');
         const stoppedProgressText = document.getElementById('navProgressText');
         if (stoppedProgressBar) stoppedProgressBar.style.width = '0%';
@@ -625,6 +680,34 @@
         // Vấn đề 4 Fix: Đã xóa logic cập nhật navStatusBadge ở đây
         // Logic cập nhật trạng thái badge được gom về hàm handleNavStateUpdate() duy nhất
         const isActive = window.isNavigationActive;
+        const fresh = window.missionStatusFresh(window.latestNavState);
+        const busy = navState.goal_active || navBusyStates.has(navState.state) ||
+            window.navigationRequests.goal || window.navigationRequests.cancel;
+        const reason = !fresh ? 'Connection or navigation state unavailable' :
+            busy ? 'Navigation is pending, active or unconfirmed' :
+            navState.nav2_running && navState.process_owned === false
+                ? 'Another or recently stopped Nav2 server is still detected; verify shutdown before restarting' :
+            navState.readiness_reason || (!navState.nav2_ready ? 'Waiting for Nav2 readiness' : '');
+        // A Welcome layout does not imply it is safe to launch a second Nav2.
+        // An unowned/discovered Nav2 stack or an unresolved goal still blocks Start.
+        if (btnStartNav) { btnStartNav.disabled = !fresh || isActive || navStarting || navStopping ||
+            navState.nav2_running || navState.goal_active || navState.state === 'UNKNOWN'; btnStartNav.title = reason; }
+        if (btnStopNav) { btnStopNav.disabled = !fresh || navStopping || navState.process_owned === false; btnStopNav.title = navState.process_owned === false ? 'This Bridge does not own the detected Nav2 process' : reason; }
+        if (btnModeAuto) btnModeAuto.disabled = !fresh || navStopping || busy;
+        if (btnModeManual) btnModeManual.disabled = !fresh || navStopping || (busy && currentOpMode === 'MANUAL');
+        const header = document.getElementById('navHeaderBadge');
+        if (header) {
+            header.textContent = !fresh ? 'State unavailable' : navState.stopping ? 'Nav2 stopping' :
+                navState.state === 'UNKNOWN' ? 'State unknown' :
+                !navState.nav2_running ? 'Nav2 stopped' : !navState.nav2_ready ? 'Nav2 not ready' :
+                busy ? 'Navigation active' : 'Nav2 ready';
+            header.title = reason;
+            header.classList.toggle('active', fresh && navState.nav2_ready);
+        }
+        document.querySelectorAll('[data-quick-goal]').forEach(button => {
+            button.disabled = !canSendManualGoal();
+            button.title = reason;
+        });
 
         // Mode buttons
         if (btnModeAuto) btnModeAuto.classList.toggle('active', currentOpMode === 'AUTO');
@@ -635,44 +718,76 @@
         btnModeManual?.classList.toggle('pending', pendingMode === 'MANUAL');
 
         // Tools: only in MANUAL mode when nav active
-        const toolsEnabled = isActive && currentOpMode === 'MANUAL' && !modeSwitchPromise;
+        const owner = window.getMissionOwner();
+        const missionBusy = owner.stale || (owner.active && owner.source !== 'navigation');
+        const toolsEnabled = isActive && fresh && !busy && currentOpMode === 'MANUAL' && !modeSwitchPromise && !missionBusy;
         if (toolSetPose) {
-            toolSetPose.disabled = !toolsEnabled;
-            toolSetPose.style.opacity = toolsEnabled ? '1' : '0.5';
+            toolSetPose.disabled = !toolsEnabled || navState.can_set_initial_pose === false;
+            toolSetPose.style.opacity = toolSetPose.disabled ? '0.5' : '1';
         }
         if (toolSetGoal) {
-            toolSetGoal.disabled = !toolsEnabled;
-            toolSetGoal.style.opacity = toolsEnabled ? '1' : '0.5';
+            toolSetGoal.disabled = !toolsEnabled || !navState.nav2_ready || navState.can_send_goal === false;
+            toolSetGoal.style.opacity = toolSetGoal.disabled ? '0.5' : '1';
         }
 
         updateMissionButtons();
     }
 
     function updateMissionButtons() {
+        const owner = window.getMissionOwner();
         const m = window.currentMissionSupervisorStatus;
         const state = m?.state || 'UNKNOWN';
         const active = ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
-            'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY'].includes(state);
-        const autoStarted = autoStartPending || active;
-        const operatorRecovery = state === 'RECOVERY' &&
-            String(m?.msg || '').includes('OPERATOR_CANCEL');
+            'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING'].includes(state) || m?.web_control_pending;
+        const autoStarted = window.autoMissionStartPending || active;
+        const retrieval = window.currentPalletRetrievalStatus;
+        const retrievalFresh = retrievalOwnsMissionCard();
+        const retrievalActive = window.retrievalStartPending ||
+            window.missionActiveStates.retrieval.has(retrieval?.state);
+        const retrievalTerminal = retrievalFresh &&
+            ['DONE', 'FAILED', 'CANCELED', 'STOPPED'].includes(retrieval?.state);
+        const autoPending = !!window.autoMissionRequest && !window.autoMissionRequest.uncertain;
         if (btnStartMission) {
-            btnStartMission.style.display = currentOpMode === 'AUTO' && !autoStarted ? 'block' : 'none';
+            btnStartMission.style.display = currentOpMode === 'AUTO' && !autoStarted &&
+                owner.source !== 'retrieval' && !retrievalActive && !(retrievalFresh && retrieval?.recovery_required) ? 'block' : 'none';
             btnStartMission.disabled = !m || m.stale || m.can_start !== true ||
-                !navState.nav2_ready || m.route_graph?.loaded !== true || autoStartPending ||
-                navState.state === 'ACTIVE' || m.nav_goal_active === true || !!modeSwitchPromise;
+                owner.active || owner.stale ||
+                !navState.nav2_ready || m.route_graph?.loaded !== true || window.autoMissionStartPending ||
+                (navState.goal_active || window.missionActiveStates.navigation.has(navState.state)) || m.nav_goal_active === true || !!modeSwitchPromise || !!window.autoMissionRequest;
         }
         if (btnCancelMission) {
-            btnCancelMission.style.display = currentOpMode === 'MANUAL' ||
-                (autoStarted && !operatorRecovery) ? 'block' : 'none';
-            btnCancelMission.disabled = false;
+            btnCancelMission.textContent = retrieval?.discard_pending ? 'DISCARDING...' :
+                retrieval?.state === 'RECOVERY' && !retrieval.resuming ? 'DISCARD RECOVERY' : retrievalActive ? 'CANCEL RETRIEVAL' :
+                (autoStarted || window.autoMissionRequest ? (state === 'RECOVERY' || m?.cancel_pending || m?.web_control_action === 'mission_cycle_cancel' || window.autoMissionRequest?.uncertain ? 'CANCEL AUTO MISSION' : 'CANCEL MISSION') :
+                    retrievalTerminal ? 'DISMISS RETRIEVAL' : 'CANCEL MISSION');
+            btnCancelMission.style.display = retrievalActive || owner.source === 'retrieval' || currentOpMode === 'MANUAL' ||
+                (owner.source === 'pallet' && owner.active) ||
+                autoStarted || !!window.autoMissionRequest ? 'block' : 'none';
+            btnCancelMission.disabled = navStopping || retrieval?.discard_pending === true || owner.stale ||
+                !window.missionStatusFresh(window.latestNavState) ||
+                !!window.navigationRequests?.cancel || (autoPending && ['mission_cycle_stop', 'mission_cycle_cancel'].includes(window.autoMissionRequest.command)) ||
+                (!owner.active && !window.autoMissionRequest && !window.navigationRequests?.goal && !owner.stale);
+            btnCancelMission.title = btnCancelMission.disabled ? 'No active task, cancellation pending, or connection unavailable' : 'Request cancellation and await confirmation';
         }
         if (btnRecoveryMission) {
-            btnRecoveryMission.style.display = state === 'RECOVERY' ? 'block' : 'none';
-            btnRecoveryMission.disabled = !m || m.stale || !navState.nav2_ready;
+            const paused = owner.source === 'pallet' ? !!owner.status?.recovery?.checkpoint : owner.status?.state === 'RECOVERY';
+            btnRecoveryMission.style.display = paused ? 'block' : 'none';
+            // Do not expose raw ROS reasons (possibly localized) as hover text.
+            btnRecoveryMission.title = 'Resume the saved mission when recovery is available';
+            btnRecoveryMission.disabled = !canResumeMission() || !navState.nav2_ready || autoPending;
+        }
+        const confirmEmpty = document.getElementById('btnConfirmForksEmpty');
+        if (confirmEmpty) {
+            const cargo = window.currentCargoTelemetry;
+            confirmEmpty.disabled = currentOpMode !== 'MANUAL' || active ||
+                !m || m.stale || m.odom_fresh !== true || m.robot_stopped !== true ||
+                retrievalActive || !cargo || cargo.stale ||
+                (navState.goal_active || window.missionActiveStates.navigation.has(navState.state)) || m.nav_goal_active === true || !!modeSwitchPromise;
         }
         const badge = document.getElementById('missionStateBadge');
-        if (badge) badge.style.display = currentOpMode === 'AUTO' ? 'inline-flex' : 'none';
+        const retrievalOwnsStatus = retrievalOwnsMissionCard();
+        if (badge) badge.style.display = currentOpMode === 'AUTO' || retrievalOwnsStatus ||
+            owner.source === 'pallet' || owner.stale ? 'inline-flex' : 'none';
     }
 
     function formatElapsed(ms) {
@@ -707,6 +822,12 @@
         updateMissionElapsed();
     }
 
+    // One owner for action, badge, progress and clock. A terminal retrieval
+    // heartbeat must yield to the next supervisor run, including after reload.
+    function retrievalOwnsMissionCard() {
+        return window.getMissionOwner().source === 'retrieval';
+    }
+
     function manualTargetCoordinates(state) {
         const target = state?.target_pose;
         let point = target;
@@ -714,6 +835,10 @@
             const index = Math.min(state.waypoint_index || 0, target.waypoints.length - 1);
             point = target.waypoints[index];
         }
+        // Named goals (Quick Goals: HOME, P_1, D_1, D_2) show the node name,
+        // matching the quick-goal style; unnamed map clicks fall back to
+        // coordinates.
+        if (point?.name) return point.name;
         if (Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.y))) {
             return `(${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)}) m`;
         }
@@ -776,8 +901,14 @@
         }
         applyConfirmedOpMode(nextMode, true);
     };
+    window.requestOperatingMode = setOpMode;
 
     function setActiveTool(tool) {
+        if (!tool) {
+            toolPending = null;
+            toolPositionSet = false;
+            window.toolPending = null;
+        }
         activeTool = tool;
         window.isCanvasToolActive = !!tool;
         toolSetPose?.classList.toggle('active', tool === 'pose');
@@ -787,6 +918,7 @@
     }
 
     function selectTool(tool) {
+        if (tool === 'pose' ? !canSetInitialPose() : !canSendManualGoal()) return;
         console.debug('[NAVTOOL] selectTool:', tool, 'toolPending:', toolPending);
         if (!window.isNavigationActive) {
             if (typeof window.showToast === 'function') window.showToast('Start Navigation first', 'warn');
@@ -890,70 +1022,208 @@
     // Mission Control
     // ============================================
 
-    async function handleStartMission() {
-        if (currentOpMode !== 'AUTO') return;
-        const m = window.currentMissionSupervisorStatus;
-        if (!m || m.stale || m.can_start !== true || !navState.nav2_ready ||
-            m.route_graph?.loaded !== true) {
-            if (typeof window.showToast === 'function') {
-                window.showToast('Nav2 and the selected route graph must be ready first', 'warn');
-            }
+    function autoRequestConfirmed(attempt, status) {
+        if (!window.missionStatusFresh(status)) return false;
+        if (attempt.command === 'mission_cycle_start') {
+            return status.run_id && status.run_id !== attempt.runId &&
+                window.missionActiveStates.supervisor.has(status.state);
+        }
+        if (status.run_id !== attempt.runId) return false;
+        if (attempt.command === 'mission_cycle_resume') return (status.resume_revision || 0) > attempt.resumeRevision;
+        if (attempt.command === 'mission_cycle_cancel') return status.state === 'IDLE' && !status.cancel_pending;
+        return status.state === 'RECOVERY' && status.stop_confirmed === true;
+    }
+
+    function finishAutoRequest(attempt) {
+        if (attempt.superseded) return false;
+        if (!autoRequestConfirmed(attempt, window.currentMissionSupervisorStatus)) return false;
+        if (!attempt.notified) {
+            attempt.notified = true;
+            const message = {mission_cycle_start: 'Mission started', mission_cycle_stop: 'Mission paused',
+                mission_cycle_resume: 'Mission resumed', mission_cycle_cancel: 'Mission canceled'}[attempt.command];
+            window.showToast?.(message, 'success');
+        }
+        if (window.autoMissionRequest === attempt) window.autoMissionRequest = null;
+        window.autoMissionStartPending = false;
+        return true;
+    }
+
+    async function requestAutoMission(command) {
+        const stopping = ['mission_cycle_stop', 'mission_cycle_cancel'].includes(command);
+        if (window.autoMissionRequest && !window.autoMissionRequest.uncertain && !stopping) return;
+        // Unknown Resume cannot be replayed; full cancellation remains available.
+        if (window.autoMissionRequest?.uncertain && command !== 'mission_cycle_cancel' && command !== 'mission_cycle_stop') return;
+        const previous = window.currentMissionSupervisorStatus || {};
+        if (window.autoMissionRequest) window.autoMissionRequest.superseded = true;
+        const attempt = {command, runId: previous.run_id, resumeRevision: previous.resume_revision || 0,
+            uncertain: false, notified: false};
+        window.autoMissionRequest = attempt;
+        window.autoMissionStartPending = command === 'mission_cycle_start';
+        updateNavUI();
+        let response;
+        try {
+            response = await window.sendCommandAndWait?.({command, run_mode: 'auto'});
+        } catch (error) {
+            console.error('Auto mission request failed:', command, error);
+            response = {status: 'unknown', uncertain: true};
+        }
+        if (response?.mission_supervisor) window.acceptMissionSupervisorStatus(response.mission_supervisor);
+        if (attempt.superseded) {
+            window.updateMissionCycle?.(window.currentMissionSupervisorStatus);
             return;
         }
-        autoStartPending = true;
-        updateMissionButtons();
-        const response = window.sendCommandAndWait
-            ? await window.sendCommandAndWait(
-                { command: 'mission_cycle_start', run_mode: 'auto' })
-            : { status: 'error', message: 'Command acknowledgement unavailable' };
-        if (!['started', 'ok'].includes(response.status)) {
-            autoStartPending = false;
-            updateMissionButtons();
-            const message = response.message || 'Could not start Auto cycle';
-            if (typeof window.showToast === 'function' &&
-                (message.toLowerCase().includes('timed out') ||
-                 message.toLowerCase().includes('timeout') ||
-                 message.includes('acknowledgement unavailable'))) {
-                window.showToast(message, 'error');
+        if (['ok', 'started'].includes(response?.status)) {
+            attempt.uncertain = !finishAutoRequest(attempt);
+        } else {
+            attempt.uncertain = response?.uncertain === true || response?.status === 'unknown';
+            const text = command === 'mission_cycle_resume' ? 'Resume unavailable; check the robot' :
+                command === 'mission_cycle_start' ? 'Cannot start mission; check readiness' : 'Stop not confirmed; check the robot';
+            if (!attempt.uncertain || !finishAutoRequest(attempt)) {
+                window.showToast?.(text, 'warn');
+                attempt.notified = true;
             }
-            if (typeof sendCommand === 'function') sendCommand({ command: 'get_nav_state' });
+            if (!attempt.uncertain && window.autoMissionRequest === attempt) window.autoMissionRequest = null;
+            window.autoMissionStartPending = false;
+        }
+        window.updateMissionCycle?.(window.currentMissionSupervisorStatus);
+        updateNavUI();
+    }
+
+    async function handleStartMission() {
+        if (currentOpMode !== 'AUTO' || window.autoMissionRequest) return;
+        const m = window.currentMissionSupervisorStatus;
+        const owner = window.getMissionOwner();
+        if (!window.missionStatusFresh(m) || !m.can_start || !navState.nav2_ready ||
+                owner.active || owner.stale || m.route_graph?.loaded !== true) return;
+        window.clearPalletRetrievalMissionStatus?.();
+        await requestAutoMission('mission_cycle_start');
+    }
+
+    async function handleCancelMission() {
+        if (window.navigationRequests.cancel || window.missionTransportConnected === false) return;
+        window.navigationRequests.cancel = true;
+        updateNavUI();
+        try { await cancelCurrentMission(); }
+        finally { window.navigationRequests.cancel = false; updateNavUI(); }
+    }
+
+    async function cancelCurrentMission() {
+        window.retrievalResumePending = null;
+        const retrieval = window.currentPalletRetrievalStatus;
+        const retrievalActive = window.retrievalStartPending || retrieval && [
+            'HOMING_LIFT', 'NAVIGATING_TO_D1', 'ALIGNING_TO_SLOT', 'LOADING_DETECTOR',
+            'DETECTING', 'PICKING', 'NAVIGATING_TO_D2', 'PLACING_AT_D2',
+            'RETURNING_HOME', 'CANCELING', 'RECOVERY'
+        ].includes(retrieval.state);
+        const retrievalTerminal = retrieval &&
+            ['DONE', 'FAILED', 'CANCELED', 'STOPPED'].includes(retrieval.state);
+        const supervisor = window.currentMissionSupervisorStatus;
+        const supervisorActive = ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
+            'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING'].includes(supervisor?.state) || supervisor?.web_control_pending;
+
+        if (retrievalTerminal && retrievalOwnsMissionCard() && !supervisorActive) {
+            window.clearPalletRetrievalMissionStatus?.();
+            updateMissionButtons();
+            return;
+        }
+        if (retrievalActive) {
+            const result = window.sendCommandAndWait
+                ? await window.sendCommandAndWait({ command: 'pallet_retrieval_cancel' })
+                : { status: 'error', message: 'Command acknowledgement unavailable' };
+            if (result.status === 'canceled') {
+                // This is only the STOP acknowledgement. The coordinator may
+                // still transition CANCELING -> RECOVERY. Its status must own
+                // the card until the authoritative terminal/Recovery update.
+                console.info('[Retrieval] Stop acknowledged; awaiting coordinator status');
+            } else {
+                console.error('[Retrieval] Stop not confirmed:', result.message || result.status);
+                window.showToast?.('Retrieval stop not confirmed. Check robot status.', 'error');
+            }
+            window.updateMissionCycle?.(window.currentMissionSupervisorStatus);
+            return;
+        }
+        if (currentOpMode === 'AUTO' && (supervisorActive || window.autoMissionRequest)) {
+            await requestAutoMission(supervisor?.state === 'RECOVERY' || supervisor?.cancel_pending || supervisor?.web_control_action === 'mission_cycle_cancel' || window.autoMissionRequest?.uncertain ? 'mission_cycle_cancel' : 'mission_cycle_stop');
+            return;
+        }
+        if (currentOpMode === 'AUTO') {
+            window.showToast?.('Mission state unavailable', 'warn');
+            return;
+        }
+        const response = await window.sendCommandAndWait?.({command: 'nav_cancel'});
+        if (!response || !['canceled', 'ok'].includes(response.status)) {
+            window.showToast?.(response?.message || 'Cancellation outcome unknown; verify robot state', 'error');
         }
     }
 
-    function handleCancelMission() {
-        if (typeof sendCommand === 'function') sendCommand({ command: 'nav_cancel' });
+    function canResumeMission() {
+        const owner = window.getMissionOwner();
+        const m = owner.status;
+        if (owner.stale || !window.missionStatusFresh(m)) return false;
+        if (owner.source === 'supervisor' && (window.autoMissionRequest || m.stop_confirmed === false || m.web_control_pending)) return false;
+        if (owner.source === 'supervisor' && window.latestNavState &&
+                (window.latestNavState.goal_active || window.missionActiveStates.navigation.has(window.latestNavState.state))) return false;
+        if (owner.source === 'retrieval' && (window.retrievalResumePending || m.resuming)) return false;
+        return owner.source === 'pallet' ? m.recovery?.available === true :
+            ['supervisor', 'retrieval'].includes(owner.source) && m.state === 'RECOVERY' && m.resume_available === true;
     }
 
     async function handleResumeMission() {
-        if (currentOpMode !== 'AUTO' && !(await setOpMode('AUTO'))) return;
-        autoStartPending = true;
-        updateMissionButtons();
-        const response = window.sendCommandAndWait
-            ? await window.sendCommandAndWait({ command: 'mission_cycle_resume' })
-            : { status: 'error', message: 'Command acknowledgement unavailable' };
-        if (!['ok', 'started'].includes(response.status)) {
-            autoStartPending = false;
+        if (window.autoMissionRequest && !window.autoMissionRequest.uncertain) return;
+        if (!canResumeMission()) {
+            window.showToast?.('Resume unavailable', 'warn');
+            return;
+        }
+        const owner = window.getMissionOwner();
+        if (owner.source === 'supervisor') {
+            await requestAutoMission('mission_cycle_resume');
+            return;
+        }
+        if (owner.source !== 'pallet' && currentOpMode !== 'AUTO' && !(await setOpMode('AUTO'))) return;
+        if (!canResumeMission()) return;
+        const attempt = owner.source === 'retrieval' ? {
+            runId: owner.status.run_id, revision: owner.status.resume_revision || 0, uncertain: false
+        } : null;
+        if (attempt) window.retrievalResumePending = attempt;
+        window.autoMissionStartPending = owner.source === 'supervisor';
+        let response, requestSent = false;
+        try {
             updateMissionButtons();
-            const message = response.message || 'Could not resume Auto cycle';
-            if (typeof window.showToast === 'function' &&
-                (message.toLowerCase().includes('timed out') ||
-                 message.toLowerCase().includes('timeout') ||
-                 message.includes('acknowledgement unavailable'))) {
-                window.showToast(message, 'error');
+            requestSent = typeof window.sendCommandAndWait === 'function';
+            response = requestSent ? await window.sendCommandAndWait({command: 'mission_cycle_resume'}) :
+                {status: 'error', message: 'Command acknowledgement unavailable'};
+        } catch (error) {
+            response = {status: 'error', message: error.message || 'Could not request Resume'};
+        } finally {
+            const accepted = ['ok', 'started'].includes(response?.status);
+            const uncertain = requestSent && /timed out|timeout|acknowledgement unavailable/i.test(response?.message || '');
+            if (attempt && window.retrievalResumePending === attempt) {
+                if (!accepted && !uncertain) window.retrievalResumePending = null;
+                else attempt.uncertain = uncertain;
+                window.resolveRetrievalResume?.(window.currentPalletRetrievalStatus);
             }
-            if (typeof sendCommand === 'function') sendCommand({ command: 'get_nav_state' });
+            if (!accepted) window.autoMissionStartPending = false;
+            // Render through the same owner snapshot; no raw RECOVERY payload
+            // can overwrite an in-flight Resume with a fake new-start display.
+            window.updateMissionCycle?.(window.currentMissionSupervisorStatus);
+        }
+        if (!['ok', 'started'].includes(response?.status)) {
+            if (!response?.command) window.showToast?.(response?.message || 'Resume unavailable', 'warn');
+            if (typeof sendCommand === 'function') sendCommand({command: 'get_nav_state'});
         }
     }
 
     window.handleMissionCycleCommandResponse = function (response) {
         if (response?.status === 'error' &&
             ['mission_cycle_start', 'mission_cycle_resume'].includes(response.command)) {
-            autoStartPending = false;
+            window.autoMissionStartPending = false;
             updateMissionButtons();
         }
     };
 
     function updateMissionStatus(action, target) {
+        const owner = window.getMissionOwner();
+        if (owner.stale || (owner.active && owner.source !== 'navigation')) return;
         const navActionText = document.getElementById('navActionText');
         const navTargetText = document.getElementById('navTargetText');
 
@@ -969,31 +1239,24 @@
         const navQuickMissions = document.getElementById('navQuickMissions');
         if (!navQuickMissions) return;
 
-        navQuickMissions.querySelectorAll('.btn-action').forEach(btn => {
+        navQuickMissions.querySelectorAll('[data-quick-goal]').forEach(btn => {
             btn.addEventListener('click', () => {
                 if (!window.isNavigationActive || currentOpMode !== 'MANUAL') {
                     if (typeof window.showToast === 'function') window.showToast('Start Navigation in MANUAL mode', 'warn');
                     return;
                 }
 
-                const action = btn.textContent.trim().toLowerCase();
-                let targetNode = null;
-
-                if (window.currentRoute && window.currentRoute.nodes) {
-                    if (action.includes('home')) {
-                        targetNode = window.currentRoute.nodes.find(n =>
-                            n.name.toUpperCase().includes('HOME'));
-                    } else if (action.includes('pick 1') || action.includes('pick1')) {
-                        targetNode = window.currentRoute.nodes.find(n =>
-                            n.name.toUpperCase().includes('P_1') || n.name.toUpperCase().includes('PICK1'));
-                    } else if (action.includes('pick 2') || action.includes('pick2')) {
-                        targetNode = window.currentRoute.nodes.find(n =>
-                            n.name.toUpperCase().includes('P_2') || n.name.toUpperCase().includes('PICK2'));
-                    } else if (action.includes('drop')) {
-                        targetNode = window.currentRoute.nodes.find(n =>
-                            n.name.toUpperCase().includes('D_1') || n.name.toUpperCase().includes('DROP'));
-                    }
-                }
+                const nodeAliases = {
+                    home: ['NODE_HOME', 'HOME'],
+                    p1: ['P_1', 'PICK1'],
+                    d1: ['D_1', 'DROP1'],
+                    d2: ['D_2', 'DROP2']
+                };
+                const aliases = nodeAliases[btn.dataset.quickGoal];
+                const nodes = window.currentRoute?.nodes;
+                const targetNode = aliases && Array.isArray(nodes)
+                    ? nodes.find(node => aliases.includes(String(node.name).toUpperCase()))
+                    : null;
 
                 if (targetNode) {
                     sendNavGoal({
@@ -1013,14 +1276,45 @@
     // Navigation Goal (Send to Backend)
     // ============================================
 
-    function sendNavGoal(pose) {
-        if (typeof sendCommand !== 'function') return;
+    function canSendManualGoal() {
+        const owner = window.getMissionOwner();
+        return window.missionStatusFresh(window.latestNavState) && window.isNavigationActive &&
+            currentOpMode === 'MANUAL' && navState.nav2_ready && navState.can_send_goal !== false &&
+            !navStopping && !modeSwitchPromise && !window.navigationRequests.goal &&
+            !window.navigationRequests.cancel && !navState.goal_active && !navBusyStates.has(navState.state) &&
+            !owner.active && !owner.stale;
+    }
+
+    function canSetInitialPose() {
+        const owner = window.getMissionOwner();
+        return window.missionStatusFresh(window.latestNavState) && window.isNavigationActive &&
+            currentOpMode === 'MANUAL' && navState.can_set_initial_pose !== false &&
+            !navStopping && !modeSwitchPromise && !window.navigationRequests.goal &&
+            !window.navigationRequests.cancel && !owner.active && !owner.stale;
+    }
+
+    async function sendNavGoal(pose) {
+        if (!canSendManualGoal()) return;
+        if (!['x', 'y', 'yaw'].every(key => typeof pose[key] === 'number' && Number.isFinite(pose[key]))) {
+            window.showToast?.('Goal requires finite x, y and yaw numbers', 'warn');
+            return;
+        }
+        window.navigationRequests.goal = true;
+        window.suppressTerminalPalletRetrievalStatus = true;
         pendingGoalName = pose.name || `(${pose.x.toFixed(1)}, ${pose.y.toFixed(1)})`;
-        lastManualTarget = manualTargetCoordinates({target_pose: pose}) || pendingGoalName;
-        startMissionClock();
-        sendCommand({ command: 'nav_goal', pose: pose });
-        updateMissionStatus('Navigating', lastManualTarget);
-        // Note: isMissionActive will be set by command response
+        updateNavUI();
+        try {
+            const response = await window.sendCommandAndWait?.({command: 'nav_goal', pose});
+            if (response?.nav_state) window.handleNavStateUpdate(response.nav_state);
+            if (!response || response.status !== 'sent') {
+                window.showToast?.(response?.message || 'Goal acknowledgement unavailable; verify robot state', 'error');
+            }
+            // A command response confirms submission only. The task, target,
+            // clock and result remain owned by nav_state and Nav2 callbacks.
+        } finally {
+            window.navigationRequests.goal = false;
+            updateNavUI();
+        }
     }
 
     // ============================================
@@ -1051,6 +1345,7 @@
         // keep receiving move/up even if the pointer leaves the viewport while aiming
         try { navViewport?.setPointerCapture(e.pointerId); } catch (_e) { /* not critical */ }
 
+        toolConfirmOnRelease = toolPositionSet;
         if (!toolPositionSet) {
             // First click: set position and start aiming
             toolPendingX = w.x;
@@ -1093,6 +1388,7 @@
         console.debug('[NAVTOOL] onPointerUp:', { toolPending, toolPositionSet });
         if (!toolPending || !toolPositionSet) return;
         if (!e.isPrimary) return;
+        if (!toolConfirmOnRelease) return;
 
         // Second click: confirm and send
         const tool = toolPending;
@@ -1120,7 +1416,7 @@
 
         // Send command
         if (tool === 'pose') {
-            if (typeof sendCommand === 'function') sendCommand({ command: 'set_initial_pose', pose });
+            if (canSetInitialPose() && typeof sendCommand === 'function') sendCommand({ command: 'set_initial_pose', pose });
         } else if (tool === 'goal') {
             sendNavGoal(pose);
         }
@@ -1174,7 +1470,16 @@
     // ============================================
 
     window.updateNavPosition = function () {
-        if (typeof window.robotPose === 'undefined' || !window.robotPose) return;
+        const valid = window.robotPose && !window.robotPose.stale &&
+            window.missionTransportConnected !== false &&
+            (!window.isNavigationActive || window.robotPose.frame_id === 'map');
+        if (!valid) {
+            for (const id of ['navPosX', 'navPosY', 'navPosYaw']) {
+                const el = document.getElementById(id);
+                if (el) { el.textContent = '--'; el.classList.add('muted'); }
+            }
+            return;
+        }
         const posX = document.getElementById('navPosX');
         const posY = document.getElementById('navPosY');
         const posYaw = document.getElementById('navPosYaw');
@@ -1197,23 +1502,32 @@
 
     const CARGO_CLASS_LABEL = {
         medium: 'MEDIUM',
-        tall: 'HIGH',
+        tall: 'TALL',
         unknown: '?'
     };
 
     window.updateCargo = function (m) {
+        window.currentCargoTelemetry = window.stampMissionStatus(m);
+        window.updateMissionCycle?.(window.currentMissionSupervisorStatus);
+        updateMissionButtons();
         const st = document.getElementById('navCargoStatus');
         const tx = document.getElementById('navCargoText');
         if (!st || !tx) return;
 
         const noMission = !m || m.state === undefined;
         if (noMission) {
-            st.className = 'cargo-status empty mt-2';
-            tx.textContent = 'NO MISSION';
+            st.className = 'cargo-status empty stale mt-2';
+            tx.textContent = 'CARGO UNKNOWN';
+            return;
+        }
+        if (m.stale) {
+            st.className = 'cargo-status empty stale mt-2';
+            tx.textContent = 'CARGO UNKNOWN · STATUS STALE';
             return;
         }
 
-        const us = (m.us_cm != null && isFinite(m.us_cm)) ? m.us_cm : null;
+        const us = (m.us_cm != null && Number.isFinite(Number(m.us_cm)))
+            ? Number(m.us_cm) : null;
         const pickActive = m.mode === 'pick' && m.cargo !== true &&
             (m.us_pick_confirmed ||
                 ['DETECTING', 'NAVIGATING', 'SETTLING', 'ALIGNING', 'INSERTING',
@@ -1326,7 +1640,15 @@
         if (state === 'RETURN_HOME') return `Returning to HOME${missionCount}`;
         return 'Waiting';
     }
-
+    function shortRecentMissionName(name) {
+        return String(name || 'Mission')
+            .replace(/^Retrieve pallet from /i, 'Retrieve ')
+            .replace(/^Align with rack slot /i, 'Align ')
+            .replace(/^Detect pallet at /i, 'Detect ')
+            .replace(/^Place pallet at /i, 'Place ')
+            .replace(/^Load pallet detector$/i, 'Load detector')
+            .replace(/^Return to HOME$/i, 'Return HOME');
+    }
     function renderRecentMissions(items) {
         const body = document.getElementById('navRecentMissions');
         const empty = document.getElementById('navMissionEmpty');
@@ -1338,11 +1660,12 @@
             const tr = document.createElement('tr');
             const cells = [
                 [item.time || '--', 'mission-time'],
-                [item.name || 'Mission', 'mission-name'],
+                [shortRecentMissionName(item.name), 'mission-name'],
                 [item.status || '--', `mission-outcome ${item.status === 'Completed' ? 'completed' :
                     item.status === 'Recovery Required' ? 'recovery' :
                         item.status === 'Resumed' ? 'resumed' :
-                            item.status === 'Canceled' ? 'canceled' : ''}`]
+                            item.status === 'Canceled' ? 'canceled' :
+                                item.status === 'Failed' ? 'failed' : ''}`]
             ];
             for (const [value, className] of cells) {
                 const td = document.createElement('td');
@@ -1355,7 +1678,9 @@
     }
 
     window.resetSessionUI = function () {
-        renderRecentMissions([]);
+        window.retrievalResumePending = null;
+        // Recent Missions is history, not current Nav2 session state.
+        // It is refreshed from the persistent Bridge snapshot on reconnect.
         if (typeof window.resetLLMSession === 'function') window.resetLLMSession();
     };
 
@@ -1363,33 +1688,38 @@
     // state and destination replace the manual goal name/coordinates.
     window.updateMissionCycle = function (m) {
         window.currentMissionSupervisorStatus = m || null;
-        const fresh = !!m && !m.stale;
+        if (typeof window.updateRackInventory === 'function') {
+            window.updateRackInventory(window.currentMissionSupervisorStatus);
+        }
+        const attempt = window.autoMissionRequest;
+        if (attempt?.uncertain) finishAutoRequest(attempt);
+        const owner = window.getMissionOwner();
+        const view = window.getMissionPresentation(owner);
+        m = owner.status;
+        const fresh = !owner.stale && window.missionStatusFresh(m);
         const state = fresh ? (m.state || 'UNKNOWN') : 'UNKNOWN';
         const badge = document.getElementById('missionStateBadge');
         const action = document.getElementById('navActionText');
         const target = document.getElementById('navTargetText');
-
-        if (fresh && state === 'RECOVERY' &&
-            !String(m?.msg || '').includes('OPERATOR_CANCEL')) {
-            const notice = `${m.resume_state || ''}|${m.msg || ''}`;
-            if (notice && notice !== lastSupervisorNotice) {
-                lastSupervisorNotice = notice;
-                if (typeof window.showToast === 'function') {
-                    window.showToast(m.msg || 'Mission needs recovery; inspect the robot, then Resume.', 'error');
-                }
-                if (typeof addActivity === 'function') addActivity('error', m.msg || 'Mission requires recovery');
-            }
-        } else if (state !== 'RECOVERY') {
-            lastSupervisorNotice = '';
+        const detail = document.getElementById('navTaskDetail');
+        if (detail) {
+            // AUTO / retrieval statuses use the compact action/target/progress/elapsed
+            // fields. Keep ROS diagnostic messages in logs, never in the mission card.
+            const message = currentOpMode === 'MANUAL' && owner.source === 'navigation' && !owner.stale
+                ? String(owner.status.task_message || '') : '';
+            detail.textContent = message;
+            detail.hidden = !message;
         }
 
-        if (currentOpMode === 'AUTO') {
+        const retrievalOwns = retrievalOwnsMissionCard();
+        const taskInfo = document.getElementById('navTaskInfo');
+        // AUTO Idle must retain the same four status fields as MANUAL.
+        if (taskInfo) taskInfo.hidden = false;
+        if (owner.source === 'supervisor') {
             if (badge) {
                 badge.style.display = 'inline-flex';
-                const operatorCanceled = state === 'RECOVERY' &&
-                    String(m?.msg || '').includes('OPERATOR_CANCEL');
                 badge.textContent = fresh
-                    ? (operatorCanceled ? 'Canceled' : missionStateLabel(state, m))
+                    ? view.label
                     : 'Unavailable';
                 badge.className = 'nav-status-badge' + (state === 'RECOVERY' ? ' warning' :
                     ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING', 'WAITING_SLOT', 'RETURN_HOME'].includes(state)
@@ -1399,64 +1729,165 @@
                 const recoveryAction = fresh && state === 'RECOVERY';
                 action.classList.toggle('mission-action-recovery', recoveryAction);
                 action.classList.toggle('accent', !recoveryAction);
-                action.textContent = fresh ? missionMessageEnglish(m) : 'Unavailable';
+                action.textContent = fresh ? view.label : 'Unavailable';
             }
-            const recoveryTarget = ['GOTO_D', 'DROPPING'].includes(m?.resume_state)
-                ? 'D_1' : (m?.active_dest || '--');
-            const missionTarget = state === 'RETURN_HOME' ? 'HOME' :
-                ['GOTO_D', 'DROPPING', 'WAITING_SLOT'].includes(state) ? 'D_1' :
-                    ['GOTO_PICK', 'PICKING'].includes(state) ? (m?.active_dest || '--') :
-                        state === 'RECOVERY' ? recoveryTarget : '--';
-            if (target) target.textContent = fresh ? missionTarget : '--';
-
+            if (target) target.textContent = state === 'IDLE' ? '--' : view.target;
+            if (fresh && Number.isFinite(m.elapsed_s)) {
+                missionElapsedMs = Math.max(0, m.elapsed_s * 1000);
+                missionStartedAt = !['IDLE', 'RECOVERY', 'STOPPING', 'DONE', 'FAILED', 'STOPPED'].includes(state)
+                    ? Date.now() - missionElapsedMs : 0;
+                updateMissionElapsed();
+            }
             if (['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
-                    'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY'].includes(state)) {
-                autoStartPending = false;
+                    'WAITING_SLOT', 'RETURN_HOME'].includes(state)) {
+                window.autoMissionStartPending = false;
+                startMissionClock();
+            } else if (['RECOVERY', 'STOPPING'].includes(state)) {
+                stopMissionClock(false);
+            } else if (state === 'IDLE') {
+                window.autoMissionStartPending = false;
+                stopMissionClock(true);
+            } else if (state === 'STARTING') {
                 startMissionClock();
             } else if (['DONE', 'FAILED', 'STOPPED'].includes(state)) {
-                autoStartPending = false;
+                window.autoMissionStartPending = false;
                 stopMissionClock(state === 'STOPPED' && currentOpMode === 'MANUAL');
+            } else {
+                stopMissionClock(false);
             }
             renderMissionProgress(m, fresh);
         } else {
-            if (badge) badge.style.display = 'none';
-            if (action) {
+            // While a retrieval mission is active, the retrieval
+            // renderer owns this card (and its badge) — do not hide the
+            // badge back and forth every tick.
+            if (owner.source === 'retrieval' && owner.stale) {
+                // Keep the retrieval card visible during brief stale telemetry;
+                // do not paint AUTO/Manual data over an unconfirmed recovery.
+                if (badge) {
+                    badge.style.display = 'inline-flex';
+                    badge.textContent = 'Unavailable';
+                    badge.className = 'nav-status-badge warning';
+                }
+            } else if (badge && !retrievalOwnsMissionCard()) badge.style.display = 'none';
+            if (action && owner.source !== 'retrieval') {
                 action.classList.remove('mission-action-recovery');
                 action.classList.add('accent');
             }
-            renderMissionProgress(m, false);
+            renderOtherMissionOwner(owner);
         }
 
-        renderRecentMissions(m?.recent_missions);
+        window.notifyMissionError(owner, view);
+        const recentHistory = window.currentMissionSupervisorStatus?.recent_missions;
+        if (Array.isArray(recentHistory)) renderRecentMissions(recentHistory);
         updateMissionButtons();
         if (typeof window.updateOverviewNavigationState === 'function') {
-            window.updateOverviewNavigationState(window.latestNavState, m);
+            window.updateOverviewNavigationState(window.latestNavState, window.currentMissionSupervisorStatus);
+        }
+        if (owner.source === 'retrieval') {
+            // Pending start has a synthetic owner before the coordinator's
+            // first heartbeat; render it without requiring a raw status yet.
+            window.renderPalletRetrievalMissionStatus(owner.status);
         }
     };
 
+    function renderOtherMissionOwner(owner) {
+        if (owner.source === 'retrieval') return;
+        const unavailable = owner.stale;
+        const state = owner.status.state;
+        const view = window.getMissionPresentation(owner);
+        const label = view.label;
+        const action = document.getElementById('navActionText');
+        const target = document.getElementById('navTargetText');
+        const badge = document.getElementById('missionStateBadge');
+        const progressLabel = document.getElementById('navProgressLabel');
+        const text = document.getElementById('navProgressText');
+        const bar = document.getElementById('navProgressBar');
+        if (action) action.textContent = label;
+        if (target) target.textContent = owner.source === 'navigation' && !unavailable
+            ? (manualTargetCoordinates(owner.status) || '--') : view.target;
+        if (badge) {
+            badge.style.display = 'inline-flex';
+            badge.textContent = owner.source === 'pallet' && !unavailable
+                ? ({pick: 'PICK', drop: 'DROP', retrieval_align: 'RETRIEVAL'}[owner.status.mode] || label)
+                : label;
+            badge.className = 'nav-status-badge' + (unavailable || state === 'FAILED'
+                ? ' warning' : owner.active ? ' active' : '');
+        }
+        const progress = window.getMissionProgress(owner);
+        if (progressLabel) progressLabel.textContent = progress?.label || 'Navigation progress';
+        const percent = unavailable || state === 'UNKNOWN' ? null : progress ? progress.percent : owner.status.nav2_running
+            ? (state === 'SUCCEEDED' ? 100 : Math.min(99, Math.max(0, Number(owner.status.progress) || 0) * 100)) : null;
+        if (text) text.textContent = progress ? progress.text : percent === null ? '--' : `${Math.floor(percent)}%`;
+        if (bar && !unavailable) bar.style.width = percent === null ? '0%' : `${percent}%`;
+        if (owner.active) startMissionClock();
+        else if (!unavailable) stopMissionClock(false);
+    }
+
     function renderMissionProgress(m, supervisorFresh) {
+        // While the retrieval card owns the mission status (see the
+        // single-owner rule), only it may write the progress bar/label.
+        if (retrievalOwnsMissionCard()) return;
         const bar = document.getElementById('navProgressBar');
         const text = document.getElementById('navProgressText');
         const label = document.getElementById('navProgressLabel');
-        const auto = currentOpMode === 'AUTO';
-        if (label) label.textContent = auto ? 'Mission progress' : 'Navigation progress';
-
-        let percent = null;
-        if (auto && supervisorFresh && Number.isFinite(m?.progress_percent)) {
-            const state = m.state;
-            const navFraction = navState.nav2_running
-                ? Math.max(0, Math.min(1, Number(navState.progress) || 0)) : null;
-            percent = m.progress_percent;
-            if (navFraction !== null && state === 'GOTO_PICK') percent = navFraction * 25;
-            else if (navFraction !== null && state === 'GOTO_D') percent = 50 + navFraction * 25;
-            else if (navFraction !== null && state === 'RETURN_HOME') percent = 90 + navFraction * 10;
-        } else if (!auto && navState.nav2_running) {
-            percent = Math.max(0, Math.min(1, Number(navState.progress) || 0)) * 100;
-        }
-
-        if (bar) bar.style.width = percent === null ? '0%' : `${Math.max(0, Math.min(100, percent))}%`;
-        if (text) text.textContent = percent === null ? '--' : `${Math.round(percent)}%`;
+        const progress = window.getMissionProgress();
+        if (label) label.textContent = progress?.label || 'Mission progress';
+        if (bar) bar.style.width = progress?.percent == null ? '0%' : `${progress.percent}%`;
+        if (text) text.textContent = progress?.text || '--';
     }
+
+    window.renderPalletRetrievalMissionStatus = function () {
+        const owner = window.getMissionOwner();
+        if (owner.source !== 'retrieval' || owner.stale) return;
+        const retrieval = owner.status;
+        const view = window.getMissionPresentation(owner);
+        const progress = window.getMissionProgress(owner);
+        const state = retrieval.state;
+        const paused = state === 'RECOVERY';
+        const action = document.getElementById('navActionText');
+        const target = document.getElementById('navTargetText');
+        const badge = document.getElementById('missionStateBadge');
+        const label = document.getElementById('navProgressLabel');
+        const text = document.getElementById('navProgressText');
+        const bar = document.getElementById('navProgressBar');
+        if (paused || ['FAILED', 'DONE', 'CANCELED', 'STOPPED'].includes(state)) stopMissionClock(false);
+        else startMissionClock();
+        if (action) {
+            action.classList.toggle('mission-action-recovery', paused && !view.resuming || !!retrieval.recovery_required && !view.resuming);
+            action.classList.toggle('accent', view.resuming || !retrieval.recovery_required && !paused);
+            action.textContent = view.label;
+            // Recovery diagnostics belong in logs, not the status card tooltip.
+            action.title = '';
+        }
+        if (target) target.textContent = view.target;
+        if (badge) {
+            badge.style.display = 'inline-flex';
+            badge.textContent = view.resuming ? 'RESUMING' : paused ? 'RECOVERY' :
+                retrieval.recovery_required ? 'RECOVERY REQUIRED' : state === 'FAILED' ? 'RETRIEVAL FAILED' :
+                state === 'DONE' ? 'COMPLETE' : ['CANCELED', 'STOPPED'].includes(state) ? state : 'PALLET RETRIEVAL';
+            badge.className = 'nav-status-badge' + (view.resuming ? ' active' :
+                state === 'FAILED' || paused || retrieval.recovery_required ? ' warning' :
+                ['DONE', 'CANCELED', 'STOPPED'].includes(state) ? '' : ' active');
+        }
+        if (label) label.textContent = progress.label;
+        if (text) text.textContent = progress.text;
+        if (bar) bar.style.width = Number.isFinite(progress.percent) ? `${progress.percent}%` : '0%';
+        window.notifyMissionError(owner, view);
+    };
+
+    window.clearPalletRetrievalMissionStatus = function (resetNavigation = false) {
+        window.retrievalResumePending = null;
+        window.suppressTerminalPalletRetrievalStatus = true;
+        window.currentPalletRetrievalStatus = null;
+        retrievalProgressStep = 0;
+        if (resetNavigation) {
+            isMissionActive = false;
+            lastManualTarget = '--';
+            updateMissionButtons();
+        }
+        stopMissionClock(false);
+        window.updateMissionCycle(window.currentMissionSupervisorStatus);
+    };
 
     // ============================================
     // Camera Feed Handler
@@ -1493,6 +1924,8 @@
     // ============================================
 
     window.handleNavStateUpdate = function (data) {
+        if (data.bridge_session_id && navState.bridge_session_id === data.bridge_session_id &&
+                Number.isFinite(data.revision) && data.revision <= navState.revision) return;
         if (data.op_mode !== undefined) {
             const nextMode = data.op_mode === 'AUTO' ? 'AUTO' : 'MANUAL';
             if (modeSwitchPromise) {
@@ -1501,13 +1934,17 @@
                 applyConfirmedOpMode(nextMode, true);
             }
         }
-        // B21 Fix: Không xử lý nav_state khi đang dừng
-        if (navStopping) return;
 
         const wasRunning = navState ? navState.nav2_running : false;
+        const wasSessionActive = window.isNavigationActive;
         const nowRunning = data.nav2_running === true;
+        // Nav2 DDS discovery is not proof that this Web Bridge still owns a
+        // running session. After Stop, an action server can remain discoverable
+        // briefly; show Welcome, but keep Start blocked until it disappears.
+        const sessionActive = nowRunning && data.process_owned !== false;
 
         navState = {
+            ...data,
             state: data.state || 'IDLE',
             progress: data.progress || 0,
             nav2_running: nowRunning,
@@ -1521,23 +1958,46 @@
             estimated_time_remaining: data.estimated_time_remaining ?? null,
             mission_type: data.mission_type || null,
         };
+        navState.received_at = Date.now();
         window.latestNavState = navState;
+        if (currentOpMode === 'MANUAL' && Number.isFinite(data.elapsed_s)) {
+            missionElapsedMs = Math.max(0, data.elapsed_s * 1000);
+            missionStartedAt = data.goal_active ? Date.now() - missionElapsedMs : 0;
+        }
 
         // Phase D 6.5: Nav2 chet/Stop tu client khac -> xoa lop
-        if (wasRunning && !nowRunning && typeof window.clearNavLayers === 'function') {
+        if ((wasSessionActive && !sessionActive || wasRunning && !nowRunning) &&
+                typeof window.clearNavLayers === 'function') {
             window.clearNavLayers();
         }
-        if (wasRunning && !nowRunning && typeof window.resetSessionUI === 'function') {
+        if ((wasSessionActive && !sessionActive || wasRunning && !nowRunning) &&
+                typeof window.resetSessionUI === 'function') {
             window.resetSessionUI();
         }
 
-        // Fix: Luôn cập nhật selectedNavMap từ backend khi có map_id
+        window.isNavigationActive = sessionActive;
+        if (sessionActive) navStarting = false;
+        // Apply the session visibility change on direct command snapshots too,
+        // not only on WebSocket broadcasts from ros_connection.js.
+        if (wasSessionActive !== sessionActive) {
+            if (sessionActive) showNavActiveUI();
+            else hideNavActiveUI();
+        }
+        isMissionActive = data.goal_active === true || navBusyStates.has(navState.state);
+        if (isMissionActive || !nowRunning) setActiveTool(null);
+        if (navState.map_id && navState.map_id !== window.selectedNavMap) {
+            window.currentRoute = null;
+            window.mapData = null;
+            ++navMapLoadSeq;
+            navMapLoading = false;
+        }
+        if (navState.route_id !== window.selectedNavRoute) window.currentRoute = null;
         if (navState.map_id) {
             window.selectedNavMap = navState.map_id;
             window.selectedNavRoute = navState.route_id;
 
             // Khi F5/reload: load PGM map neu chua co
-            if (navState.nav2_running && (!window.mapData || !window.mapData.is_pgm_raw)) {
+            if (navState.nav2_running && !navStopping && (!window.mapData || !window.mapData.is_pgm_raw)) {
                 loadNavMap();
             }
 
@@ -1552,25 +2012,11 @@
             }
         }
 
-        if (navState.nav2_running) {
-            window.isNavigationActive = true;
-        }
+        // Do not reactivate the Navigation layout solely because DDS still
+        // discovers an action server after the owned process has exited.
 
         // B21 Fix: Gọi updateNavUI vô điều kiện để sync nút AUTO/MANUAL
         updateNavUI();
-
-        // Update status badge (header nav badge CHI - khong dong vao
-        // #missionStateBadge cua card Mission Status)
-        const navStatusBadge = document.getElementById('navHeaderBadge');
-        if (navStatusBadge) {
-            if (navState.nav2_running) {
-                navStatusBadge.textContent = navState.state === 'ACTIVE' ? 'Navigation Active' : 'Nav2 Ready';
-                navStatusBadge.classList.add('active');
-            } else {
-                navStatusBadge.textContent = 'Nav2 Stopped';
-                navStatusBadge.classList.remove('active');
-            }
-        }
 
         // Update mission status display
         const navActionText = document.getElementById('navActionText');
@@ -1578,7 +2024,14 @@
         const navProgressBar = document.getElementById('navProgressBar');
         const navProgressText = document.getElementById('navProgressText');
 
-        if (navActionText) {
+        // Single-owner rule: while a retrieval mission is active, the
+        // retrieval renderer is the only writer of the visible mission card.
+        // The raw Nav2 values below (incl. per-leg "Goal reached!") would
+        // otherwise paint over it every tick — the flicker. Bookkeeping still
+        // runs; only the visible writes are gated.
+        const retrievalOwns = window.getMissionOwner().source !== 'navigation';
+
+        if (navActionText && !retrievalOwns) {
             switch (navState.state) {
                 case 'IDLE':
                     if (!isMissionActive && currentOpMode === 'MANUAL') navActionText.textContent = 'Idle';
@@ -1587,6 +2040,12 @@
                         if (currentOpMode === 'MANUAL') stopMissionClock(false);
                         updateMissionButtons();
                     }
+                    break;
+                case 'SENDING':
+                case 'ACCEPTED':
+                case 'CANCELING':
+                case 'UNKNOWN':
+                    navActionText.textContent = window.missionStateLabels[navState.state];
                     break;
                 case 'ACTIVE':
                     navActionText.textContent = navState.waypoint_total > 0
@@ -1615,24 +2074,42 @@
 
         const targetCoordinates = manualTargetCoordinates(navState);
         if (targetCoordinates) lastManualTarget = targetCoordinates;
-        if (currentOpMode === 'MANUAL' && navTargetText) navTargetText.textContent = lastManualTarget;
+        if (currentOpMode === 'MANUAL' && !retrievalOwns && navTargetText) navTargetText.textContent = lastManualTarget;
 
-        if (navProgressBar) navProgressBar.style.width = navState.nav2_running
+        if (navProgressBar && !retrievalOwns) navProgressBar.style.width = navState.nav2_running
             ? `${navState.progress * 100}%` : '0%';
-        if (navProgressText) navProgressText.textContent = navState.nav2_running
+        if (navProgressText && !retrievalOwns) navProgressText.textContent = navState.nav2_running
             ? `${Math.round(navState.progress * 100)}%` : '--';
 
         if (typeof window.updateOverviewNavigationState === 'function') {
             window.updateOverviewNavigationState(navState, window.currentMissionSupervisorStatus);
         }
-        if (window.currentMissionSupervisorStatus) {
-            window.updateMissionCycle(window.currentMissionSupervisorStatus);
+        window.updateMissionCycle(window.currentMissionSupervisorStatus);
+        if (window.currentPalletRetrievalStatus) {
+            window.renderPalletRetrievalMissionStatus(window.currentPalletRetrievalStatus);
         }
         updateMissionButtons();
         if (typeof window.updateNavPosition === 'function') window.updateNavPosition();
     };
 
     window.handleNavResult = function (data) {
+        // The full session STOP owns goal cancellation and the final notice.
+        if (navStopping) return;
+        if (data.bridge_session_id && navState.bridge_session_id && data.bridge_session_id !== navState.bridge_session_id) return;
+        const key = JSON.stringify([data.goal_id, data.state, data.goal_id ? '' : data.timestamp]);
+        if (seenNavResults.has(key)) return;
+        seenNavResults.add(key);
+        if (seenNavResults.size > 128) seenNavResults.delete(seenNavResults.values().next().value);
+        if (data.goal_id && navState.goal_id && data.goal_id !== navState.goal_id) return;
+        // A Nav2 leg canceled by AUTO/retrieval is not a user-facing mission
+        // result. Only its owning coordinator announces pause/recovery/finish.
+        const owner = window.getMissionOwner();
+        if (owner.source !== 'navigation' || window.retrievalStartPending ||
+                (currentOpMode === 'AUTO' && (window.currentPalletRetrievalStatus &&
+                 window.missionActiveStates.retrieval.has(window.currentPalletRetrievalStatus.state))) ||
+                (currentOpMode === 'AUTO' && window.currentMissionSupervisorStatus &&
+                 (window.missionActiveStates.supervisor.has(window.currentMissionSupervisorStatus.state) ||
+                  window.currentMissionSupervisorStatus.run_id))) return;
         console.log('[Nav] Navigation result:', data);
 
         if (data.state === 'SUCCEEDED') {
@@ -1646,7 +2123,6 @@
             if (typeof addActivity === 'function') addActivity('info', 'Mission canceled');
         }
 
-        isMissionActive = false;
         updateMissionButtons();
     };
 
@@ -1657,37 +2133,15 @@
             case 'start_navigation':
                 navStarting = false;
                 if (!ok) { rollbackStart(d.message || d.status); break; }
-                window.isNavigationActive = true;
+                if (d.nav_state) window.handleNavStateUpdate(d.nav_state);
                 updateOpModeDisplay?.();
                 updateNavUI();
                 startMapRequestLoop();
-                addActivity?.('info', `Navigation started – Map: ${window.selectedNavMap}`);
                 break;
 
             case 'nav_goal':
             case 'waypoint_mission':
-                if (ok) {
-                    isMissionActive = true;
-                    startMissionClock();
-                    const sentTarget = manualTargetCoordinates({target_pose: {
-                        ...d.pose,
-                        waypoints: d.waypoints
-                    }});
-                    if (sentTarget) lastManualTarget = sentTarget;
-                    updateMissionButtons();
-                    updateMissionStatus('Navigating', lastManualTarget || pendingGoalName || '--');
-                    if (typeof window.showToast === 'function') {
-                        window.showToast(`Goal sent: ${pendingGoalName || 'Position'}`, 'success');
-                    }
-                } else {
-                    isMissionActive = false;
-                    stopMissionClock(true);
-                    updateMissionButtons();
-                    updateMissionStatus('Failed', '--');
-                    if (typeof window.showToast === 'function') {
-                        window.showToast(d.message || 'Goal rejected', 'error');
-                    }
-                }
+                if (!ok && !d.handled_by_request) window.showToast?.(d.message || 'Goal submission failed', 'error');
                 break;
 
             case 'set_initial_pose':
@@ -1699,13 +2153,13 @@
 
             case 'nav_cancel':
             case 'emergency_stop':
-                if (!ok && !navStopping && typeof window.showToast === 'function') {
+                if (!ok && !d.handled_by_request && !navStopping && typeof window.showToast === 'function') {
                     window.showToast(d.message || 'Cancel failed', 'error');
                 }
                 break;
 
             case 'stop_navigation':
-                if (!ok && !navStopping && typeof window.showToast === 'function') {
+                if (!ok && !d.handled_by_request && !navStopping && typeof window.showToast === 'function') {
                     window.showToast(d.message || 'Failed to stop Navigation', 'error');
                 }
                 break;
@@ -1751,13 +2205,21 @@
         console.log('[Nav] Camera mode:', mode);
     }
 
+    window.setNavigationCameraMode = setCameraMode;
+
     // ============================================
     // Event Listeners Initialization
     // ============================================
 
     function initEventListeners() {
         if (!missionElapsedTimer) {
-            missionElapsedTimer = window.setInterval(updateMissionElapsed, 1000);
+            missionElapsedTimer = window.setInterval(() => {
+                updateMissionElapsed();
+                // Age cached statuses even when the WebSocket stops updating.
+                updateNavUI();
+                window.updateNavPosition();
+                window.updateMissionCycle(window.currentMissionSupervisorStatus);
+            }, 1000);
         }
         updateMissionElapsed();
         // Modal
@@ -1797,6 +2259,14 @@
         btnCancelMission?.addEventListener('click', handleCancelMission);
 
         btnRecoveryMission?.addEventListener('click', handleResumeMission);
+        document.getElementById('btnConfirmForksEmpty')?.addEventListener('click', async () => {
+            // Single-click confirmation; no popup or success toast.
+            const response = await window.sendCommandAndWait?.({command: 'confirm_forks_empty', confirmed_empty: true});
+            if (response?.status !== 'ok') {
+                window.showToast?.('Fork confirmation unavailable. Check robot status.', 'error');
+            }
+        });
+
 
         // Tool buttons
         toolSetPose?.addEventListener('click', () => selectTool('pose'));
@@ -1820,6 +2290,9 @@
             if (e.key === 'Escape') {
                 cancelToolPending();
             } else if (e.key === 'Enter' && toolPositionSet) {
+                const target = e.target;
+                if (e.repeat || target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable)) return;
+                e.preventDefault();
                 const tool = toolPending;
                 const pose = { x: toolPendingX, y: toolPendingY, yaw: toolPendingYaw };
                 // Reset state
@@ -1837,7 +2310,7 @@
                 setActiveTool(null);
                 // Send
                 if (tool === 'pose') {
-                    if (typeof sendCommand === 'function') sendCommand({ command: 'set_initial_pose', pose });
+                    if (canSetInitialPose() && typeof sendCommand === 'function') sendCommand({ command: 'set_initial_pose', pose });
                 } else if (tool === 'goal') {
                     sendNavGoal(pose);
                 }
@@ -1874,6 +2347,8 @@
     let manualVel = { linear: 0, angular: 0 };
 
     function manualDriveAllowed() {
+        const owner = window.getMissionOwner();
+        if (owner.active || owner.stale) return false;
         if (!window.isNavigationActive || currentOpMode !== 'MANUAL' || isMissionActive) return false;
         if (!navViewport || navViewport.getClientRects().length === 0) return false;  // trang Nav đang ẩn
         if (navSetupModal?.classList.contains('active')) return false;
@@ -1942,6 +2417,12 @@
     }
 
     window.showNavSetupModal = showNavSetupModal;
+    window.updateNavUI = updateNavUI;
+    window.onNavTransportChange = function (connected) {
+        if (!connected) { navStarting = false; setActiveTool(null); stopManualTeleop(); }
+        updateNavUI();
+        window.updateNavPosition();
+    };
 
     // Page navigation hook
     window.onNavigateToNav = function () {

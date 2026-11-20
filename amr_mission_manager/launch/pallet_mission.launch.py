@@ -43,7 +43,7 @@ def generate_launch_description():
              'khoang cach tu base_footprint toi diem dem (m). '
              '= 0.40 + khoang cach tu truc banh toi mui cang'),
         _arg('insert_speed', '0.10', 'van toc tien vao pallet (m/s)'),
-        _arg('stop_dist_cm', '3.5', 'nguong sieu am de dung (cm)'),
+        _arg('stop_dist_cm', '4.5', 'pick: nguong sieu am de dung (cm)'),
         _arg('confirm_count', '10', 'so mau sieu am lien tiep duoi nguong'),
         _arg('auto_insert', 'true', 'true: toi diem dem xong tu canh goc + tien vao'),
         _arg('require_stable', 'true', 'true: Detect OFF chi nhan ket qua on dinh'),
@@ -54,7 +54,7 @@ def generate_launch_description():
         _arg('range_topic', '/ultrasonic/range', 'topic sieu am (sensor_msgs/Range)'),
         _arg('detector_executable', 'pallet_detector_ov',
              'executable detector: pallet_detector_ov (OpenVINO) | pallet_detector (best.pt)'),
-        _arg('detector_prewarm', 'true',
+        _arg('detector_prewarm', 'false',
              'preload the detector model at startup and keep inference paused while idle'),
         _arg('after_pick', 'hold',
              "hold: pick xong lui ra roi DUNG giu pallet (CARRYING) | home: ve Home + ha lift "
