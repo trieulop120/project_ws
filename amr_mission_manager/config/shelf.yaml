@@ -114,7 +114,7 @@ slots:
 # So do nguoi dung da chot. Lift tinh bang cm (nhu pallet_mission).
 # ============================================================================
 insert:
-  stop_dist_cm: 3.0           # sieu am: dung khi con 3 cm
+  stop_dist_cm: 3.0           # DROP/retrieval: dung khi con 3 cm
 
 levels:
   1:                          # tang 1

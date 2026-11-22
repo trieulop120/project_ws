@@ -784,9 +784,27 @@ class WebBridge(Node):
         except Exception:
             return
         if isinstance(data, dict):
+            incoming_run = data.get('run_id')
+            new_state = data.get('state')
+            retired_runs = getattr(self, '_retrieval_retired_run_ids', set())
+            if incoming_run and incoming_run in retired_runs:
+                return
+            if (getattr(self, '_retrieval_start_pending', False)
+                    and incoming_run
+                    and incoming_run == getattr(self, '_retrieval_start_baseline_run_id', None)):
+                return  # old-run heartbeat cannot acknowledge a new Start
+            accepted_run = getattr(self, '_retrieval_accepted_run_id', None)
+            if (accepted_run and incoming_run and incoming_run != accepted_run
+                    and not getattr(self, '_retrieval_start_pending', False)):
+                if new_state not in self._RETRIEVAL_ACTIVE:
+                    return  # an unknown terminal heartbeat cannot replace this run
+                # LLM may start Retrieval directly. Its new active run is valid
+                # even though Web never set _retrieval_start_pending.
+                retired_runs = set(retired_runs)
+                retired_runs.add(accepted_run)
+                self._retrieval_retired_run_ids = retired_runs
             previous = self._pallet_retrieval_status or {}
             old_state = previous.get('state')
-            new_state = data.get('state')
             slot = str(data.get('slot') or previous.get('slot') or '').strip().upper()
             labels = {
                 'HOMING_LIFT': 'Homing',
@@ -848,9 +866,11 @@ class WebBridge(Node):
                 'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY')
             self._pallet_retrieval_status = {
                 **data, 'ts': time.time(),
-                'superseded': terminal and (bool(data.get('discarded')) or
+                'superseded': terminal and (new_state == 'DONE' or bool(data.get('discarded')) or
                     (same_run and previous.get('superseded', False)) or auto_active),
             }
+            if (incoming_run and new_state in self._RETRIEVAL_ACTIVE):
+                self._retrieval_accepted_run_id = incoming_run
             if new_state in self._RETRIEVAL_ACTIVE:
                 self._retrieval_start_pending = False
             elif (new_state in ('DONE', 'FAILED', 'CANCELED', 'STOPPED') and
@@ -1352,7 +1372,19 @@ class WebBridge(Node):
             self._pallet_resume_pending = False
             return False, 'Mission busy'
         generation = getattr(self, '_web_stop_generation', 0)
+        if client is self._retrieval_resume_client:
+            self.get_logger().info(
+                f'[RETRIEVAL_COMMAND] source=Web action=resume '
+                f'slot={retrieval.get("slot")} run_id={retrieval.get("run_id")} '
+                f'previous_state={retrieval.get("state")}')
         response, error = self._call_service_wait(client, Trigger.Request(), timeout_s=4.)
+        if client is self._retrieval_resume_client:
+            current = self._pallet_retrieval_status or {}
+            self.get_logger().info(
+                f'[RETRIEVAL_COMMAND] source=Web action=resume '
+                f'result={getattr(response, "success", None)} error={error} '
+                f'slot={current.get("slot")} run_id={current.get("run_id")} '
+                f'current_state={current.get("state")}')
         if generation != getattr(self, '_web_stop_generation', 0):
             self._stop_robot_and_lift()
             return False, 'Resume canceled by a newer Stop'
@@ -1478,15 +1510,29 @@ class WebBridge(Node):
         if start_generation != getattr(self, '_web_stop_generation', 0):
             return False, 'Canceled'
         baseline = self._pallet_retrieval_status or {}
+        self._retrieval_start_baseline_run_id = baseline.get('run_id')
+        self._retrieval_accepted_run_id = None
+        self.get_logger().info(
+            f'[RETRIEVAL_COMMAND] source=Web action=start slot={slot} '
+            f'previous_run_id={baseline.get("run_id")} previous_state={baseline.get("state")}')
         self._retrieval_start_baseline = (baseline.get('state'), baseline.get('message'))
         self._retrieval_start_pending = True
         response, error = self._call_service_wait(
             self._retrieval_start_client, Trigger.Request(), timeout_s=5.0)
+        current = self._pallet_retrieval_status or {}
+        self.get_logger().info(
+            f'[RETRIEVAL_COMMAND] source=Web action=start result={getattr(response, "success", None)} '
+            f'error={error} slot={slot} previous_run_id={baseline.get("run_id")} '
+            f'current_run_id={current.get("run_id")} current_state={current.get("state")}')
         if response is None:
             return False, error
         if not response.success:
             self._retrieval_start_pending = False
             return False, response.message or 'Retrieval mission was rejected'
+        if baseline.get('run_id'):
+            retired_runs = set(getattr(self, '_retrieval_retired_run_ids', set()))
+            retired_runs.add(baseline['run_id'])
+            self._retrieval_retired_run_ids = retired_runs
         if start_generation != getattr(self, '_web_stop_generation', 0):
             canceled, message = self.pallet_retrieval_cancel()
             return False, 'Canceled' if canceled else message
@@ -1586,6 +1632,10 @@ class WebBridge(Node):
             self._mark_supervisor_reset()
         if self._nav_bridge:
             self._nav_bridge.set_op_mode(mode)
+        llm = getattr(self, 'llm', None)
+        if llm and isinstance(llm.last_status, dict) and llm.last_status.get('state') in (
+                'started', 'done', 'failed', 'stopped', 'simulated', 'idle'):
+            llm.clear_status('idle', f'Chế độ đã đổi sang {mode}; sẵn sàng cho nhiệm vụ mới')
         return True, stop_message or f'Operating mode set to {mode}'
 
     def _lookup_map_tf(self, frame_id: str) -> Optional[Tuple[float, float, float]]:
@@ -2609,6 +2659,7 @@ def main(args=None):
         bridge.stop_slam()
         if bridge._nav_bridge:
             bridge._nav_bridge.stop_nav2()
+        executor.shutdown()
         executor.remove_node(bridge)
         bridge.destroy_node()
         # [history] Flush writer thread + mark open runs INTERRUPTED.

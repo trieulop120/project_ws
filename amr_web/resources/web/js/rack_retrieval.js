@@ -105,12 +105,19 @@
                 'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
                 'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY'
             ].includes(supervisor.state);
-            if (isTerminal && (status.discarded || status.superseded || autoActive ||
+            if (isTerminal && (status.state === 'DONE' || status.discarded || status.superseded || autoActive ||
                     window.suppressTerminalPalletRetrievalStatus)) {
                 window.suppressTerminalPalletRetrievalStatus = true;
                 // Retain proof of termination while retiring its display; a
                 // missing cache would resemble a lost active coordinator.
                 window.currentPalletRetrievalStatus = {...status, superseded: true};
+                if (status.state === 'DONE') {
+                    const event = JSON.stringify([status.run_id || '', 'DONE']);
+                    if (lastRetrievalState !== event) {
+                        lastRetrievalState = event;
+                        window.showToast?.('Pallet retrieval complete', 'success');
+                    }
+                }
                 if (status.discarded) {
                     const event = JSON.stringify([status.run_id || '', 'DISCARDED']);
                     if (lastRetrievalState !== event) {

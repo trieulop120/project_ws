@@ -64,9 +64,10 @@ TOOLS = {
         "group": "B",
         "desc": "Chạy mission pallet có giới hạn số lượng rồi về HOME. Mặc định lấy 1 pallet bất kỳ. "
                 "cargo_class=medium nghĩa là chỉ lấy hộp medium; tall nghĩa là chỉ lấy hộp cao; any là loại nào cũng được. "
-                "quantity là số pallet phải đặt thành công lên kệ trước khi mission hoàn tất. "
+                "quantity là số pallet phải đặt thành công lên kệ trước khi mission hoàn tất (1–10). "
                 "Dùng cho 'chạy một chu trình', 'lấy 2 box cao', 'lấy 3 hộp medium rồi đặt lên kệ', 'one cycle'. "
-                "Phải là bước duy nhất trong kế hoạch.",
+                "Có thể kết hợp nhiều start_single_cycle khác loại/ô trong một kế hoạch; Supervisor "
+                "xử lý queue có thứ tự trong cùng một run, chỉ về HOME sau lượt cuối. Không ghép với auto/retrieval/manual.",
         "params": {"cargo_class": ["any", "medium", "tall"],
                     "drop_slot": ["auto", "A1", "A2", "B1", "B2"],
                     "quantity": {"type": "integer", "min": 1, "max": 10}},
@@ -211,7 +212,8 @@ RÀO CHẮN PHÂN BIỆT BẮT BUỘC (ĐỌC KỸ TRƯỚC KHỊ CHỌN TOOL):
 
 BẢNG CHỌN LỆNH - phân loại toàn bộ yêu cầu; nếu có nhiều thao tác thì giữ tất cả theo thứ tự:
 1. Yêu cầu lấy pallet ra khỏi ô kệ, xuất kho, lấy hàng ở A1/A2/B1/B2 hoặc đưa về D_2 -> retrieve_pallet với slot tương ứng. Đây là retrieval ở AUTO, không phải lấy pallet sàn rồi đặt lên kệ.
-2. Yêu cầu lấy N sản phẩm/hộp/pallet rồi đặt lên kệ, hoặc yêu cầu có loại thấp/medium/tall/high/cao -> start_single_cycle. quantity=N (mặc định 1); cargo_class="medium" cho thấp/low/medium/vừa, "tall" cho high/cao/tall, nếu không nêu loại dùng "any". Nếu nêu ô cụ thể hoặc tầng kệ: "kệ tầng 1"/"tầng dưới"/"A1" -> drop_slot="A1" (medium); "kệ tầng 2"/"tầng trên"/"A2" -> drop_slot="A2" (medium); "B1"/"B2" -> drop_slot tương ứng (tall). Từ chối nếu số lượng >1 với ô cố định. Mission chỉ báo hoàn tất sau khi đủ số lượng đã đặt thành công lên kệ.
+2. Yêu cầu lấy N sản phẩm/hộp/pallet cùng loại rồi đặt lên kệ -> start_single_cycle, quantity=N (1–10; mặc định 1). cargo_class="medium" cho thấp/low/medium/vừa, "tall" cho high/cao/tall, nếu không nêu loại dùng "any". A1/A2 dành cho medium; B1/B2 dành cho tall. Ô cố định chỉ chứa một pallet nên quantity=1. Nếu yêu cầu nhiều loại/ô khác nhau, tạo một start_single_cycle cho MỖI lượt theo đúng thứ tự, ví dụ medium/A2 rồi tall/B2 là HAI bước quantity=1. Supervisor nhận các bước thành một queue trong cùng run; sau mỗi DROP đã xác nhận, cargo=false và Nav2 idle mới đi D_1→P_1 cho lượt kế. Chỉ lượt cuối mới RETURN_HOME; lỗi/Stop thì dừng queue.
+   - Ví dụ “lấy 3 medium đặt lên kệ” -> một bước quantity=3. “medium lên A2 rồi tall lên B2” -> hai bước quantity=1: medium/A2, sau đó tall/B2.
 2. Câu chỉ nói "one cycle / một chu trình / một lần / single" mà không yêu cầu nhiều sản phẩm -> start_single_cycle với quantity=1, cargo_class="any".
 3. Câu có từ "mission" hoặc "chu trình" (start mission, start auto mission, bật mission, chạy mission, bắt đầu mission, chạy chu trình auto) -> start_auto_cycle.
 4. Câu có "resume / tiếp tục" -> resume_cycle.
@@ -220,7 +222,7 @@ BẢNG CHỌN LỆNH - phân loại toàn bộ yêu cầu; nếu có nhiều tha
    - Nếu English: "Do you want to Start Mission or switch Navigation to AUTO?"
    - Nếu Vietnamese: "Bạn muốn Start Mission hay chuyển Navigation sang AUTO?"
 PHÂN RÃ CÂU LỆNH NHIỀU BƯỚC (BẮT BUỘC):
-- Không dừng ở ý định đầu tiên. Tạo một step cho MỖI thao tác người dùng yêu cầu, giữ nguyên thứ tự; giữ các thao tác độc lập thành steps riêng.
+- Không dừng ở ý định đầu tiên. Tạo một step cho MỖI thao tác người dùng yêu cầu, giữ nguyên thứ tự; giữ các thao tác độc lập thành steps riêng. Nhiều start_single_cycle được gom thành một queue tuần tự của Supervisor, không khởi động nhiều mission riêng.
 - Khi người dùng nêu quy trình manual rõ ràng như đi tới Pick, detect, dừng/chốt detect, lấy pallet, đi tới kệ, đặt pallet, về HOME: dùng lần lượt quick_goal(P_1), detect_pallet, lock_detection, pick_pallet, go_mission(p1_to_d1), drop_pallet, go_mission(return_home). Không thay quy trình rõ ràng này bằng start_single_cycle.
 - Với các câu lệnh ở nhiều lượt: nếu vị trí hiện tại đã là P_1 và người dùng chỉ nói lấy/pick, gọi pick_pallet trực tiếp để dùng pose READY đã chốt; không điều hướng hoặc detect lại. Nếu vị trí là P_1 và người dùng nói đem pallet tới kệ, đặt xuống rồi về HOME, tạo đủ go_mission(p1_to_d1), drop_pallet, go_mission(return_home). Nếu đã ở D_1 và đang mang pallet, chỉ cần drop_pallet rồi return_home theo yêu cầu.
 - Nếu người dùng chỉ nói lấy pallet và đặt lên kệ mà không yêu cầu các thao tác riêng, có thể dùng start_single_cycle.
@@ -337,11 +339,17 @@ def validate_plan(plan, location, max_steps=8, allow_unmeasured_lift=False):
     if len(steps) > max_steps:
         raise ValueError(f"Kế hoạch quá dài ({len(steps)} > {max_steps} bước)")
     clean, loc = [], location
-    if any(isinstance(s, dict) and s.get("action") in CYCLE_ACTIONS for s in steps) and len(steps) != 1:
-        raise ValueError("Lệnh cycle phải là hành động duy nhất trong kế hoạch")
+    cycle_steps = [s for s in steps if isinstance(s, dict) and s.get("action") in CYCLE_ACTIONS]
+    # Every cycle command is valid alone; only start_single_cycle can form an
+    # ordered multi-pallet queue. Other combinations must stay isolated.
+    is_single_cycle_command = len(steps) == 1 and len(cycle_steps) == 1
+    if cycle_steps and not is_single_cycle_command and (len(cycle_steps) != len(steps) or
+                        any(s.get("action") != "start_single_cycle" for s in cycle_steps)):
+        raise ValueError("Cycle chỉ được ghép với các start_single_cycle tuần tự")
     if any(isinstance(s, dict) and s.get("action") == "get_robot_status" for s in steps) and len(steps) != 1:
         raise ValueError("Câu hỏi trạng thái phải tách khỏi kế hoạch điều khiển")
     mode_after_steps = None
+    fixed_cycle_slots = set()
     for s in steps:
         if not isinstance(s, dict):
             raise ValueError("Mỗi bước phải là object")
@@ -398,6 +406,10 @@ def validate_plan(plan, location, max_steps=8, allow_unmeasured_lift=False):
                 raise ValueError(f"drop_slot {slot} không tương thích cargo_class {cargo}")
             if slot != "auto" and args["quantity"] != 1:
                 raise ValueError("Ô kệ chỉ định chỉ chứa được một pallet; quantity phải bằng 1")
+            if slot != "auto" and slot in fixed_cycle_slots:
+                raise ValueError(f"Ô {slot} bị yêu cầu nhiều lần trong cùng kế hoạch")
+            if slot != "auto":
+                fixed_cycle_slots.add(slot)
             if slot_class and cargo == "any":
                 args["cargo_class"] = slot_class
         if action == "set_mode":

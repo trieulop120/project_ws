@@ -43,6 +43,60 @@ def context(**extra):
 
 
 class QueryTests(unittest.TestCase):
+    def test_single_cycle_commands_validate_but_mixed_cycles_do_not(self):
+        for action, args in (
+                ('start_auto_cycle', {}), ('start_single_cycle', {}),
+                ('retrieve_pallet', {'slot': 'A1'}), ('stop_cycle', {}),
+                ('resume_cycle', {})):
+            with self.subTest(action=action):
+                clean = validate_plan({'steps': [{'action': action, 'args': args}]}, 'home')
+                self.assertEqual(clean[0]['action'], action)
+        with self.assertRaisesRegex(ValueError, 'Cycle chỉ được ghép'):
+            validate_plan({'steps': [{'action': 'start_auto_cycle', 'args': {}},
+                                     {'action': 'start_single_cycle', 'args': {}}]}, 'home')
+
+    def test_ordered_multiple_single_cycle_plans_validate(self):
+        plans = [
+            [{'action': 'start_single_cycle', 'args': {'cargo_class': 'medium', 'quantity': 2}}],
+            [{'action': 'start_single_cycle', 'args': {'cargo_class': 'any', 'quantity': 2}}],
+            [{'action': 'start_single_cycle', 'args': {'cargo_class': 'medium', 'quantity': 1, 'drop_slot': 'A2'}},
+             {'action': 'start_single_cycle', 'args': {'cargo_class': 'tall', 'quantity': 1, 'drop_slot': 'B2'}}],
+        ]
+        for steps in plans:
+            with self.subTest(steps=steps):
+                clean = validate_plan({'steps': steps}, 'home')
+                self.assertEqual(len(clean), len(steps))
+                self.assertTrue(all(step['action'] == 'start_single_cycle' for step in clean))
+        self.assertEqual(validate_plan({'steps': plans[2]}, 'home')[1]['args']['drop_slot'], 'B2')
+
+    def test_multiple_cycle_steps_start_one_supervisor_queue(self):
+        run_plan = method('llm_command_node.py', '_run_plan', {'Aborted': RuntimeError})
+        calls = []
+        node = NS(_is_en=lambda _language: False,
+                  get_parameter=lambda _name: NS(value=False),
+                  _begin_manual_checkpoint=lambda *_args: None,
+                  _freeze_manual_checkpoint=lambda _cp: None,
+                  _check_abort=lambda: None,
+                  _status=lambda *_args, **_kwargs: None,
+                  _start_cycle=lambda mode, **kwargs: calls.append((mode, kwargs)) or True,
+                  _wait_cycle_complete=lambda *args, **kwargs: calls.append(('wait', kwargs)) or True,
+                  _success_message='', _failure_message='', _cycle_run_id='run-42',
+                  _cycle_operation_id=3)
+        for action in ('set_mode', 'quick_goal', 'start_auto_cycle', 'start_single_cycle',
+                       'retrieve_pallet', 'stop_cycle', 'cancel_navigation', 'resume_cycle',
+                       'go_mission', 'pick_pallet', 'detect_pallet', 'lock_detection',
+                       'drop_pallet', 'lift_to', 'lift_home', 'relative_move'):
+            setattr(node, '_h_' + action, lambda _args: True)
+        run_plan(node, [
+            {'action': 'start_single_cycle', 'args': {'cargo_class': 'medium', 'quantity': 1, 'drop_slot': 'A2'}},
+            {'action': 'start_single_cycle', 'args': {'cargo_class': 'tall', 'quantity': 1, 'drop_slot': 'B2'}},
+        ], 'vi')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], 'single')
+        self.assertEqual(calls[0][1]['queue'][0]['drop_slot'], 'A2')
+        self.assertEqual(calls[0][1]['queue'][1]['drop_slot'], 'B2')
+        self.assertEqual(calls[1], ('wait', {'expected_run_id': 'run-42'}))
+
     def test_project_questions_without_telemetry(self):
         examples = {
             'Bạn là ai?': 'identity', 'Bạn tên gì': 'identity',
@@ -355,6 +409,7 @@ class IntegrationTests(unittest.TestCase):
                         String=lambda **kw: NS(**kw)))
         node = NS(_precheck=lambda: 'Nav2 stopped', _session_reset=False,
                   _pub_cmd=NS(publish=lambda msg: publish.append(msg)),
+                  clear_status=lambda *_args: None,
                   _resp=lambda name, status='ok', message='': {'status': status})
         reply = handle(node, {'command': 'llm_command', 'text': 'kệ có mấy sản phẩm'})
         self.assertEqual(reply['status'], 'ok')

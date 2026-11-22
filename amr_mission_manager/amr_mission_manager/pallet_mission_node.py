@@ -93,6 +93,8 @@ NAVIGATING = 'NAVIGATING'
 SETTLING = 'SETTLING'
 ALIGNING = 'ALIGNING'
 INSERTING = 'INSERTING'
+AUTO_RECOVERING = 'AUTO_RECOVERING'
+WAITING_FOR_SENSOR = 'WAITING_FOR_SENSOR'
 LIFTING = 'LIFTING'
 BACKING = 'BACKING'         # moi: lui ra sau khi nang
 HOMING = 'HOMING'           # moi: ve Home
@@ -105,7 +107,8 @@ CARRYING = 'CARRYING'       # giu pallet sau khi lui (after_pick=hold), xe dung 
 # Loai hang theo do cao hop (detector /pallet/cargo): medium -> A (A1/A2), tall -> B (B1/B2)
 CARGO_TYPE_BY_CLASS = {'medium': 'A', 'tall': 'B'}
 
-BUSY_STATES = (NAVIGATING, SETTLING, ALIGNING, INSERTING, LIFTING,
+BUSY_STATES = (NAVIGATING, SETTLING, ALIGNING, INSERTING, AUTO_RECOVERING,
+               WAITING_FOR_SENSOR, LIFTING,
                BACKING, HOMING, LOWERING)
 
 # Tham so (gia tri mac dinh). Launch chi truyen mot phan; phan con lai lay o day.
@@ -175,8 +178,8 @@ DEFAULTS = {
     'rot_settle_s': 0.5,
     'lat_tol_cm': 2.5,              # lech ngang > nguong -> di ngang (cong gate_lat_cm van bat 2cm)
     'max_sidestep_m': 0.30,
-    'max_sidesteps': 1,
-    'side_speed': 0.05,
+    'max_sidesteps': 2,
+    'side_speed': 0.04,
     'side_tol_deg': 3.0,
     'side_accept_deg': 6.0,
     'side_done_cm': 0.5,
@@ -193,8 +196,8 @@ DEFAULTS = {
     'insert_speed': 0.10,
     'gate_margin_m': 0.05,          # cong cach mat pallet (tinh tu mui cang)
     'gate_pause_s': 0.4,
-    'gate_lat_cm': 2.0,
-    'gate_yaw_deg': 2.0,
+    'gate_lat_cm': 3.0,
+    'gate_yaw_deg': 4.0,
     'max_gate_retries': 2,
     'realign_deg': 6.0,             # trong vung hoi tu: lech goc > nguong -> dung, xoay lai
     'k_lat_conv': 2.0,
@@ -205,7 +208,7 @@ DEFAULTS = {
     'lock_yaw_abort_deg': 4.0,
     # dung (sieu am)
     'stop_dist_cm': 4.5,
-    'confirm_count': 10,
+    'confirm_count': 2,
     'us_arm_m': 0.10,               # chi tin sieu am sau khi da di vao >= 10 cm tu cong
     'us_below_min_is_close': True,  # doc < min_range cung tinh la "sat"
     'max_insert_m': 0.90,           # quang toi da tu cong (= chieu dai cang + du)
@@ -213,8 +216,9 @@ DEFAULTS = {
     'align_timeout_s': 60.0,
     'total_timeout_s': 300.0,
     'range_stale_s': 0.7,
-    'tf_stale_s': 1.0,
-    'tf_miss_max': 40,              # so nhip control (20Hz) mat TF lien tiep moi FAILED (xe dung yen khi cho)
+    'sensor_wait_timeout_s': 2.0,
+    'tf_stale_s': 3.0,
+    'tf_miss_max': 100,             # 5 s missing lookups at 20 Hz; command stays zero while waiting
     # lift
     'esp32_cmd_topic': '/esp32_cmd',
     'joint_states_topic': '/joint_states',
@@ -258,7 +262,7 @@ DEFAULTS = {
     'drop_stop_angular_rps': 0.04,
     'drop_rot_clear_m': 0.60,       # cho de xoay tai cho khi dang mang pallet
     'drop_max_sidestep_m': 0.80,    # cho phep di ngang toi 0.60 m (cot A / B2)
-    'drop_side_speed': 0.05,
+    'drop_side_speed': 0.04,
     'drop_gate_margin_m': 0.10,     # cong cach mat ke (tinh tu mui cang)
     'drop_insert_speed': 0.08,
     'drop_max_insert_m': 0.60,      # chot an toan, KHONG phai do sau ke
@@ -438,12 +442,22 @@ class ApproachController:
         self._pgain = None
         self._last_e = None
         self.sidesteps = 0
+        self.sidestep_distance_m = 0.0
         self.gate_retries = 0
+        # DROP-only recovery budget. This belongs to the controller instance so
+        # STOP/Resume and phase transitions cannot silently reset it.
+        self.alignment_retries = 0
+        self._alignment_error_before_retry = None
         self.err = (0.0, 0.0, 0.0)      # e_lat, e_yaw, a
         self._ref = (0.0, 0.0)
         self._side_dir = 1.0
         self._side_h = 0.0
         self._side_e0 = 0.0
+        self._side_last_pose = None
+        self._side_progress_start = None
+        self._progress_phase = None
+        self._progress_start_metric = None
+        self._progress_metric_now = None
         self._a_lock0 = 0.0
         self.log = []
 
@@ -461,6 +475,31 @@ class ApproachController:
     def _fail(self, msg):
         return 0.0, 0.0, None, msg
 
+    def _phase_metric(self, ph, e_lat, e_yaw, a, ryaw):
+        p = self.p
+        if ph == self.RETREAT:
+            return max(0.0, a + self.stage_m)
+        if ph == self.ALIGN:
+            return max(abs(e_yaw) / max(math.radians(p['align_accept_deg']), 1e-6),
+                       abs(e_lat) / max(p['lat_tol_cm'] / 100.0, 1e-6))
+        if ph == self.SIDE_TURN:
+            return abs(norm_angle(self._side_h - ryaw))
+        if ph == self.SIDE_DRIVE:
+            return abs(e_lat)
+        if ph == self.CONVERGE:
+            a_gate = -(float(p['fork_front_m']) + float(p['gate_margin_m']))
+            return max(0.0, a_gate - a)
+        if ph == self.GATE:
+            return max(abs(e_lat) / max(float(p['gate_lat_cm']) / 100.0, 1e-6),
+                       abs(e_yaw) / max(math.radians(float(p['gate_yaw_deg'])), 1e-6))
+        return 0.0
+
+    def phase_progress_ratio(self):
+        start, current = self._progress_start_metric, self._progress_metric_now
+        if start is None or current is None or start <= 1e-6:
+            return 0.0
+        return max(0.0, (start - current) / start)
+
     def restart_align(self, now):
         self._goto(self.ALIGN, now)
 
@@ -468,6 +507,34 @@ class ApproachController:
         """Resume driving; raised forks may steer, but never turn/side-step."""
         self.insertion_only = bool(insertion_only)
         self._goto(self.CONVERGE, now)
+
+    def begin_drop_alignment_retry(self, now, pose, error):
+        """Reuse the original straight RETREAT -> ALIGN path before raising forks."""
+        if (self.insertion_only or self.phase not in (*self.ALIGN_PHASES, self.CONVERGE)
+                or self.alignment_retries >= 2):
+            return False, 'Alignment retry budget exhausted, phase not retryable, or forks already raised'
+        rx, ry, ryaw = pose
+        e_lat, e_yaw, a = error
+        if (not all(math.isfinite(v) for v in (*pose, *error))
+                or a + float(self.p['fork_front_m']) >= -0.02
+                or abs(e_lat) > float(self.p['max_sidestep_m'])
+                or abs(e_yaw) > math.radians(float(self.p['side_accept_deg']))):
+            return False, 'Alignment retry refused: approach geometry/angle is outside the safe pre-lift envelope'
+        quality = max(abs(e_lat) / max(float(self.p['lat_tol_cm']) / 100.0, 1e-6),
+                      abs(e_yaw) / max(math.radians(float(self.p['align_accept_deg'])), 1e-6))
+        if (self._alignment_error_before_retry is not None
+                and quality >= self._alignment_error_before_retry - 0.05):
+            return (False, f'Alignment did not improve (quality={quality:.3f}, '
+                    f'previous={self._alignment_error_before_retry:.3f})')
+        self.alignment_retries += 1
+        self._alignment_error_before_retry = quality
+        self._ref = (rx, ry)
+        self._goto(self.RETREAT, now)
+        self.log.append(
+            f'[ALIGN_RETRY {self.alignment_retries}/2] stop confirmed; '
+            f'retreat to alignment distance then reuse ALIGN (lat={e_lat*100:+.3f} cm, '
+            f'yaw={math.degrees(e_yaw):+.3f} deg, a={a:.3f} m, quality={quality:.3f})')
+        return True, 'alignment retry started'
 
     def _min_wz(self, wz, e_h):
         """Bu vung chet ma sat khi dang chay: co tre hai nguong de khong chop."""
@@ -545,6 +612,11 @@ class ApproachController:
             return self._fail('Qua thoi gian tong')
 
         ph = self.phase
+        metric = self._phase_metric(ph, e_lat, e_yaw, a, ryaw)
+        if self._progress_phase != ph:
+            self._progress_phase = ph
+            self._progress_start_metric = metric
+        self._progress_metric_now = metric
 
         if self.insertion_only and ph in self.ALIGN_PHASES:
             return self._fail('Sau lift chi duoc tien bu sai lech, khong xoay/di ngang')
@@ -608,15 +680,32 @@ class ApproachController:
             if st != 'ok':
                 return 0.0, wz, None, None
             self._ref = (rx, ry)
+            self._side_last_pose = (rx, ry)
+            self._side_progress_start = self.sidestep_distance_m
             self._goto(self.SIDE_DRIVE, now)
             return 0.0, 0.0, None, None
 
         if ph == self.SIDE_DRIVE:
             traveled = math.hypot(rx - self._ref[0], ry - self._ref[1])
+            # Account each observed increment immediately. A stop/retry during
+            # SIDE_DRIVE must not erase the distance already travelled.
+            if self._side_last_pose is None:
+                self._side_last_pose = self._ref
+                dx, dy = rx - self._side_last_pose[0], ry - self._side_last_pose[1]
+                self.sidestep_distance_m += math.hypot(dx, dy)
+                self._side_last_pose = (rx, ry)
+            else:
+                dx, dy = rx - self._side_last_pose[0], ry - self._side_last_pose[1]
+                self.sidestep_distance_m += math.hypot(dx, dy)
+                self._side_last_pose = (rx, ry)
+            budget = float(p['max_sidestep_m']) * int(p['max_sidesteps'])
+            if self.sidestep_distance_m > budget + 1e-6:
+                return self._fail('Tong quang duong di ngang da vuot ngan sach operation')
             if e_lat * self._side_dir <= p['side_done_cm'] / 100.0:
                 self._goto(self.ALIGN, now)
                 return 0.0, 0.0, None, None
-            if traveled > self._side_e0 + 0.05 or now - self.t_phase > 20.0:
+            if (traveled > min(self._side_e0 + 0.05, float(p['max_sidestep_m']))
+                    or now - self.t_phase > 20.0):
                 return self._fail('Di ngang khong het lech (odom/ban xe?)')
             e_h = norm_angle(self._side_h - ryaw)
             wz = self._min_wz(clamp(p['k_yaw'] * e_h, -0.2, 0.2), e_h)
@@ -651,11 +740,17 @@ class ApproachController:
             if self.insertion_only:
                 return self._fail(f'Khong qua cong sau lift: lat={lat_cm:+.1f} cm '
                                   f'yaw={yaw_deg:+.1f} deg -> dung, khong lui canh lai')
-            if self.gate_retries < int(p['max_gate_retries']):
+            if (self.gate_retries < int(p['max_gate_retries'])
+                    and self.alignment_retries < 2):
                 self.gate_retries += 1
-                self.sidesteps = 0
+                self.alignment_retries += 1
+                self._alignment_error_before_retry = max(
+                    abs(e_lat) / max(float(p['lat_tol_cm']) / 100.0, 1e-6),
+                    abs(e_yaw) / max(math.radians(float(p['align_accept_deg'])), 1e-6))
                 self.log.append(f'KHONG QUA CONG: lat={lat_cm:+.1f} cm yaw={yaw_deg:+.1f} deg '
-                                f'-> lui ra lam lai (lan {self.gate_retries})')
+                                f'-> lui ra lam lai (alignment retry '
+                                f'{self.alignment_retries}/2; gate {self.gate_retries}/'
+                                f'{int(p["max_gate_retries"])})')
                 self._goto(self.RETREAT, now)
                 self._ref = (rx, ry)
                 return 0.0, 0.0, None, None
@@ -747,6 +842,10 @@ class PalletMission(PalletRecovery, Node):
         self._retrieval_pick_nav = None
         self._retrieval_pick_nav_elapsed = 0.0
         self._tf_miss = 0
+        self._tf_wait_since = None
+        self._range_wait_since = None
+        self._waiting_sensor = ''
+        self._sensor_return_state = None
         self._ctl = ApproachController(self.p, self.stage_m)
         self._phase_shown = None
         self._trimmed = False
@@ -951,7 +1050,7 @@ class PalletMission(PalletRecovery, Node):
                     'yaw_deg': round(math.degrees(s[3]), 1)}
         lift = self._lift_height_now()
         err = None
-        if self._state in (ALIGNING, INSERTING):
+        if self._state in (ALIGNING, INSERTING, AUTO_RECOVERING, WAITING_FOR_SENSOR):
             e_lat, e_yaw, a = self._ctl.err
             my = self._map_yaw_err()
             err = {'lat_cm': round(e_lat * 100, 1), 'yaw_deg': round(math.degrees(e_yaw), 1),
@@ -970,7 +1069,14 @@ class PalletMission(PalletRecovery, Node):
              'mode': self._mode, 'drop': self._drop_status(), 'shelf': self._shelf_status(),
              'sel': {'cargo': str(self.get_parameter('cargo_type_override').value),
                      'slot': str(self.get_parameter('drop_slot').value)},
-             'phase': self._ctl.phase if self._state in (ALIGNING, INSERTING) else None,
+             'phase': self._ctl.phase if self._state in (ALIGNING, INSERTING,
+                                                          AUTO_RECOVERING, WAITING_FOR_SENSOR) else None,
+             'handling_status': self._handling_status(),
+             'waiting_for': getattr(self, '_waiting_sensor', '') or None,
+             'retries': {'alignment': self._ctl.alignment_retries,
+                         'gate': self._ctl.gate_retries,
+                         'sidesteps': self._ctl.sidesteps,
+                         'sidestep_distance_m': round(self._ctl.sidestep_distance_m, 4)},
              'rack_trimmed': self._rack_trimmed,
              'insertion_only': self._ctl.insertion_only,
              'fail_phase': getattr(self, '_fail_phase', None),
@@ -979,6 +1085,15 @@ class PalletMission(PalletRecovery, Node):
         m = String()
         m.data = json.dumps(d)
         self.pub_status.publish(m)
+
+    def _handling_status(self):
+        if self._state in (AUTO_RECOVERING, WAITING_FOR_SENSOR):
+            return self._state
+        if self._state in (FAILED, STOPPED) and self._checkpoint is not None:
+            return 'NEED_OPERATOR'
+        if self._state == FAILED:
+            return FAILED
+        return None
 
     # ==================================================================
     # Subscriptions
@@ -1183,7 +1298,7 @@ class PalletMission(PalletRecovery, Node):
         pd.update({
             'face_offset_m': 0.0,
             'max_sidestep_m': tol,
-            'max_sidesteps': 1,
+            'max_sidesteps': 2,
             'side_speed': float(p['drop_side_speed']),
             'rot_clear_m': float(p['drop_rot_clear_m']),
             'total_timeout_s': float(p['drop_total_timeout_s']),
@@ -2154,12 +2269,69 @@ class PalletMission(PalletRecovery, Node):
         self._set_state(state, msg, fail_phase=fail_phase)
 
     def _approach_fail_phase(self):
-        # Do not let the supervisor create a fresh drop (and another sidestep)
-        # after the one physical lateral manoeuvre has already been consumed.
+        # Do not let the supervisor create a fresh rack operation and reset
+        # the two-manoeuvre lateral budget after both moves were consumed.
         if (self._mode in ('drop', 'retrieval_align') or self._retrieval_mode):
-            if not self._ctl.insertion_only and self._ctl.sidesteps >= 1:
+            if not self._ctl.insertion_only and self._ctl.sidesteps >= 2:
                 return 'ALIGN_BUDGET'
         return self._ctl.phase
+
+    def _try_alignment_recovery(self, now, pose, fail):
+        """Retry only small pre-lift PICK/DROP errors via RETREAT -> ALIGN."""
+        retryable = ('Xoay ', 'Di ngang ', 'Canh goc ', 'Lech ngang ')
+        converge_timeout = ('Tien toi cong qua thoi gian' in str(fail)
+                            and self._mode == 'pick' and not self._ctl.insertion_only)
+        if (self._mode not in ('pick', 'drop') or self._drop_lifted
+                or self._ctl.phase not in (*self._ctl.ALIGN_PHASES, self._ctl.CONVERGE)
+                or not (converge_timeout or any(token in str(fail) for token in retryable))):
+            return False
+        if self._ctl.phase_progress_ratio() < 0.05:
+            self.get_logger().warn(
+                f'[ALIGN_RECOVERY] no measured progress before retry in {self._ctl.phase}; '
+                f'progress={self._ctl.phase_progress_ratio():.1%}; refusing blind retry')
+            return False
+        ok, reason = self._ctl.begin_drop_alignment_retry(now, pose, self._ctl.err)
+        if not ok:
+            self.get_logger().warn(f'[ALIGN_RECOVERY] STOP -> RECOVERY: {reason}; fail={fail}')
+            return False
+        self._halt()
+        self._phase_shown = None
+        self._set_state(AUTO_RECOVERING,
+                        f'{self._mode.upper()} {reason}; attempt {self._ctl.alignment_retries}/2')
+        return True
+
+    def _drop_live_alignment_error(self):
+        pose = self._robot_pose(self.p['insertion_frame'])
+        if pose is None or self._line is None:
+            return None
+        e_yaw, e_lat, a = line_errors(*pose, *self._line, self.p['face_offset_m'])
+        return pose, (e_lat, e_yaw, a)
+
+    def _restore_after_sensor_wait(self, message):
+        prior = self._sensor_return_state
+        if prior not in (ALIGNING, INSERTING, AUTO_RECOVERING):
+            prior = ALIGNING if self._ctl.phase in self._ctl.ALIGN_PHASES else INSERTING
+        self._waiting_sensor = ''
+        self._sensor_return_state = None
+        self._tf_wait_since = self._range_wait_since = None
+        self._set_state(prior, message)
+
+    def _wait_for_sensor(self, kind, now, message, timeout_s):
+        if self._waiting_sensor != kind:
+            self._waiting_sensor = kind
+            self._sensor_return_state = self._state
+            if kind == 'tf':
+                self._tf_wait_since = now
+            else:
+                self._range_wait_since = now
+            self.get_logger().warn(f'[WAITING_FOR_SENSOR] {kind}: {message}')
+        started = self._tf_wait_since if kind == 'tf' else self._range_wait_since
+        self._cmd(0.0, 0.0)
+        if self._state != WAITING_FOR_SENSOR or self._msg != message:
+            self._set_state(WAITING_FOR_SENSOR, message)
+        if started is not None and now - started >= float(timeout_s):
+            self._finish(FAILED, f'{kind} sensor unavailable for {now-started:.2f}s: {message}',
+                         fail_phase=f'{kind.upper()}_STALE')
 
     def _trim_rack_before_sidestep(self, now, previous_sidesteps):
         """Legacy TF trim once; True means this tick must stay stopped."""
@@ -2210,12 +2382,15 @@ class PalletMission(PalletRecovery, Node):
     def _control(self, now: float):
         pose = self._robot_pose(self.p['insertion_frame'])
         if pose is None:
-            self._cmd(0.0, 0.0)
             self._tf_miss += 1
+            tf_timeout = float(self.p['tf_miss_max']) / 20.0
+            self._wait_for_sensor('tf', now, 'robot TF missing; motion command is zero', float('inf'))
             if self._tf_miss >= int(self.p['tf_miss_max']):
-                self._finish(FAILED, 'Mat TF robot -> dung xe',
+                self._finish(FAILED, f'Mat TF robot sau {tf_timeout:.1f}s -> dung xe',
                              fail_phase=self._approach_fail_phase())
             return
+        if self._waiting_sensor == 'tf':
+            self._restore_after_sensor_wait('Robot TF restored; resuming saved controller phase')
         self._tf_miss = 0
         if self._mode == 'retrieval_align':
             # Keep these checks outside the shared controller: PICK/DROP keep
@@ -2228,6 +2403,17 @@ class PalletMission(PalletRecovery, Node):
         previous_phase = self._ctl.phase
         previous_sidesteps = self._ctl.sidesteps
         us_fresh = (now - self._us_t) <= self.p['range_stale_s']
+        if self._ctl.phase == self._ctl.LOCK and self._line is not None:
+            e_yaw, e_lat, a = line_errors(*pose, *self._line, self._ctl.p['face_offset_m'])
+            depth = a - self._ctl._a_lock0
+            if depth >= float(self._ctl.p['us_arm_m']) and not us_fresh:
+                self._wait_for_sensor(
+                    'ultrasonic', now,
+                    'ultrasonic stale at armed LOCK depth; robot held at zero',
+                    float(self.p['sensor_wait_timeout_s']))
+                return
+        if self._waiting_sensor == 'ultrasonic' and us_fresh:
+            self._restore_after_sensor_wait('Fresh ultrasonic data restored; resuming LOCK')
         vx, wz, done, fail = self._ctl.step(now, pose, self._line, self._us_count, us_fresh)
 
         # ALIGN has settled the initial heading. Refresh the legacy map->odom
@@ -2245,6 +2431,8 @@ class PalletMission(PalletRecovery, Node):
         self._ctl.log.clear()
 
         if fail:
+            if self._try_alignment_recovery(now, pose, fail):
+                return
             e_lat, e_yaw, a = self._ctl.err
             self._finish(FAILED, f'{fail} [lat={e_lat * 100:+.1f}cm yaw={math.degrees(e_yaw):+.1f}deg]',
                          fail_phase=self._approach_fail_phase())
@@ -2312,7 +2500,8 @@ class PalletMission(PalletRecovery, Node):
         if ph != self._phase_shown:
             self._phase_shown = ph
             top = ALIGNING if ph in ApproachController.ALIGN_PHASES else INSERTING
-            self._set_state(top, PHASE_TEXT.get(ph, ph))
+            if not (self._state == AUTO_RECOVERING and ph in ApproachController.ALIGN_PHASES):
+                self._set_state(top, PHASE_TEXT.get(ph, ph))
         self._cmd(vx, wz)
 
     # ==================================================================
@@ -2895,7 +3084,7 @@ class PalletMission(PalletRecovery, Node):
         pd.update({
             'face_offset_m': 0.0,                       # goc khung o = MAT TRUOC ke
             'max_sidestep_m': float(p['drop_max_sidestep_m']),
-            'max_sidesteps': 1,
+            'max_sidesteps': 2,
             'side_speed': float(p['drop_side_speed']),
             'gate_margin_m': float(p['drop_gate_margin_m']),
             'insert_speed': float(p['drop_insert_speed']),
@@ -3058,7 +3247,7 @@ class PalletMission(PalletRecovery, Node):
             # lay mau map->odom trong luc cho on dinh (khong dung lai, chi de log)
             if now - self._settle_t0 >= self.p['settle_s']:
                 self._begin_alignment()
-        elif self._state in (ALIGNING, INSERTING):
+        elif self._state in (ALIGNING, INSERTING, AUTO_RECOVERING, WAITING_FOR_SENSOR):
             self._control(now)
         elif self._state in (LIFTING, LOWERING):
             self._lift_control(now)
@@ -3179,7 +3368,8 @@ class PalletMission(PalletRecovery, Node):
     # ==================================================================
     def destroy_node(self):
         try:
-            if self._state in (ALIGNING, INSERTING, BACKING):
+            if self._state in (ALIGNING, INSERTING, AUTO_RECOVERING,
+                               WAITING_FOR_SENSOR, BACKING):
                 self._halt()
             if self._state in (LIFTING, LOWERING):
                 self._lift_stop()

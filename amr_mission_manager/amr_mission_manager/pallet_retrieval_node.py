@@ -25,6 +25,7 @@ detection, then performs its separate alignment before raising the forks.
 
 import math
 import os
+import traceback
 import threading
 import time
 import uuid
@@ -51,6 +52,21 @@ from amr_mission_manager.shelf_model import ShelfModel, FULL
 def yaw_from_quaternion(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                       1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def detector_counts(status):
+    """An inference frame is usable only with both nonnegative integer counts."""
+    if not isinstance(status, dict):
+        return None, 'payload'
+    counts = []
+    for field in ('detected_pallets', 'localized_pallets'):
+        value = status.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None, field
+        counts.append(value)
+    if counts[1] > counts[0]:
+        return None, 'localized_pallets'
+    return tuple(counts), None
 
 
 class PalletRetrievalNode(Node):
@@ -270,6 +286,8 @@ class PalletRetrievalNode(Node):
         self._status_pub.publish(msg)
 
     def _srv_start(self, _req, res):
+        previous = self._last_status or {}
+        previous_run_id = self._run_id
         if self._discard_pending:
             res.success, res.message = False, 'Previous retrieval discard is still pending'
             return res
@@ -331,6 +349,10 @@ class PalletRetrievalNode(Node):
             self._resumed_pm_after = 0.0
             self._cancel_event.clear()
             self._status('HOMING_LIFT', 'Preparing retrieval; homing lift first', slot)
+            self.get_logger().info(
+                f'[RETRIEVAL_START] slot={slot} previous_state={previous.get("state")} '
+                f'previous_run_id={previous_run_id} '
+                f'current_state=HOMING_LIFT run_id={self._run_id} step={self._resume_stage}')
         self._worker = threading.Thread(target=self._run, args=(slot,), daemon=True)
         self._worker.start()
         res.success, res.message = True, f'Retrieval started for {slot}'
@@ -681,6 +703,7 @@ class PalletRetrievalNode(Node):
         saw_raw_detection = False
         saw_unlocalized_detection = False
         saw_inference_frame = False
+        last_invalid_status_t = 0.0
         while time.monotonic() < deadline:
             self._raise_if_cancelled()
             with self._lock:
@@ -690,21 +713,31 @@ class PalletRetrievalNode(Node):
                 detector_status = self._detection_status
                 detector_status_t = self._detection_status_t
             if detector_status and detector_status_t >= enabled_at:
-                if not saw_inference_frame:
+                counts, invalid_field = detector_counts(detector_status)
+                if invalid_field:
+                    if detector_status_t != last_invalid_status_t:
+                        self.get_logger().warn(
+                            f'[RETRIEVAL_DETECTOR_WAIT] invalid field={invalid_field} '
+                            f'payload={detector_status!r}; waiting for valid inference counters')
+                        last_invalid_status_t = detector_status_t
+                elif not saw_inference_frame:
                     saw_inference_frame = True
                     # Do not spend the pallet-search window waiting for the
                     # detector process/model to finish starting. Search gets
                     # its full timeout after the first inference result arrives.
                     deadline = time.monotonic() + timeout
-                detected_count = int(detector_status.get('detected_pallets', 0))
-                localized_count = int(detector_status.get('localized_pallets', 0))
-                saw_raw_detection |= detected_count > 0
-                saw_unlocalized_detection |= detected_count > 0 and localized_count == 0
+                if counts is not None:
+                    detected_count, localized_count = counts
+                    saw_raw_detection |= detected_count > 0
+                    saw_unlocalized_detection |= detected_count > 0 and localized_count == 0
             if (pm and pm_t >= enabled_at and pm.get('state') in ('STOPPED', 'FAILED')):
                 raise RuntimeError('Pallet retrieval was stopped by the operator')
             if (supervisor and supervisor_t >= enabled_at and
                     supervisor.get('state') == 'RECOVERY'):
                 raise RuntimeError('Mission supervisor entered recovery')
+            if not saw_inference_frame:
+                time.sleep(0.05)
+                continue
             if msg is None or seen < enabled_at or time.monotonic() - seen > 1.0:
                 time.sleep(0.05)
                 continue
@@ -920,8 +953,14 @@ class PalletRetrievalNode(Node):
             res.success, res.message = False, 'Retrieval is busy'
             return res
         with self._lock:
+            previous_state = (self._last_status or {}).get('state')
             self._resume_revision += 1
             self._resume_in_progress = True
+            self.get_logger().info(
+                f'[RETRIEVAL_RESUME] slot={self._resume_slot} run_id={self._run_id} '
+                f'previous_state={previous_state} current_state={previous_state} '
+                f'step={self._resume_stage} resume_revision={self._resume_revision} '
+                f'pm_operation_id={(self._pm_status or {}).get("operation_id")}')
         self._cancel_event.clear()
         self._worker = threading.Thread(target=self._run, args=(self._resume_slot, True), daemon=True)
         self._worker.start()
@@ -1021,7 +1060,7 @@ class PalletRetrievalNode(Node):
             self._candidate_enable_pub.publish(Bool(data=False))
             self._stop_for_recovery()
             self._status('RECOVERY', f'{exc}; operation retained for Resume after inspection', slot, resuming=False)
-            self.get_logger().warn(f'Retrieval recovery: {exc}')
+            self.get_logger().error(f'Retrieval recovery: {exc}\n{traceback.format_exc()}')
         finally:
             self._resume_in_progress = False
             self._run_lock.release()
@@ -1037,8 +1076,10 @@ def main(args=None):
     try:
         executor.spin()
     finally:
+        executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

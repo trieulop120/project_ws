@@ -109,6 +109,7 @@ class LLMCommandNode(ManualRecovery, Node):
         d("start_location", "home")
         d("max_steps", 8)
         d("mission_timeout_s", 180.0)
+        d("cycle_completion_timeout_s", 1200.0)
         d("nav_start_timeout_s", 15.0)
         d("srv_detect", "pallet_mission/detect")
         d("srv_go_to_pallet", "pallet_mission/go_to_pallet")
@@ -186,6 +187,8 @@ class LLMCommandNode(ManualRecovery, Node):
         self._sup_status = None
         self._sup_status_revision = 0
         self._sup_status_signature = None
+        self._cycle_run_id = None
+        self._cycle_operation_id = None
         self._current_action = None
         self._current_action_args = None
         self._current_command_text = ""
@@ -267,6 +270,9 @@ class LLMCommandNode(ManualRecovery, Node):
                                      'action': cp['steps'][cp['index']]['action'],
                                      'paused': cp['paused_at'] is not None,
                                      'reason': self._manual_resume_blocked() if cp['paused_at'] is not None else ''}
+        if self._cycle_run_id and not kw.get('observational'):
+            kw.setdefault('run_id', self._cycle_run_id)
+            kw.setdefault('operation_id', self._cycle_operation_id)
         self.pub_status.publish(String(data=json.dumps(
             {"state": state, "location": self._location, "op_mode": self._op_mode,
              "dry_run": bool(self.get_parameter("dry_run").value),
@@ -363,7 +369,8 @@ class LLMCommandNode(ManualRecovery, Node):
                     if en else "Không thể hủy giữa chừng khi càng nâng đang nâng/hạ pallet. Hệ thống sẽ tiếp tục hoàn thành hành động hiện tại.")
         if (act in ("pick_pallet", "drop_pallet")
                 or sup_state in ("PICKING", "DROPPING", "GOTO_D")
-                or pal_state in ("SETTLING", "ALIGNING", "INSERTING", "BACKING", "HOMING")):
+                or pal_state in ("SETTLING", "ALIGNING", "INSERTING", "AUTO_RECOVERING",
+                                 "WAITING_FOR_SENSOR", "BACKING", "HOMING")):
             return ("Cannot cancel mid-way while picking or placing a pallet on the rack. Continuing the current action."
                     if en else "Không thể hủy giữa chừng khi robot đang lấy hoặc đặt pallet lên kệ. Hệ thống sẽ tiếp tục hoàn thành hành động hiện tại.")
         if self._motion_active or act == "relative_move":
@@ -376,6 +383,20 @@ class LLMCommandNode(ManualRecovery, Node):
 
     def _describe_active_task(self, language=None):
         en = self._is_en(language)
+        handling = (self._sup_status or {}).get('handling_status')
+        if handling == 'AUTO_RECOVERING':
+            return ('automatically correcting pallet alignment within the retry limit' if en else
+                    'đang tự căn chỉnh pallet trong giới hạn số lần thử')
+        if handling == 'WAITING_FOR_SENSOR':
+            waiting = (self._sup_status or {}).get('pm_waiting_for') or 'sensor'
+            return (f'robot stopped while waiting for fresh {waiting} data' if en else
+                    f'robot đang dừng chờ dữ liệu {waiting} mới')
+        if handling == 'NEED_OPERATOR':
+            return ('pallet operation needs operator inspection and is not complete' if en else
+                    'thao tác pallet cần người vận hành kiểm tra và chưa hoàn tất')
+        if handling == 'FAILED':
+            return ('pallet operation failed and was not completed' if en else
+                    'thao tác pallet thất bại, chưa hoàn tất')
         act = self._current_action
         args = self._current_action_args or {}
         if act == "go_mission" and "name" in args:
@@ -504,8 +525,12 @@ class LLMCommandNode(ManualRecovery, Node):
             st = data.get(self.get_parameter("pallet_state_key").value)
             cycle = data.get("cycle") if isinstance(data.get("cycle"), dict) else {}
             signature = (st, data.get("msg"), data.get("active_mission"),
+                         data.get("handling_status"), data.get("pm_handling_status"),
+                         data.get("pm_waiting_for"),
                          data.get("active_dest"), cycle.get("number"),
-                         data.get("resume_state"))
+                         data.get("resume_state"), data.get("run_id"),
+                         data.get("operation_id"), cycle.get("task_index"),
+                         cycle.get("task_placed"))
             if signature != self._sup_status_signature:
                 self._sup_status_revision += 1
                 self._sup_status_signature = signature
@@ -666,6 +691,8 @@ class LLMCommandNode(ManualRecovery, Node):
 
     def _worker(self, text, language="auto"):
         en = self._is_en(language)
+        self._cycle_run_id = None
+        self._cycle_operation_id = None
         self._current_command_text = text
         try:
             self._status("planning", msg=text, language=language)
@@ -764,6 +791,8 @@ class LLMCommandNode(ManualRecovery, Node):
 
     def _run_plan(self, steps, language="auto", resume_checkpoint=None):
         en = self._is_en(language)
+        queued_cycles = bool(steps) and all(
+            st.get("action") == "start_single_cycle" for st in steps)
         handlers = {"set_mode": self._h_set_mode,
                     "quick_goal": self._h_quick_goal,
                     "start_auto_cycle": self._h_start_auto_cycle,
@@ -783,10 +812,33 @@ class LLMCommandNode(ManualRecovery, Node):
         dry = self.get_parameter("dry_run").value
         self._success_message = ""
         self._failure_message = ""
-        cp = self._begin_manual_checkpoint(steps, resume_checkpoint) if not dry else None
+        cp = self._begin_manual_checkpoint(steps, resume_checkpoint) if not dry and not queued_cycles else None
         base_index = cp["index"] if cp else 0
         resume_started = bool(cp and cp["started"])
         try:
+            if queued_cycles and not dry:
+                tasks = [{"cargo_class": st["args"].get("cargo_class", "any"),
+                          "quantity": st["args"].get("quantity", 1),
+                          "drop_slot": st["args"].get("drop_slot", "auto")}
+                         for st in steps]
+                self._current_action = "start_single_cycle"
+                self._current_action_args = {"queue": tasks}
+                self._status("running", step=1, total=len(steps),
+                             msg=("Starting ordered pallet queue" if en else
+                                  "Đang khởi động hàng đợi pallet theo thứ tự"), language=language)
+                if not self._start_cycle("single", queue=tasks):
+                    self._status("failed", msg=self._failure_message or "Mission start failed",
+                                 language=language)
+                    return
+                if not self._wait_cycle_complete(1, len(steps), language,
+                                                 expected_run_id=self._cycle_run_id):
+                    self._status("failed", msg=self._failure_message or "Mission did not complete",
+                                 language=language)
+                    return
+                self._status("done", msg=(self._success_message or
+                             ("All pallet tasks completed" if en else
+                              "Đã hoàn thành toàn bộ lượt pallet")), language=language)
+                return
             for i, st in enumerate(steps, 1):
                 self._check_abort()
                 if cp:
@@ -822,12 +874,58 @@ class LLMCommandNode(ManualRecovery, Node):
         if dry:
             msg = "Preview complete" if en else "Xem trước hoàn tất"
             self._status("simulated", msg=msg, language=language)
-        elif any(s["action"] in ("start_auto_cycle", "start_single_cycle", "resume_cycle") for s in steps):
+        elif (not queued_cycles and
+              any(s["action"] in ("start_auto_cycle", "start_single_cycle", "resume_cycle") for s in steps)):
             msg = "Cycle started" if en else "Đã khởi động chu trình"
             self._status("started", msg=msg, language=language)
         else:
             self._status("done", msg=self._success_message or ("Completed" if en else "Hoàn thành"),
                          language=language)
+
+    def _wait_cycle_complete(self, step, total, language, expected_run_id=None):
+        """Wait for this sequential single-cycle run to return home and publish DONE."""
+        en = language == "en"
+        deadline = time.monotonic() + float(
+            self.get_parameter("cycle_completion_timeout_s").value)
+        active_states = {"GOTO_PICK", "PICKING", "GOTO_D", "DROPPING", "WAITING_SLOT",
+                         "RETURN_HOME", "STOPPING"}
+        saw_active = False
+        while time.monotonic() < deadline:
+            self._check_abort()
+            age = time.time() - self._sup_state_t if self._sup_state_t else float("inf")
+            if age <= self.get_parameter("supervisor_status_max_age_s").value:
+                state = self._sup_state
+                snapshot = self._sup_status or {}
+                if expected_run_id is None or snapshot.get("run_id") != expected_run_id:
+                    time.sleep(0.2)
+                    continue
+                self._cycle_operation_id = snapshot.get("operation_id")
+                if state in active_states:
+                    saw_active = True
+                elif state == "DONE" and saw_active:
+                    nav = snapshot.get("nav_mission") or {}
+                    if (snapshot.get("cargo") is False
+                            and snapshot.get("nav_status_fresh") is True
+                            and snapshot.get("nav_goal_active") is False
+                            and nav.get("state") == "SUCCEEDED"):
+                        return True
+                elif state in ("FAILED", "RECOVERY", "STOPPED"):
+                    self._failure_message = ((self._sup_status or {}).get("msg") or
+                                             (f"Cycle {step}/{total} entered {state}" if en else
+                                              f"Chu trình {step}/{total} chuyển sang {state}"))
+                    return False
+                elif state == "IDLE" and saw_active:
+                    self._failure_message = ("Cycle ended in IDLE before DONE" if en else
+                                             "Chu trình về IDLE trước khi xác nhận DONE")
+                    return False
+            self._status("running", step=step, total=total,
+                         msg=(f"Waiting for cycle {step}/{total} to complete" if en else
+                              f"Đang chờ chu trình {step}/{total} hoàn tất"),
+                         language=language)
+            time.sleep(0.2)
+        self._failure_message = (f"Timed out waiting for cycle {step}/{total} to complete" if en else
+                                 f"Quá thời gian chờ chu trình {step}/{total} hoàn tất")
+        return False
 
     @staticmethod
     def _action_summary(steps, language, initial_location):
@@ -1109,7 +1207,7 @@ class LLMCommandNode(ManualRecovery, Node):
             self._location = "unknown"
         return ok
 
-    def _start_cycle(self, run_mode, cargo_class="any", quantity=1, drop_slot="auto"):
+    def _start_cycle(self, run_mode, cargo_class="any", quantity=1, drop_slot="auto", queue=None):
         self._failure_message = ""
         en = self._is_en()
 
@@ -1143,6 +1241,8 @@ class LLMCommandNode(ManualRecovery, Node):
                           int(quantity)).to_parameter_msg(),
                 Parameter("target_drop_slot", Parameter.Type.STRING,
                           "" if drop_slot == "auto" else drop_slot).to_parameter_msg(),
+                Parameter("target_queue_json", Parameter.Type.STRING,
+                          json.dumps(queue, ensure_ascii=False) if queue else "").to_parameter_msg(),
             ]
             param_result = self._call(self.cli_cycle_params, req, timeout=5.0)
             if not param_result or not param_result.results or not all(
@@ -1154,13 +1254,13 @@ class LLMCommandNode(ManualRecovery, Node):
             # /mission/start so a previous run's terminal FAILED/RECOVERY state
             # cannot be mistaken for failure of the newly accepted run.
             start_status_revision = self._sup_status_revision
+            previous_run_id = (self._sup_status or {}).get("run_id")
             result = self._call(self.cli_cycle_start, Trigger.Request(), timeout=5.0)
             if not result.success:
                 return fail(f"Supervisor rejected /mission/start: {result.message}" if en
                             else f"Supervisor từ chối /mission/start: {result.message}")
 
             deadline = time.monotonic() + 10.0
-            goto_seen_at = None
             while time.monotonic() < deadline:
                 self._check_abort()
                 age = time.time() - self._sup_state_t if self._sup_state_t else float("inf")
@@ -1168,21 +1268,21 @@ class LLMCommandNode(ManualRecovery, Node):
                 is_new_status = self._sup_status_revision > start_status_revision
                 if (is_new_status and
                         age <= self.get_parameter("supervisor_status_max_age_s").value):
+                    current_run_id = (self._sup_status or {}).get("run_id")
+                    if not current_run_id or current_run_id == previous_run_id:
+                        time.sleep(0.1)
+                        continue
+                    self._cycle_run_id = current_run_id
+                    self._cycle_operation_id = (self._sup_status or {}).get("operation_id")
                     if state in ("RECOVERY", "FAILED"):
                         return fail(f"Cycle entered {state}" if en else f"Cycle chuyển sang {state}")
-                    if state == "GOTO_PICK":
-                        goto_seen_at = goto_seen_at or time.monotonic()
-                        if time.monotonic() - goto_seen_at >= 0.8:
-                            self._failure_message = ""
-                            return True
-                    elif (state not in (None, "IDLE") and (self._sup_status or {}).get("nav_goal_active") is True):
+                    if state not in (None, "IDLE", "DONE", "FAILED", "STOPPED", "RECOVERY"):
                         self._failure_message = ""
                         return True
-                    else:
-                        goto_seen_at = None
                 time.sleep(0.1)
 
-            return True
+            return fail("/mission/start was accepted but no active status with a new run_id was confirmed" if en
+                        else "/mission/start đã nhận nhưng chưa xác nhận được trạng thái hoạt động với run_id mới")
 
         except Aborted:
             raise
@@ -1204,6 +1304,11 @@ class LLMCommandNode(ManualRecovery, Node):
             raise RuntimeError(f"Invalid retrieval slot: {slot}")
         if self.get_parameter("dry_run").value:
             return True
+        previous = self._retrieval_status or {}
+        previous_run = previous.get('run_id')
+        if (previous.get('state') not in (None, 'IDLE', 'DONE', 'FAILED', 'CANCELED', 'STOPPED')
+                and time.time() - self._retrieval_state_t <= 3.):
+            raise RuntimeError('Retrieval is already active or paused; use its Resume control')
         if self._op_mode != "AUTO":
             self._h_set_mode({"mode": "AUTO"})
             self._sleep(0.3)
@@ -1215,7 +1320,16 @@ class LLMCommandNode(ManualRecovery, Node):
             raise RuntimeError(f"Could not select retrieval slot {slot}")
         self._retrieval_state = None
         self._retrieval_state_t = 0.0
+        request_at = time.time()
+        self.get_logger().info(
+            f'[RETRIEVAL_COMMAND] source=LLM action=start slot={slot} '
+            f'previous_run_id={previous_run} previous_state={previous.get("state")}')
         response = self._call(self.cli_retrieval_start, Trigger.Request(), timeout=5.0)
+        self.get_logger().info(
+            f'[RETRIEVAL_COMMAND] source=LLM action=start result={response.success} '
+            f'slot={slot} previous_run_id={previous_run} '
+            f'current_run_id={(self._retrieval_status or {}).get("run_id")} '
+            f'current_state={self._retrieval_state}')
         if not response.success:
             raise RuntimeError(response.message or f"Retrieval rejected for {slot}")
         deadline = time.monotonic() + float(self.get_parameter("retrieval_timeout_s").value)
@@ -1223,6 +1337,11 @@ class LLMCommandNode(ManualRecovery, Node):
         while time.monotonic() < deadline:
             self._check_abort()
             state = self._retrieval_state
+            status = self._retrieval_status or {}
+            if (self._retrieval_state_t < request_at or not status.get('run_id')
+                    or status.get('run_id') == previous_run):
+                self._sleep(0.2)
+                continue
             if state == "DONE":
                 return True
             if state in terminal:
@@ -1247,7 +1366,15 @@ class LLMCommandNode(ManualRecovery, Node):
 
     def _h_resume_cycle(self, _args):
         if (self._retrieval_state == "RECOVERY" and time.time() - self._retrieval_state_t <= 3.):
+            before = self._retrieval_status or {}
+            self.get_logger().info(
+                f'[RETRIEVAL_COMMAND] source=LLM action=resume slot={before.get("slot")} '
+                f'run_id={before.get("run_id")} previous_state={before.get("state")}')
             result = self._call(self.cli_retrieval_resume, Trigger.Request(), timeout=5.)
+            self.get_logger().info(
+                f'[RETRIEVAL_COMMAND] source=LLM action=resume result={result.success} '
+                f'run_id={(self._retrieval_status or {}).get("run_id")} '
+                f'current_state={self._retrieval_state}')
             if not result.success:
                 self._failure_message = result.message
             return bool(result.success)
@@ -1640,6 +1767,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        ex.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

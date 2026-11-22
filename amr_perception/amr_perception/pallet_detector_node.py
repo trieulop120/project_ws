@@ -96,6 +96,7 @@ measured. Change either one and the table must be re-measured.
 import math
 import json
 import os
+import json
 import traceback
 import time
 import threading
@@ -220,6 +221,9 @@ class PalletDetectorNode(Node):
     DEFAULT_FY = 570.0
     DEFAULT_CX = 320.0
     DEFAULT_CY = 240.0
+    DEFAULT_INTRINSICS_FILE = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), 'config',
+        'astra_rgb_640x480.json')
 
     MIN_DEPTH_M = 0.1
     MAX_DEPTH_M = 10.0
@@ -239,6 +243,7 @@ class PalletDetectorNode(Node):
         self.declare_parameter('target_frame', 'map')
         self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
+        self.declare_parameter('intrinsics_file', self.DEFAULT_INTRINSICS_FILE)
         self.declare_parameter('pallet_frame_id', 'pallet_frame')
         self.declare_parameter('tf_timeout', 0.2)
         self.declare_parameter('debug_image', True)
@@ -296,6 +301,8 @@ class PalletDetectorNode(Node):
         self.target_frame = self.get_parameter('target_frame').value
         self.base_frame = self.get_parameter('base_frame').value
         self.camera_frame_param = self.get_parameter('camera_frame').value
+        self.intrinsics_file = os.path.expanduser(
+            str(self.get_parameter('intrinsics_file').value))
         self.pallet_frame_id = self.get_parameter('pallet_frame_id').value
         self.tf_timeout = self.get_parameter('tf_timeout').value
         self.publish_debug = self.get_parameter('debug_image').value
@@ -459,6 +466,7 @@ class PalletDetectorNode(Node):
         self.cx = self.DEFAULT_CX
         self.cy = self.DEFAULT_CY
         self.camera_info_received = False
+        self._load_calibrated_intrinsics()
 
         # Process CPU load is shared by both inference modes; each mode gets
         # its own completed-inference Hz and model.predict latency.
@@ -739,6 +747,12 @@ class PalletDetectorNode(Node):
     def camera_info_callback(self, msg: CameraInfo):
         """Update camera intrinsics from CameraInfo topic."""
         if not self.camera_info_received:
+            if self.intrinsics_file:
+                self.get_logger().info(
+                    'Ignoring /color/camera_info intrinsics because calibrated '
+                    f'file is configured: {self.intrinsics_file}')
+                self.camera_info_received = True
+                return
             self.fx = msg.k[0] if msg.k[0] != 0 else self.DEFAULT_FX
             self.fy = msg.k[4] if msg.k[4] != 0 else self.DEFAULT_FY
             self.cx = msg.k[2] if msg.k[2] != 0 else self.DEFAULT_CX
@@ -748,6 +762,26 @@ class PalletDetectorNode(Node):
                 f'Camera intrinsics updated: fx={self.fx:.1f}, fy={self.fy:.1f}, '
                 f'cx={self.cx:.1f}, cy={self.cy:.1f}'
             )
+
+    def _load_calibrated_intrinsics(self):
+        """Load the repository camera calibration JSON when present."""
+        try:
+            with open(self.intrinsics_file, 'r', encoding='utf-8') as stream:
+                calibration = json.load(stream)
+            if calibration.get('width') != 640 or calibration.get('height') != 480:
+                raise ValueError('expected a 640x480 calibration')
+            matrix = calibration['K']
+            self.fx, self.fy = float(matrix[0][0]), float(matrix[1][1])
+            self.cx, self.cy = float(matrix[0][2]), float(matrix[1][2])
+            self.camera_info_received = True
+            self.get_logger().info(
+                'Loaded calibrated camera intrinsics from '
+                f'{self.intrinsics_file}: fx={self.fx:.3f}, fy={self.fy:.3f}, '
+                f'cx={self.cx:.3f}, cy={self.cy:.3f}')
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            self.intrinsics_file = ''
+            self.get_logger().warning(
+                f'Could not load camera calibration; using /color/camera_info: {exc}')
 
     def _on_detection_enable(self, msg: Bool):
         enabled = bool(msg.data)

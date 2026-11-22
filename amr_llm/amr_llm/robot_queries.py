@@ -146,6 +146,9 @@ def build_context(*, supervisor=None, supervisor_age=None, pallet=None, pallet_a
     owner = 'retrieval' if rf and ret.get('state') in ACTIVE_RETRIEVAL else 'supervisor'
     return {
         'supervisor_state': sup.get('state', 'unknown') if sf else 'unknown',
+        'handling_status': sup.get('handling_status', 'unknown') if sf else 'unknown',
+        'pm_handling_status': sup.get('pm_handling_status', 'unknown') if sf else 'unknown',
+        'pm_waiting_for': sup.get('pm_waiting_for') if sf else None,
         'supervisor_status_age_s': supervisor_age,
         'supervisor_fresh': sf,
         'active_mission': sup.get('active_mission') if sf else None,
@@ -247,6 +250,7 @@ def answer_query(topics, context, text='', language='vi'):
         else:
             cycle = context['cycle']
             state = context['supervisor_state']
+            handling = context['handling_status']
             progress = context['progress_percent']
             placed = number(cycle.get('placed'), 0)
             target = number(cycle.get('target_quantity'), 1)
@@ -254,6 +258,19 @@ def answer_query(topics, context, text='', language='vi'):
             if progress is not None: line += (f' Current cycle progress: {progress:g}%.' if en else f' Tiến độ chu kỳ hiện tại: {progress:g}%.')
             if placed is not None: line += (f' Placed: {placed:g}' if en else f' Đã đặt: {placed:g}') + (f'/{target:g}.' if target else '.')
             if context['mission_message']: line += ' ' + context['mission_message']
+            if handling == 'AUTO_RECOVERING':
+                line += (' The pallet controller is automatically retrying alignment within its bounded budget.' if en else
+                         ' Bộ điều khiển pallet đang tự căn chỉnh lại trong giới hạn số lần thử.')
+            elif handling == 'WAITING_FOR_SENSOR':
+                sensor = context['pm_waiting_for'] or 'sensor'
+                line += (f' Robot stopped while waiting for fresh {sensor} data.' if en else
+                         f' Robot đang dừng chờ dữ liệu {sensor} mới.')
+            elif handling == 'NEED_OPERATOR':
+                line += (' Operator inspection is required; the pallet operation is not complete.' if en else
+                         ' Cần người vận hành kiểm tra; thao tác pallet chưa hoàn tất.')
+            elif handling == 'FAILED':
+                line += (' The operation failed and was not reported complete.' if en else
+                         ' Thao tác thất bại, chưa được xác nhận hoàn tất.')
             if state == 'RECOVERY':
                 line += (' Resume checkpoint: ' if en else ' Checkpoint resume: ') + str(context['resume_state'] or '--') + '.'
                 line += (' Resume requires checking robot/cargo/lift first.' if context['resume_available'] else ' No resumable checkpoint.') if en else (

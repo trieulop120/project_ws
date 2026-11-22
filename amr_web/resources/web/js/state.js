@@ -45,7 +45,8 @@ window.missionActiveStates = {
     supervisor: new Set(['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
         'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING']),
     pallet: new Set(['DETECTING', 'NAVIGATING', 'SETTLING', 'ALIGNING',
-        'INSERTING', 'LIFTING', 'BACKING', 'HOMING', 'LOWERING']),
+        'INSERTING', 'AUTO_RECOVERING', 'WAITING_FOR_SENSOR',
+        'LIFTING', 'BACKING', 'HOMING', 'LOWERING']),
     navigation: new Set(['SENDING', 'ACCEPTED', 'ACTIVE', 'CANCELING', 'UNKNOWN', 'STARTING'])
 };
 // Age transport receipts locally; browser and robot wall clocks may differ.
@@ -170,6 +171,8 @@ window.missionStateLabels = {
     DROPPING: 'Placing', WAITING_SLOT: 'Waiting', RETURN_HOME: 'Returning',
     RECOVERY: 'Recovery', NAVIGATING: 'Navigating', SETTLING: 'Settling',
     ALIGNING: 'Aligning', INSERTING: 'Inserting', LIFTING: 'Lifting', BACKING: 'Backing',
+    AUTO_RECOVERING: 'Auto correcting alignment', WAITING_FOR_SENSOR: 'Waiting for sensor',
+    NEED_OPERATOR: 'Operator check required',
     HOMING: 'Homing', LOWERING: 'Lowering', READY: 'Ready', CARRYING: 'Holding',
     ACTIVE: 'Navigating', SUCCEEDED: 'Done', DONE: 'Done', FAILED: 'Failed',
     CANCELED: 'Canceled', STOPPED: 'Stopped'
@@ -184,7 +187,8 @@ window.getMissionPresentation = (() => {
     const terminal = new Set(['DONE', 'FAILED', 'CANCELED', 'STOPPED']);
     const palletLabels = {DETECTING: 'Detecting', READY: 'Pallet Ready',
         NAVIGATING: 'To Staging', SETTLING: 'Settling', ALIGNING: 'Aligning',
-        INSERTING: 'Inserting', LIFTING: 'Lifting', BACKING: 'Backing',
+        INSERTING: 'Inserting', AUTO_RECOVERING: 'Auto correcting alignment',
+        WAITING_FOR_SENSOR: 'Waiting for sensor', LIFTING: 'Lifting', BACKING: 'Backing',
         LOWERING: 'Lowering', HOMING: 'Homing', CARRYING: 'Carrying',
         DONE: 'Done', FAILED: 'Failed', STOPPED: 'Stopped'};
     return (owner = window.getMissionOwner()) => {
@@ -193,6 +197,11 @@ window.getMissionPresentation = (() => {
         const view = {label: owner.stale ? 'Unavailable' :
             (window.missionStateLabels[state] || 'Unavailable'), target: '--', detail: ''};
         if (owner.stale) return view;
+        const handling = m.handling_status || m.pm_handling_status;
+        if (handling === 'AUTO_RECOVERING') view.label = 'Auto correcting alignment';
+        else if (handling === 'WAITING_FOR_SENSOR') view.label = 'Waiting for sensor';
+        else if (handling === 'NEED_OPERATOR') view.label = 'Operator check required';
+        else if (handling === 'FAILED') view.label = 'Failed';
         if (owner.source !== 'supervisor') { context = ''; observedPallet = false; }
         if (owner.source === 'retrieval') {
             const labels = {HOMING_LIFT: 'Homing', ALIGNING_TO_SLOT: 'Aligning',
@@ -271,6 +280,16 @@ window.getMissionPresentation = (() => {
             if (related && (pmState === 'FAILED' || ['RECOVERY', 'FAILED'].includes(state))) {
                 const diagnostic = [m.pm_msg, m.pm_fail_phase && `[${m.pm_fail_phase}]`].filter(Boolean).join(' ');
                 if (diagnostic && !view.detail.includes(diagnostic)) view.detail = [view.detail, diagnostic].filter(Boolean).join(' · ');
+            }
+            // A phase label from the child snapshot must not hide its explicit
+            // recovery/wait/operator state. Stop presentation still takes priority.
+            if (!m.web_control_pending && state !== 'STOPPING' &&
+                    !(state === 'RECOVERY' && m.stop_confirmed === false)) {
+                const handling = m.handling_status || m.pm_handling_status;
+                if (handling === 'AUTO_RECOVERING') view.label = 'Auto correcting alignment';
+                else if (handling === 'WAITING_FOR_SENSOR') view.label = 'Waiting for sensor';
+                else if (handling === 'NEED_OPERATOR') view.label = 'Operator check required';
+                else if (handling === 'FAILED') view.label = 'Failed';
             }
             view.detail = '';
             return view;

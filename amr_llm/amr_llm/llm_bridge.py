@@ -222,7 +222,14 @@ class LLMBridge:
         try:
             self._pub_cmd.publish(String(data=json.dumps({"internal_abort": True})))
         finally:
-            self.last_status = None
+            self.clear_status("idle", "Phiên nhiệm vụ đã được làm mới")
+
+    def clear_status(self, state="idle", message="Sẵn sàng"):
+        """Replace the cached execution result and notify every connected UI."""
+        data = {"state": state, "msg": message, "run_id": None,
+                "operation_id": None, "mission_state": "unknown"}
+        self.last_status = data
+        self._broadcast({"type": "llm_status", "data": data})
 
     # ------------------------------------------------------------ web -> ROS
     @staticmethod
@@ -255,6 +262,7 @@ class LLMBridge:
                 if problem:
                     return self._resp(name, "error", problem)
                 self._session_reset = False
+                self.clear_status("pending", "Đang nhận yêu cầu mới")
                 envelope = {"text": text, "language": language}
                 if confidence is not None:
                     envelope["speech_confidence"] = confidence

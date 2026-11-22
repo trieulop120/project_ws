@@ -20,6 +20,7 @@
     window.currentMissionSupervisorStatus = null;
     window.currentPalletRetrievalStatus = null;
     window.latestNavState = null;
+    window.currentNavigationSessionId = null;
     let isMissionActive = false;
     let navStarting = false;
     let navStopping = false;  // B21 Fix: Cờ báo đang dừng - phòng thủ frontend
@@ -737,8 +738,12 @@
         const owner = window.getMissionOwner();
         const m = window.currentMissionSupervisorStatus;
         const state = m?.state || 'UNKNOWN';
+        const returnHomeUnconfirmed = state === 'DONE' && m?.active_mission === 'return_home' &&
+            (m?.nav_mission?.state !== 'SUCCEEDED' || m?.nav_goal_active !== false ||
+             m?.nav_status_fresh !== true || m?.robot_stopped !== true);
         const active = ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
-            'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING'].includes(state) || m?.web_control_pending;
+            'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING'].includes(state) ||
+            m?.web_control_pending || returnHomeUnconfirmed;
         const autoStarted = window.autoMissionStartPending || active;
         const retrieval = window.currentPalletRetrievalStatus;
         const retrievalFresh = retrievalOwnsMissionCard();
@@ -1118,8 +1123,14 @@
         const retrievalTerminal = retrieval &&
             ['DONE', 'FAILED', 'CANCELED', 'STOPPED'].includes(retrieval.state);
         const supervisor = window.currentMissionSupervisorStatus;
+        const returnHomeUnconfirmed = supervisor?.state === 'DONE' &&
+            supervisor?.active_mission === 'return_home' &&
+            (supervisor?.nav_mission?.state !== 'SUCCEEDED' ||
+             supervisor?.nav_goal_active !== false || supervisor?.nav_status_fresh !== true ||
+             supervisor?.robot_stopped !== true);
         const supervisorActive = ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
-            'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING'].includes(supervisor?.state) || supervisor?.web_control_pending;
+            'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING'].includes(supervisor?.state) ||
+            supervisor?.web_control_pending || returnHomeUnconfirmed;
 
         if (retrievalTerminal && retrievalOwnsMissionCard() && !supervisorActive) {
             window.clearPalletRetrievalMissionStatus?.();
@@ -1777,8 +1788,10 @@
         }
 
         window.notifyMissionError(owner, view);
-        const recentHistory = window.currentMissionSupervisorStatus?.recent_missions;
-        if (Array.isArray(recentHistory)) renderRecentMissions(recentHistory);
+        const recentStatus = window.currentMissionSupervisorStatus;
+        const recentHistory = recentStatus?.navigation_session_id === window.currentNavigationSessionId
+            ? recentStatus.recent_missions : null;
+        renderRecentMissions(Array.isArray(recentHistory) ? recentHistory : []);
         updateMissionButtons();
         if (typeof window.updateOverviewNavigationState === 'function') {
             window.updateOverviewNavigationState(window.latestNavState, window.currentMissionSupervisorStatus);
@@ -1960,6 +1973,11 @@
         };
         navState.received_at = Date.now();
         window.latestNavState = navState;
+        if (data.navigation_session_id &&
+                data.navigation_session_id !== window.currentNavigationSessionId) {
+            window.currentNavigationSessionId = data.navigation_session_id;
+            renderRecentMissions([]);
+        }
         if (currentOpMode === 'MANUAL' && Number.isFinite(data.elapsed_s)) {
             missionElapsedMs = Math.max(0, data.elapsed_s * 1000);
             missionStartedAt = data.goal_active ? Date.now() - missionElapsedMs : 0;

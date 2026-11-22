@@ -53,6 +53,7 @@ class RetrievalStagingTests(unittest.TestCase):
         n._state, n._mode = 'READY', 'retrieval_align'
         n._checkpoint = None
         n._operation_id = 0
+        n._det_proc = None
         n._resume_operation_id = None
         n._retrieval_mode = False
         n._retrieval_align_only = False
@@ -74,6 +75,11 @@ class RetrievalStagingTests(unittest.TestCase):
         n._retrieval_pick_nav_elapsed = 0.
         n._retrieval_nav_t = self.now
         n._retrieval_nav_active = False
+        n._tf_miss = 0
+        n._tf_wait_since = None
+        n._range_wait_since = None
+        n._waiting_sensor = ''
+        n._sensor_return_state = None
         n._ctl = self.ns['ApproachController'](n.p, 1.2, align_only=True)
         n._drop_odom_t = self.now
         n._drop_odom_speed = (0., 0.)

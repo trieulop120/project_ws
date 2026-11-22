@@ -72,7 +72,9 @@ install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
 
-# (config/ removed: the pallet detector has no YAML, settings are in the node)
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME}
+)
 
 # =========================================================================
 # Install Weights (OpenVINO model directory)

@@ -54,6 +54,7 @@ from rclpy.qos import (QoSProfile, DurabilityPolicy, ReliabilityPolicy,
                        qos_profile_sensor_data)
 
 from amr_mission_manager.shelf_model import ShelfModel, UNKNOWN, EMPTY, FULL
+from amr_mission_manager.mission_queue import normalize_mission_queue, task_after_placement, mission_start_blockers
 
 NODE_NAME = 'mission_supervisor'
 
@@ -84,6 +85,7 @@ DEFAULTS = {
     'target_cargo_class': '',      # '' | 'medium' | 'tall'
     'target_quantity': 1,          # applied to run_mode=single
     'target_drop_slot': '',        # '' = supervisor priority | exact A1/A2/B1/B2 for one LLM cycle
+    'target_queue_json': '',       # ordered bounded tasks owned by this supervisor run
     # W4 (loi 2 ESP serial -> /shelf/occupancy): 4 bit o ke, 1 = co hang;
     # -1 = mat lien lac. Anh xa bit -> o va thiet ke ke: config/shelf.yaml
     # (doc bang shelf_model). KHONG CON drop_bin_fallback: khong ro (mat
@@ -223,6 +225,8 @@ class MissionSupervisor(Node):
         self._await_operation_after = None
         self._await_resume_checkpoint = None
         self._pm_recovery = None
+        self._pm_handling_status = None
+        self._pm_waiting_for = None
         self._recovery_stop_future = None
         self._recovery_cancel_future = None
         self._recovery_still_since = None
@@ -233,6 +237,12 @@ class MissionSupervisor(Node):
         self._navigation_stop_requests = []
         self._manager_busy = None
         self._manager_status_t = 0.0
+        self._manager_status_wall_t = 0.0
+        self._manager_status_run_id = None
+        self._mission_queue = []
+        self._mission_task_index = 0
+        self._task_placed = 0
+        self._mission_target_total = 0
         self._empty_scans = 0
         self._cancel_requested = False
         self._mission_epoch = 0
@@ -377,6 +387,19 @@ class MissionSupervisor(Node):
         self._start_refusals = 0
         self.get_logger().info(f'[{state}] {msg}')
 
+    def _handling_status(self):
+        """Fine-grained safety activity while keeping the legacy mission state."""
+        if (self._pm_status_t > 0.0 and time.monotonic() - self._pm_status_t <= 1.5
+                and self._pm_handling_status in ('AUTO_RECOVERING', 'WAITING_FOR_SENSOR')):
+            return self._pm_handling_status
+        if (self._pm_handling_status == 'NEED_OPERATOR'
+                and (self._stop_confirmed is True
+                     or (self._pm_recovery or {}).get('stop_confirmed') is True)):
+            return 'NEED_OPERATOR'
+        if self._state == FAILED:
+            return FAILED
+        return self._state
+
     def _base_pose(self):
         """Pose cua xe trong map: (x, y, yaw) hoac None."""
         try:
@@ -519,11 +542,17 @@ class MissionSupervisor(Node):
     def _on_mission_nav_status(self, msg: String):
         try:
             data = json.loads(msg.data)
-            self._manager_busy = data.get('busy')
-            self._manager_status_t = time.monotonic()
             mission = str(data.get('mission') or '')
             state = str(data.get('state') or '').upper()
             stamp = float(data.get('timestamp') or time.time())
+            # Mission Manager may publish terminal/idle before an older busy
+            # heartbeat is delivered. Never let that delayed sample re-lock Start.
+            if stamp < self._manager_status_wall_t:
+                return
+            self._manager_status_wall_t = stamp
+            self._manager_busy = data.get('busy')
+            self._manager_status_run_id = data.get('run_id')
+            self._manager_status_t = time.monotonic()
             if mission != self._mission_nav_expected or stamp < self._mission_nav_attempt_t:
                 return
             run_id = data.get('run_id')
@@ -536,6 +565,7 @@ class MissionSupervisor(Node):
                     return
             self._mission_nav_status = {
                 'run_id': run_id,
+                'busy': data.get('busy'),
                 'mission': mission, 'state': state,
                 'reason': str(data.get('reason') or ''),
                 'nav_mode': data.get('nav_mode'),
@@ -552,13 +582,26 @@ class MissionSupervisor(Node):
             return self._start_operation(req, res)
 
     def _start_operation(self, req, res):
-        if (getattr(self, '_tick_inflight', False) or self._state == 'STOPPING' or
-                getattr(self, '_discard_requested', False)):
-            res.success, res.message = False, 'Previous mission is still stopping'
+        # Keep unresolved service outcomes as hard blockers. A stale manager
+        # busy flag, however, can be superseded only by same-run terminal idle.
+        unresolved = sum(not f.done() for f in self._pending_service_futures)
+        terminal_idle = self._confirmed_terminal_idle()
+        blockers = mission_start_blockers(
+            stopping=(self._state == 'STOPPING'),
+            discarding=getattr(self, '_discard_requested', False),
+            tick_inflight=getattr(self, '_tick_inflight', False),
+            unresolved_services=unresolved, manager_busy=self._manager_busy,
+            terminal_idle_confirmed=terminal_idle)
+        if blockers:
+            detail = '; '.join(blockers)
+            self.get_logger().warning(
+                f'[mission/start] rejected: {detail}; state={self._state}, '
+                f'busy={self._manager_busy}, manager_run={self._manager_status_run_id}, '
+                f'run_id={self._run_id}, nav={self._mission_nav_status}, '
+                f'terminal_idle={terminal_idle}')
+            res.success, res.message = False, f'Không thể bắt đầu mission: {detail}'
             return res
-        if any(not f.done() for f in self._pending_service_futures) or self._manager_busy is True:
-            res.success, res.message = False, 'Previous operation outcome is unconfirmed'
-            return res
+
         route_age = (time.monotonic() - self._route_path_last_received
                      if self._route_path_last_received > 0.0 else float('inf'))
         if self._route_loader is None or route_age > 6.0:
@@ -584,11 +627,12 @@ class MissionSupervisor(Node):
             res.success = False
             res.message = 'Nav2 dang co goal khac; hay ket thuc/huy goal truoc khi bat dau chu trinh'
             return res
+
         # Nạp lại các tham số mission (web/GUI/CLI có thể đã set qua
         # ros2 param set mission_supervisor ... TRƯỚC khi gọi /mission/start)
         # - override hot, không cần restart.
         for k in ('pick_mission', 'drop_mission', 'pick_dest', 'run_mode',
-                  'target_cargo_class', 'target_quantity', 'target_drop_slot',
+                  'target_cargo_class', 'target_quantity', 'target_drop_slot', 'target_queue_json',
                   'pm_final_window_s', 'pm_min_samples', 'pm_max_pos_std_m',
                   'pm_max_yaw_std_deg', 'pm_max_sample_age_s',
                   'pm_require_stable'):
@@ -615,10 +659,27 @@ class MissionSupervisor(Node):
             res.success = False
             res.message = 'target_drop_slot must be empty, A1, A2, B1, or B2'
             return res
-        if target_drop_slot and target_quantity != 1:
+        if target_drop_slot and target_quantity != 1 and not self.p.get('target_queue_json'):
             res.success = False
             res.message = 'A fixed shelf slot only accepts one pallet per mission'
             return res
+        try:
+            self._mission_queue = normalize_mission_queue(
+                self.p.get('target_queue_json', ''),
+                {'cargo_class': target_class or 'any', 'quantity': target_quantity,
+                 'drop_slot': target_drop_slot or 'auto'}) if requested_mode == 'single' else []
+        except ValueError as exc:
+            res.success, res.message = False, str(exc)
+            self.get_logger().warning(f'[mission/start] rejected: invalid task queue: {exc}')
+            return res
+        self._mission_task_index = 0
+        self._task_placed = 0
+        self._mission_target_total = sum(t['quantity'] for t in self._mission_queue)
+        if self._mission_queue:
+            first = self._mission_queue[0]
+            target_class, target_quantity, target_drop_slot = (
+                '' if first['cargo_class'] == 'any' else first['cargo_class'],
+                first['quantity'], '' if first['drop_slot'] == 'auto' else first['drop_slot'])
         if target_drop_slot and self._shelf_model is not None:
             slot_cfg = self._shelf_model._slot_by_id.get(target_drop_slot)
             slot_class = ('medium' if slot_cfg and slot_cfg.product_type == 'A'
@@ -638,6 +699,17 @@ class MissionSupervisor(Node):
                 res.success = False
                 res.message = f'No compatible shelf slot for {target_class}: {why}'
                 return res
+
+        # The queue belongs to this accepted run. Consume the parameter so a
+        # later GUI/CLI start that does not provide a queue cannot replay it.
+        if self.p.get('target_queue_json'):
+            cleared = self.set_parameters([Parameter('target_queue_json', value='')])
+            if not cleared or not cleared[0].successful:
+                res.success = False
+                res.message = 'Could not consume target_queue_json; refusing to start with reusable queue state'
+                self.get_logger().error('[mission/start] rejected: failed to clear consumed target_queue_json')
+                return res
+            self.p['target_queue_json'] = ''
 
         # Canh bao nhat quan: `pick_dest` va `pick_mission` phai tro cung mot
         # diem. Khong tu sua (nguoi van hanh can thay), chi bao ro.
@@ -689,6 +761,21 @@ class MissionSupervisor(Node):
         res.success = True
         res.message = 'start'
         return res
+
+    def _confirmed_terminal_idle(self):
+        """Whether same Mission Manager run ended and Nav2 freshly reports idle."""
+        return (self._state in (DONE, FAILED, STOPPED)
+                and self._mission_nav_status is not None
+                and self._mission_nav_run_id is not None
+                and self._mission_nav_status.get('run_id') == self._mission_nav_run_id
+                and self._manager_status_run_id == self._mission_nav_run_id
+                and self._mission_nav_status.get('state') in ('SUCCEEDED', 'ABORTED', 'CANCELED')
+                and self._mission_nav_status.get('busy') is False
+                and self._manager_status_t > 0.0
+                and time.monotonic() - self._manager_status_t <= 5.0
+                and self._nav_goal_active is False
+                and self._nav_status_t > 0.0
+                and time.monotonic() - self._nav_status_t <= 2.0)
 
     def _stop_after_late_request(self):
         if self._cancel_requested and self._state in ('STOPPING', 'RECOVERY'):
@@ -1204,6 +1291,8 @@ class MissionSupervisor(Node):
         self._pm_operation_id = d.get('operation_id', -1)
         self._pm_session_id = d.get('session_id')
         self._pm_recovery = d.get('recovery')
+        self._pm_handling_status = d.get('handling_status')
+        self._pm_waiting_for = d.get('waiting_for')
         self._pm_state = d.get('state')
         self._pm_phase = d.get('phase')
         self._pm_lift = d.get('lift_cm')
@@ -1245,6 +1334,10 @@ class MissionSupervisor(Node):
 
     def _navigation_idle(self, now: float) -> bool:
         """Only hand control to pallet_mission after the Nav2 goal has ended."""
+        # GoalStatusArray is periodic and can be slower than the 10 Hz mission
+        # tick. A stale-but-idle sample must not deadlock a completed pallet
+        # operation; the pallet action's terminal DONE plus latest inactive
+        # state establishes the handoff without accepting an active goal.
         return (self._nav_status_t > 0.0 and self._nav_goal_active is False
                 and not any(not f.done() for f in self._navigation_stop_requests))
 
@@ -1257,7 +1350,7 @@ class MissionSupervisor(Node):
         result = self._mission_nav_status
         if not result or self._mission_nav_status_t <= self._mission_nav_consumed_t:
             return
-        if result.get('state') not in ('ABORTED', 'CANCELED'):
+        if result.get('state') not in ('ABORTED', 'CANCELED', 'FAILED'):
             return
         if self._state not in (GOTO_PICK, GOTO_D, 'RETURN_HOME'):
             return
@@ -1324,8 +1417,7 @@ class MissionSupervisor(Node):
     # (ENTER va LOCK bi loai: mui cang da sat/qua mat, can nguoi kiem tra)
     # DETECT_DRIFT xay ra tai diem lay, robot dung yen, chua cham vao pallet.
     # ENTER va LOCK co tinh khong an toan de tu dong retry, khong them vao day.
-    SAFE_RETRY_PHASES = ('RETREAT', 'ALIGN', 'SIDE_TURN', 'SIDE_DRIVE',
-                         'CONVERGE', 'GATE', 'DETECT_DRIFT')
+    SAFE_RETRY_PHASES = ('DETECT_DRIFT',)
 
     def _drop_refused(self, now, why: str):
         """pallet_mission tu choi Drop (xe KHONG chuyen dong): thu lai vai lan roi moi RECOVERY,
@@ -1339,11 +1431,24 @@ class MissionSupervisor(Node):
         self._resume_state = DROPPING
 
     def _can_auto_retry(self, used: int) -> bool:
-        return (not (self._pm_recovery or {}).get('checkpoint')
-                and used < int(self.p['approach_retries'])
-                and not self._pm_insertion_only
-                and self._pm_fail_phase in self.SAFE_RETRY_PHASES
-                and not self._cancel_requested)
+        blockers = []
+        if (self._pm_recovery or {}).get('checkpoint'):
+            blockers.append('child checkpoint owns the interrupted operation')
+        if self._pm_insertion_only:
+            blockers.append('raised forks/insertion-only; a new operation could duplicate DROP')
+        if self._pm_fail_phase not in self.SAFE_RETRY_PHASES:
+            blockers.append(f'phase {self._pm_fail_phase!r} is not a supervisor retry phase')
+        if used >= int(self.p['approach_retries']):
+            blockers.append('supervisor retry budget exhausted')
+        if self._cancel_requested:
+            blockers.append('cancel requested')
+        if blockers:
+            self.get_logger().warn(
+                f'[AUTO_RETRY_DENIED] phase={self._pm_fail_phase} '
+                f'operation_id={self._pm_operation_id}: ' + '; '.join(blockers),
+                throttle_duration_sec=5.0)
+            return False
+        return True
 
     def _shelf_states(self) -> dict:
         """Trang thai 4 o (A1/A2/B1/B2) tu /shelf/occupancy + shelf.yaml.
@@ -1475,12 +1580,12 @@ class MissionSupervisor(Node):
 
     def _start_return_home(self, why):
         incomplete = (self.p.get('run_mode') == 'single'
-                      and self._cycle < int(self.p.get('target_quantity', 1)))
+                      and self._cycle < int(self._mission_target_total or self.p.get('target_quantity', 1)))
         self._terminal_after_home = FAILED if incomplete else DONE
         if incomplete:
             requested = self.p.get('target_cargo_class') or 'any'
             why = (f'Mission incomplete: placed {self._cycle}/'
-                   f'{self.p.get("target_quantity", 1)} {requested}; {why}')
+                   f'{self._mission_target_total or self.p.get("target_quantity", 1)} {requested}; {why}')
         self._terminal_reason = why
         self._active_mission, self._active_dest = 'return_home', 'NODE_HOME'
         self._triggered, self._near_t0 = False, None
@@ -1700,15 +1805,55 @@ class MissionSupervisor(Node):
             self._t_state = now
             return
         if self._pm_state == DONE and self._pm_cargo is False:
+            # The pallet operation reaches DONE only after its owned Nav2 goal
+            # is terminal; also require the supervisor's latest status not to
+            # show an active goal before changing task or reporting completion.
+            if not self._navigation_idle(now):
+                nav_age = (now - self._nav_status_t if self._nav_status_t > 0.0
+                           else float('inf'))
+                pending_stops = sum(not f.done() for f in self._navigation_stop_requests)
+                self.get_logger().warn(
+                    f'[DROPPING] pallet operation DONE/cargo=false; waiting for Nav2 idle: '
+                    f'goal_active={self._nav_goal_active}, status_age={nav_age:.1f}s, '
+                    f'pending_stop_services={pending_stops}', throttle_duration_sec=5.0)
+                return
+            if not self._drop_slot_chosen:
+                self._set_state('RECOVERY', 'DROP reported DONE without a validated shelf slot')
+                self._resume_state = DROPPING
+                return
             if self._drop_slot_chosen:
                 self._reserved_drop_slots.add(self._drop_slot_chosen[0])
             self._cycle += 1
+            self._task_placed += 1
             self._drop_retries = 0
             self._go_called = False
+            transition, next_index = (task_after_placement(self._mission_queue,
+                                  self._mission_task_index, self._task_placed)
+                                  if self.p.get('run_mode') == 'single' and self._mission_queue
+                                  else ('complete', self._mission_task_index))
+            if transition == 'next':
+                self._mission_task_index = next_index
+                self._task_placed = 0
+                task = self._mission_queue[next_index]
+                self.p['target_cargo_class'] = '' if task['cargo_class'] == 'any' else task['cargo_class']
+                self.p['target_quantity'] = task['quantity']
+                self.p['target_drop_slot'] = '' if task['drop_slot'] == 'auto' else task['drop_slot']
+                if not self._requested_slot_available():
+                    self._start_return_home('Mission queue task has no compatible empty shelf slot')
+                    return
+                self._pick_queue = self._build_pick_queue()
+                self._pick_idx = 0
+                self._active_dest = self._current_pick_dest()
+                self._active_mission = self._mission_from_d1(self._active_dest)
+                self._triggered, self._near_t0 = False, None
+                self._set_state(GOTO_PICK,
+                    f'Queue task {next_index + 1}/{len(self._mission_queue)}: '
+                    f'{task["cargo_class"]} -> {task["drop_slot"]}; D_1 to {self._active_dest}')
+                return
             if self.p.get('run_mode') == 'auto' and (not self._shelf_ok() or self._shelf_bits is None):
                 self._start_return_home('Da dat pallet; cam bien ke mat ket noi nen dung Auto')
             elif (self.p.get('run_mode') == 'auto'
-                  or self._cycle < int(self.p.get('target_quantity', 1))):
+                  or transition == 'repeat'):
                 if not self._requested_slot_available():
                     self._start_return_home('Da het o ke phu hop voi loai hang can lay')
                     return
@@ -1723,6 +1868,12 @@ class MissionSupervisor(Node):
             else:
                 self._start_return_home('Hoan tat chu ky' if self.p.get('run_mode') != 'auto'
                                          else 'Ke da day')
+        elif self._pm_state == DONE and self._pm_cargo is not False:
+            self.get_logger().warn(
+                f'[DROPPING] pallet node DONE but cargo is not confirmed false: '
+                f'cargo={self._pm_cargo}, operation_id={self._pm_operation_id}, '
+                f'pm_status_age={now - self._pm_status_t:.1f}s',
+                throttle_duration_sec=5.0)
         elif self._pm_state == FAILED and now - self._t_state > 1.5:
             if self._can_auto_retry(self._drop_retries):
                 self._drop_retries += 1
@@ -1779,6 +1930,23 @@ class MissionSupervisor(Node):
                 self._resume_state = 'RETURN_HOME'
             return
         if math.hypot(pose[0] - dest[0], pose[1] - dest[1]) <= float(self.p['arrive_tol_m']):
+            result = self._mission_nav_status or {}
+            confirmed = (self._mission_nav_run_id is not None
+                         and result.get('run_id') == self._mission_nav_run_id
+                         and result.get('mission') == 'return_home'
+                         and result.get('state') == 'SUCCEEDED'
+                         and result.get('busy') is False
+                         and self._manager_status_run_id == self._mission_nav_run_id
+                         and self._manager_busy is False
+                         and self._manager_status_t > 0.0
+                         and now - self._manager_status_t <= 5.0
+                         and self._nav_status_t > 0.0
+                         and now - self._nav_status_t <= 2.0
+                         and self._navigation_idle(now)
+                         and self._robot_stopped(now))
+            if not confirmed:
+                self._near_t0 = None
+                return
             self._near_t0 = self._near_t0 or now
             if now - self._near_t0 >= float(self.p['arrive_settle_s']):
                 # Ve HOME xong NHUNG van giu pallet: khong co o ke de dat, va
@@ -1795,6 +1963,8 @@ class MissionSupervisor(Node):
                                         f'{self.p.get("target_quantity", 1)}')
                     else:
                         self._set_state(DONE, f'Ve HOME xong; da dat {self._cycle} pallet len ke')
+        else:
+            self._near_t0 = None
 
     def _tick(self):
         if self._state == 'STOPPING':
@@ -2150,6 +2320,8 @@ class MissionSupervisor(Node):
         can_start = (self._state in (IDLE, DONE, FAILED, STOPPED)
                      and not (self._pm_recovery or {}).get('checkpoint')
                      and not self._discard_requested and not self._tick_inflight
+                     and not any(not f.done() for f in self._pending_service_futures)
+                     and (self._manager_busy is not True or self._confirmed_terminal_idle())
                      and self._nav_goal_active is not True)
         stop_reason = self._stop_blocked() if self._state in ('STOPPING', 'RECOVERY') else ''
         elapsed = self._elapsed_active_s + (max(0., now - self._active_since) if self._active_since is not None else 0.)
@@ -2184,6 +2356,7 @@ class MissionSupervisor(Node):
         d = {
             'supervisor_session_id': self._supervisor_session_id,
             'run_id': self._run_id,
+            'operation_id': self._pm_operation_id,
             'revision': self._revision,
             'resume_revision': self._resume_revision,
             'elapsed_s': round(elapsed, 1),
@@ -2192,6 +2365,7 @@ class MissionSupervisor(Node):
             'cancel_pending': self._discard_requested,
             'stop_reason': stop_reason or getattr(self, '_stop_reason', ''),
             'state': self._state,
+            'handling_status': self._handling_status(),
             'msg': self._msg,
             'progress_percent': progress_percent,
             'progress_phase': progress_phase,
@@ -2203,13 +2377,16 @@ class MissionSupervisor(Node):
             'cycle': {
                 'run_mode': self.p.get('run_mode', 'single'),
                 'number': self._cycle,
-                'placed': self._cycle,
+                'placed': self._task_placed if self._mission_queue else self._cycle,
                 'target_quantity': (int(self.p.get('target_quantity', 1))
                                     if self.p.get('run_mode') == 'single' else None),
                 'target_cargo_class': (self.p.get('target_cargo_class') or 'any'
                                        if self.p.get('run_mode') == 'single' else None),
                 'target_drop_slot': (self.p.get('target_drop_slot') or 'auto'
                                      if self.p.get('run_mode') == 'single' else None),
+                'task_index': (self._mission_task_index + 1 if self._mission_queue else None),
+                'task_count': len(self._mission_queue) if self._mission_queue else None,
+                'task_placed': self._task_placed if self._mission_queue else None,
                 'pick_mission': self.p['pick_mission'],
                 'drop_mission': self.p['drop_mission'],
             },
@@ -2257,6 +2434,8 @@ class MissionSupervisor(Node):
                 'age_s': detector_age,
             },
             'pm_state': self._pm_state,
+            'pm_handling_status': self._pm_handling_status,
+            'pm_waiting_for': self._pm_waiting_for,
             'pm_status_fresh': pm_fresh,
             'pm_status_age_s': (round(now - self._pm_status_t, 2)
                                 if self._pm_status_t > 0.0 else None),
@@ -2302,8 +2481,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
         executor.shutdown()
+        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
