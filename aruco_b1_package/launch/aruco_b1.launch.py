@@ -10,7 +10,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('marker_x', default_value='0.0'),
         DeclareLaunchArgument('marker_y', default_value='0.0'),
-        DeclareLaunchArgument('marker_z', default_value='0.122'),
+        DeclareLaunchArgument('marker_z', default_value='0.115'),
         Node(
             package='aruco_b1_package',
             executable='aruco_b1_localizer',
@@ -19,7 +19,7 @@ def generate_launch_description():
             parameters=[{
                 'marker_id': 0,
                 'dictionary': 'DICT_4X4_50',
-                'marker_size_m': 0.10,
+                'marker_size_m': 0.15,
                 'marker_xyz_slot_m': ParameterValue(
                     PythonExpression([
                         '[', LaunchConfiguration('marker_x'), ', ',

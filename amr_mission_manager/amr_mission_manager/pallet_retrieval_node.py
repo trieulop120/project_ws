@@ -24,6 +24,7 @@ detection, then performs its separate alignment before raising the forks.
 """
 
 import math
+import json
 import os
 import traceback
 import threading
@@ -67,6 +68,12 @@ def detector_counts(status):
     if counts[1] > counts[0]:
         return None, 'localized_pallets'
     return tuple(counts), None
+
+
+def status_counter(status, field):
+    """JSON null/bool/missing must never be treated as an operation counter."""
+    value = status.get(field) if isinstance(status, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 class PalletRetrievalNode(Node):
@@ -207,38 +214,43 @@ class PalletRetrievalNode(Node):
             self._candidate_t = time.monotonic()
 
     def _on_detection_status(self, msg):
-        try:
-            import json
-            data = json.loads(msg.data)
+        data = self._decode_status(msg, 'detection')
+        if data is not None:
             with self._lock:
                 self._detection_status = data
                 self._detection_status_t = time.monotonic()
-        except Exception:
-            pass
+
+    def _decode_status(self, msg, source):
+        try:
+            data = json.loads(msg.data)
+            if not isinstance(data, dict):
+                raise ValueError('JSON status must be an object')
+            return data
+        except (ValueError, TypeError) as exc:
+            self.get_logger().warn(f'Ignoring invalid {source} status: {exc}',
+                                   throttle_duration_sec=5.0)
+            return None
 
     def _on_pm_status(self, msg):
-        try:
+        data = self._decode_status(msg, 'pallet_mission')
+        if data is not None:
             with self._lock:
-                self._pm_status = __import__('json').loads(msg.data)
+                self._pm_status = data
                 self._pm_status_t = time.monotonic()
-        except Exception:
-            pass
 
     def _on_supervisor(self, msg):
-        try:
+        data = self._decode_status(msg, 'supervisor')
+        if data is not None:
             with self._lock:
-                self._supervisor = __import__('json').loads(msg.data)
+                self._supervisor = data
                 self._supervisor_t = time.monotonic()
-        except Exception:
-            pass
 
     def _on_mission_status(self, msg):
-        try:
+        data = self._decode_status(msg, 'mission_manager')
+        if data is not None:
             with self._lock:
-                self._mission_status = __import__('json').loads(msg.data)
+                self._mission_status = data
                 self._mission_status_t = time.monotonic()
-        except Exception:
-            pass
 
     def _status(self, state, message, slot=None, nav_leg=None, resuming=None, discarded=False):
         with self._lock:
@@ -267,6 +279,9 @@ class PalletRetrievalNode(Node):
             cargo = cargo if isinstance(cargo, bool) else None
             payload = dict(self._last_status)
             payload['run_id'] = self._run_id
+            # This handle belongs to this retrieval worker's current stance goal.
+            # Global Nav2 status can also include unrelated goals.
+            payload['nav_goal_active'] = self._active_nav_goal is not None
             payload['resume_revision'] = self._resume_revision
             payload['resuming'] = self._resume_in_progress and self._run_lock.locked()
             payload['discard_pending'] = self._discard_pending
@@ -738,7 +753,7 @@ class PalletRetrievalNode(Node):
             if not saw_inference_frame:
                 time.sleep(0.05)
                 continue
-            if msg is None or seen < enabled_at or time.monotonic() - seen > 1.0:
+            if msg is None or seen < enabled_at or time.monotonic() - seen > 2.0:
                 time.sleep(0.05)
                 continue
             if seen <= last_seen:
@@ -769,7 +784,7 @@ class PalletRetrievalNode(Node):
                     distance = math.dist(candidate[:3], previous[:3])
                     dyaw = abs(math.atan2(math.sin(candidate[3] - previous[3]),
                                           math.cos(candidate[3] - previous[3])))
-                    stable = stable + 1 if distance <= 0.05 and dyaw <= math.radians(5.0) else 1
+                    stable = stable + 1 if distance <= 0.10 and dyaw <= math.radians(10.0) else 1
                 else:
                     stable = 1
                 previous = candidate
@@ -818,7 +833,6 @@ class PalletRetrievalNode(Node):
                 break
             time.sleep(0.02)
         if not future.done():
-            future.add_done_callback(lambda _: self._stop_for_recovery())
             return None
         return future.result()
 
@@ -860,14 +874,17 @@ class PalletRetrievalNode(Node):
 
     def _wait_pm_state(self, states, timeout, after_t=0.0, after_operation_id=None, after_resume_id=0):
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while rclpy.ok():
             self._raise_if_cancelled()
             with self._lock:
                 data = self._pm_status
                 status_t = self._pm_status_t
-            if (status_t < after_t or (data or {}).get('last_resumed_checkpoint_id', 0) < after_resume_id
+            resume_id = status_counter(data, 'last_resumed_checkpoint_id')
+            operation_id = status_counter(data, 'operation_id')
+            if (status_t < after_t or (after_resume_id > 0 and
+                    (resume_id is None or resume_id < after_resume_id))
                     or (after_operation_id is not None
-                    and (data or {}).get('operation_id', -1) <= after_operation_id)):
+                    and (operation_id is None or operation_id <= after_operation_id))):
                 time.sleep(0.1)
                 continue
             state = data.get('state') if data else None
@@ -875,8 +892,14 @@ class PalletRetrievalNode(Node):
                 return data
             if state in ('FAILED', 'STOPPED'):
                 raise RuntimeError(data.get('msg') or 'Pallet mission failed')
+            if time.monotonic() >= deadline:
+                self._status('AUTO_RECOVERING' if state in (
+                    'AUTO_RECOVERING', 'WAITING_FOR_SENSOR') else 'WAITING_FOR_SENSOR',
+                    f'Waiting for pallet operation {after_operation_id} to reach {sorted(states)}; '
+                    f'current={state or "unknown"}', self._resume_slot)
+                deadline = time.monotonic() + timeout
             time.sleep(0.1)
-        raise RuntimeError(f'Pallet mission did not reach {states}')
+        raise RuntimeError('ROS shutdown while waiting for pallet operation')
 
     def _stop_for_recovery(self):
         if self._recovery_pm_session is None:
@@ -974,17 +997,23 @@ class PalletRetrievalNode(Node):
             if not client.wait_for_service(timeout_sec=1.):
                 raise RuntimeError(f'Service unavailable before issuing mechanical step: {client.srv_name}')
             issued = time.monotonic()
-            self._issued_stages[stage] = {'time': issued, 'operation_id': (self._pm_status or {}).get('operation_id', -1)}
+            prior_id = status_counter(self._pm_status, 'operation_id')
+            if prior_id is None:
+                raise RuntimeError('Pallet operation ID missing or invalid; mechanical step not sent')
+            self._issued_stages[stage] = {'time': issued, 'operation_id': prior_id}
             result = self._wait_future(client.call_async(Trigger.Request()), 15.)
             if result is not None and not result.success:
                 self._issued_stages.pop(stage, None)  # explicit refusal means no accepted step
                 raise RuntimeError(result.message)
             if result is None:
-                raise RuntimeError('Mechanical request outcome unknown; inspect its checkpoint')
+                self.get_logger().warn(
+                    f'Mechanical request outcome unknown for stage {stage}; '
+                    'waiting for operation ID/status without replay')
         elif not self._resumed_pm_after:
             pm = self._pm_status or {}
             if (pm.get('state') not in states or self._pm_status_t < issued['time']
-                    or pm.get('operation_id', -1) <= issued['operation_id']):
+                    or (status_counter(pm, 'operation_id') is None
+                        or status_counter(pm, 'operation_id') <= issued['operation_id'])):
                 raise RuntimeError('Interrupted mechanical step has no validated checkpoint')
         record = self._issued_stages[stage]
         return self._wait_pm_state(states, timeout, after_t=max(record['time'], self._resumed_pm_after),
@@ -1005,6 +1034,12 @@ class PalletRetrievalNode(Node):
             self._navigate_to_slot_stance(slot)
         elif stage == 3:
             self._status('ALIGNING_TO_SLOT', f'Aligning to {slot}', slot)
+            target = self._slot_stance(slot)
+            radius = 0.20
+            if not self._stance_reached(target, radius):
+                self._status('AUTO_RECOVERING',
+                             f'Waiting pose for {slot} drifted; navigating back before alignment', slot)
+                self._navigate_to_slot_stance(slot)
             self._pm_step(self._align_cli, {'READY'}, 180.)
             self._wait_stance_stopped(self._slot_stance(slot), float(self.get_parameter('d1_abort_ok_m').value))
         elif stage == 4:
@@ -1050,7 +1085,27 @@ class PalletRetrievalNode(Node):
             self._selected_slot_pub.publish(String(data=slot))
             while self._resume_stage is not None and self._resume_stage < 10:
                 self._raise_if_cancelled()
-                self._run_step(self._resume_stage, slot)
+                try:
+                    self._run_step(self._resume_stage, slot)
+                except Exception as exc:
+                    # Before the alignment service accepts an operation the
+                    # forks are down and this stage has no mechanical effect.
+                    # Keep the selected slot/run and wait for fresh status;
+                    # the next iteration restages via Nav2 if necessary.
+                    pm = self._pm_status or {}
+                    if (self._resume_stage == 3
+                            and 3 not in self._issued_stages
+                            and not self._cancel_event.is_set()
+                            and pm.get('cargo') is False
+                            and pm.get('state') in ('IDLE', 'READY')):
+                        self._candidate_enable_pub.publish(Bool(data=False))
+                        self._status('AUTO_RECOVERING',
+                                     f'Alignment before insertion deferred: {exc}', slot)
+                        self.get_logger().warn(f'Retrieval {slot} alignment retry: {exc}',
+                                               throttle_duration_sec=5.0)
+                        time.sleep(0.5)
+                        continue
+                    raise
                 self._resume_stage += 1
                 self._resumed_pm_after = 0.
                 self._resumed_pm_id = 0

@@ -738,12 +738,9 @@
         const owner = window.getMissionOwner();
         const m = window.currentMissionSupervisorStatus;
         const state = m?.state || 'UNKNOWN';
-        const returnHomeUnconfirmed = state === 'DONE' && m?.active_mission === 'return_home' &&
-            (m?.nav_mission?.state !== 'SUCCEEDED' || m?.nav_goal_active !== false ||
-             m?.nav_status_fresh !== true || m?.robot_stopped !== true);
         const active = ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
             'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING'].includes(state) ||
-            m?.web_control_pending || returnHomeUnconfirmed;
+            m?.web_control_pending;
         const autoStarted = window.autoMissionStartPending || active;
         const retrieval = window.currentPalletRetrievalStatus;
         const retrievalFresh = retrievalOwnsMissionCard();
@@ -1123,14 +1120,9 @@
         const retrievalTerminal = retrieval &&
             ['DONE', 'FAILED', 'CANCELED', 'STOPPED'].includes(retrieval.state);
         const supervisor = window.currentMissionSupervisorStatus;
-        const returnHomeUnconfirmed = supervisor?.state === 'DONE' &&
-            supervisor?.active_mission === 'return_home' &&
-            (supervisor?.nav_mission?.state !== 'SUCCEEDED' ||
-             supervisor?.nav_goal_active !== false || supervisor?.nav_status_fresh !== true ||
-             supervisor?.robot_stopped !== true);
         const supervisorActive = ['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
             'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING'].includes(supervisor?.state) ||
-            supervisor?.web_control_pending || returnHomeUnconfirmed;
+            supervisor?.web_control_pending;
 
         if (retrievalTerminal && retrievalOwnsMissionCard() && !supervisorActive) {
             window.clearPalletRetrievalMissionStatus?.();
@@ -1716,8 +1708,9 @@
         if (detail) {
             // AUTO / retrieval statuses use the compact action/target/progress/elapsed
             // fields. Keep ROS diagnostic messages in logs, never in the mission card.
-            const message = currentOpMode === 'MANUAL' && owner.source === 'navigation' && !owner.stale
-                ? String(owner.status.task_message || '') : '';
+            const message = owner.source === 'supervisor' && !owner.stale && owner.status.state === 'DONE'
+                ? view.detail : currentOpMode === 'MANUAL' && owner.source === 'navigation' && !owner.stale
+                    ? String(owner.status.task_message || '') : '';
             detail.textContent = message;
             detail.hidden = !message;
         }

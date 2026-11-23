@@ -295,7 +295,14 @@ class SupervisorGUI(tk.Tk):
             pm_state = d.get('pm_state') or '-'
             pm_phase = d.get('pm_phase') or '-'
             n, nmin = d.get('pm_samples', 0), d.get('pm_min_samples', 0)
-            self._pm_var.set(f'Pallet: {pm_state}   phase: {pm_phase}   detect samples: {n}/{nmin}')
+            err, retries = d.get('pm_err') or {}, d.get('pm_retries') or {}
+            detail = ''
+            if d.get('pm_handling_status') in ('AUTO_RECOVERING', 'WAITING_FOR_SENSOR'):
+                detail = (f"   lateral: {err.get('lat_cm', '?')} cm"
+                          f"   yaw: {err.get('yaw_deg', '?')}°"
+                          f"   retry: {retries.get('alignment', '?')}"
+                          f"   reason: {d.get('pm_msg') or '-'}")
+            self._pm_var.set(f'Pallet: {pm_state}   phase: {pm_phase}   detect samples: {n}/{nmin}{detail}')
             det = d.get('detector') or {}
             self._detector_var.set(
                 f"Detector: {det.get('state', '-')} | seen {det.get('seen_pallets', 0)} "

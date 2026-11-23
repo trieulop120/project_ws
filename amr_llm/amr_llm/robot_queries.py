@@ -34,6 +34,7 @@ TOPICS = ('inventory', 'mission', 'cargo', 'lift', 'battery', 'health', 'navigat
           'eta', 'battery_runtime', 'clarification', 'capabilities', 'location',
           'mode', 'overview', 'llm_model', *PROFILE_ANSWERS)
 ACTIVE_RETRIEVAL = {'HOMING_LIFT', 'NAVIGATING_TO_D1', 'ALIGNING_TO_SLOT',
+                    'AUTO_RECOVERING', 'WAITING_FOR_SENSOR',
                     'LOADING_DETECTOR', 'DETECTING', 'PICKING', 'NAVIGATING_TO_D2',
                     'PLACING_AT_D2', 'RETURNING_HOME', 'CANCELING', 'RECOVERY'}
 
@@ -149,6 +150,10 @@ def build_context(*, supervisor=None, supervisor_age=None, pallet=None, pallet_a
         'handling_status': sup.get('handling_status', 'unknown') if sf else 'unknown',
         'pm_handling_status': sup.get('pm_handling_status', 'unknown') if sf else 'unknown',
         'pm_waiting_for': sup.get('pm_waiting_for') if sf else None,
+        'pm_phase': sup.get('pm_phase') if sf else None,
+        'pm_err': sup.get('pm_err') if sf and isinstance(sup.get('pm_err'), dict) else None,
+        'pm_retries': sup.get('pm_retries') if sf and isinstance(sup.get('pm_retries'), dict) else None,
+        'pm_message': str(sup.get('pm_msg') or '')[:300] if sf else '',
         'supervisor_status_age_s': supervisor_age,
         'supervisor_fresh': sf,
         'active_mission': sup.get('active_mission') if sf else None,
@@ -259,8 +264,15 @@ def answer_query(topics, context, text='', language='vi'):
             if placed is not None: line += (f' Placed: {placed:g}' if en else f' Đã đặt: {placed:g}') + (f'/{target:g}.' if target else '.')
             if context['mission_message']: line += ' ' + context['mission_message']
             if handling == 'AUTO_RECOVERING':
-                line += (' The pallet controller is automatically retrying alignment within its bounded budget.' if en else
-                         ' Bộ điều khiển pallet đang tự căn chỉnh lại trong giới hạn số lần thử.')
+                line += (' The pallet controller is recovering automatically or holding zero while conditions are unsafe.' if en else
+                         ' Bộ điều khiển pallet đang tự phục hồi hoặc giữ vận tốc zero khi chưa đủ điều kiện an toàn.')
+                err, retries = context['pm_err'] or {}, context['pm_retries'] or {}
+                detail = [context['pm_phase'],
+                          f"lateral {err['lat_cm']} cm" if isinstance(err.get('lat_cm'), (int, float)) else None,
+                          f"yaw {err['yaw_deg']}°" if isinstance(err.get('yaw_deg'), (int, float)) else None,
+                          f"retry {retries['alignment']}" if isinstance(retries.get('alignment'), int) else None,
+                          context['pm_message']]
+                line += ' ' + '; '.join(str(value) for value in detail if value) + '.'
             elif handling == 'WAITING_FOR_SENSOR':
                 sensor = context['pm_waiting_for'] or 'sensor'
                 line += (f' Robot stopped while waiting for fresh {sensor} data.' if en else

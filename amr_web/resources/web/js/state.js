@@ -40,7 +40,7 @@ window.isNavigationActive = false;
 // sources compete; a missing/stale active source must never look like Idle.
 window.missionActiveStates = {
     retrieval: new Set(['HOMING_LIFT', 'NAVIGATING_TO_D1', 'ALIGNING_TO_SLOT',
-        'LOADING_DETECTOR', 'DETECTING', 'PICKING', 'NAVIGATING_TO_D2',
+        'AUTO_RECOVERING', 'WAITING_FOR_SENSOR', 'LOADING_DETECTOR', 'DETECTING', 'PICKING', 'NAVIGATING_TO_D2',
         'PLACING_AT_D2', 'RETURNING_HOME', 'CANCELING', 'RECOVERY']),
     supervisor: new Set(['GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
         'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY', 'STOPPING']),
@@ -78,6 +78,8 @@ window.resolveRetrievalResume = status => {
 window.getMissionOwner = (() => {
     const previous = {};
     let lastActiveSource = null;
+    let discardedSupervisorKey = null;
+    let discardedRetrievalRunId = null;
     return () => {
         if (window.missionTransportConnected === false ||
                 (window.missionTransportConnected === true && !window.missionSnapshotReady)) {
@@ -127,13 +129,25 @@ window.getMissionOwner = (() => {
             return {source: 'unavailable', status: {}, active: false, stale: true};
         }
         const retrieval = sources.retrieval;
+        const supervisor = sources.supervisor;
+        const supervisorKey = supervisor && JSON.stringify([
+            supervisor.supervisor_session_id, supervisor.run_id, supervisor.revision]);
+        if (retrieval?.discarded && retrieval.state === 'CANCELED' && supervisor?.state === 'DONE' &&
+                retrieval.run_id && retrieval.run_id !== discardedRetrievalRunId) {
+            discardedRetrievalRunId = retrieval.run_id;
+            discardedSupervisorKey = retrieval.discarded_supervisor_key
+                ? JSON.stringify(retrieval.discarded_supervisor_key) : supervisorKey;
+        }
+        if (supervisor?.state === 'DONE' && discardedSupervisorKey === supervisorKey &&
+                window.missionStatusFresh(supervisor)) {
+            return {source: 'navigation', status: {state: 'IDLE'}, active: false, stale: false};
+        }
         if (window.currentOpMode === 'AUTO' && window.missionStatusFresh(retrieval) &&
                 !retrieval.discarded && !retrieval.superseded &&
                 !window.suppressTerminalPalletRetrievalStatus &&
                 ['DONE', 'FAILED', 'CANCELED', 'STOPPED'].includes(retrieval.state)) {
             return {source: 'retrieval', status: retrieval, active: false, stale: false};
         }
-        const supervisor = sources.supervisor;
         const pallet = sources.pallet;
         if (window.currentOpMode === 'AUTO' && supervisor && !window.missionStatusFresh(supervisor)) {
             return {source: 'unavailable', status: {}, active: false, stale: true};
@@ -205,6 +219,7 @@ window.getMissionPresentation = (() => {
         if (owner.source !== 'supervisor') { context = ''; observedPallet = false; }
         if (owner.source === 'retrieval') {
             const labels = {HOMING_LIFT: 'Homing', ALIGNING_TO_SLOT: 'Aligning',
+                AUTO_RECOVERING: 'Auto correcting alignment', WAITING_FOR_SENSOR: 'Waiting for sensor',
                 LOADING_DETECTOR: 'Loading', DETECTING: 'Detecting', PICKING: 'Picking',
                 NAVIGATING_TO_D2: 'To D_2', PLACING_AT_D2: 'Placing', RETURNING_HOME: 'To Home'};
             const stageStates = ['HOMING_LIFT', 'NAVIGATING_TO_D1', 'NAVIGATING_TO_D1',
@@ -236,6 +251,11 @@ window.getMissionPresentation = (() => {
             return view;
         }
         if (owner.source === 'supervisor') {
+            if (state === 'DONE') {
+                view.label = 'DONE';
+                view.detail = 'Mission completed';
+                return view;
+            }
             const phase = ['PICKING', 'DROPPING'].includes(state) ? state :
                 state === 'RECOVERY' && ['PICKING', 'DROPPING'].includes(m.resume_state) ? m.resume_state : null;
             const key = JSON.stringify([window.missionDisplaySession || 0, phase,
@@ -283,15 +303,24 @@ window.getMissionPresentation = (() => {
             }
             // A phase label from the child snapshot must not hide its explicit
             // recovery/wait/operator state. Stop presentation still takes priority.
+            const handling = m.handling_status || m.pm_handling_status;
             if (!m.web_control_pending && state !== 'STOPPING' &&
                     !(state === 'RECOVERY' && m.stop_confirmed === false)) {
-                const handling = m.handling_status || m.pm_handling_status;
                 if (handling === 'AUTO_RECOVERING') view.label = 'Auto correcting alignment';
                 else if (handling === 'WAITING_FOR_SENSOR') view.label = 'Waiting for sensor';
                 else if (handling === 'NEED_OPERATOR') view.label = 'Operator check required';
                 else if (handling === 'FAILED') view.label = 'Failed';
             }
-            view.detail = '';
+            if (['AUTO_RECOVERING', 'WAITING_FOR_SENSOR'].includes(handling)) {
+                const err = m.pm_err || {};
+                const retries = m.pm_retries || {};
+                const metrics = [m.pm_phase,
+                    Number.isFinite(err.lat_cm) ? `Lateral ${err.lat_cm.toFixed(1)} cm` : null,
+                    Number.isFinite(err.yaw_deg) ? `Yaw ${err.yaw_deg.toFixed(1)}°` : null,
+                    Number.isInteger(retries.alignment) ? `Retry ${retries.alignment}` : null,
+                    m.pm_msg].filter(Boolean);
+                view.detail = metrics.join(' · ');
+            } else view.detail = '';
             return view;
         }
         if (owner.source === 'pallet') {

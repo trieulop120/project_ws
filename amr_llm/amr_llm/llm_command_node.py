@@ -301,13 +301,13 @@ class LLMCommandNode(ManualRecovery, Node):
             except Exception as exc:
                 box['e'] = exc
             if box['abandoned'] or stop_version != self._stop_requested_at:
-                self._emergency_stop('Late service response after Stop or timeout')
+                self.get_logger().warn(
+                    f'Late service response for {client.srv_name}; reconcile operation status before retry')
             ev.set()
         client.call_async(req).add_done_callback(done)
         if not ev.wait(timeout):
             box['abandoned'] = True
-            self._emergency_stop('Service timed out; result remains uncertain')
-            raise TimeoutError(f'Service timed out: {client.srv_name}')
+            raise TimeoutError(f'Service timed out: {client.srv_name}; result uncertain, do not replay')
         self._check_abort()
         if stop_version != self._stop_requested_at:
             raise Aborted()
@@ -385,8 +385,8 @@ class LLMCommandNode(ManualRecovery, Node):
         en = self._is_en(language)
         handling = (self._sup_status or {}).get('handling_status')
         if handling == 'AUTO_RECOVERING':
-            return ('automatically correcting pallet alignment within the retry limit' if en else
-                    'đang tự căn chỉnh pallet trong giới hạn số lần thử')
+            return ('automatically recovering pallet alignment' if en else
+                    'đang tự phục hồi căn chỉnh pallet')
         if handling == 'WAITING_FOR_SENSOR':
             waiting = (self._sup_status or {}).get('pm_waiting_for') or 'sensor'
             return (f'robot stopped while waiting for fresh {waiting} data' if en else
@@ -902,6 +902,9 @@ class LLMCommandNode(ManualRecovery, Node):
                 self._cycle_operation_id = snapshot.get("operation_id")
                 if state in active_states:
                     saw_active = True
+                    # The configured deadline is a warning while the same run
+                    # still reports active work or automatic recovery.
+                    deadline = max(deadline, time.monotonic() + 5.0)
                 elif state == "DONE" and saw_active:
                     nav = snapshot.get("nav_mission") or {}
                     if (snapshot.get("cargo") is False
@@ -1324,17 +1327,23 @@ class LLMCommandNode(ManualRecovery, Node):
         self.get_logger().info(
             f'[RETRIEVAL_COMMAND] source=LLM action=start slot={slot} '
             f'previous_run_id={previous_run} previous_state={previous.get("state")}')
-        response = self._call(self.cli_retrieval_start, Trigger.Request(), timeout=5.0)
+        try:
+            response = self._call(self.cli_retrieval_start, Trigger.Request(), timeout=5.0)
+        except TimeoutError:
+            # The start request may have been accepted. The run ID, not a
+            # repeated Trigger request, resolves this uncertain outcome.
+            response = None
         self.get_logger().info(
-            f'[RETRIEVAL_COMMAND] source=LLM action=start result={response.success} '
+            f'[RETRIEVAL_COMMAND] source=LLM action=start result='
+            f'{"unknown" if response is None else response.success} '
             f'slot={slot} previous_run_id={previous_run} '
             f'current_run_id={(self._retrieval_status or {}).get("run_id")} '
             f'current_state={self._retrieval_state}')
-        if not response.success:
+        if response is not None and not response.success:
             raise RuntimeError(response.message or f"Retrieval rejected for {slot}")
         deadline = time.monotonic() + float(self.get_parameter("retrieval_timeout_s").value)
         terminal = {"DONE", "FAILED", "CANCELED", "STOPPED", "RECOVERY"}
-        while time.monotonic() < deadline:
+        while True:
             self._check_abort()
             state = self._retrieval_state
             status = self._retrieval_status or {}
@@ -1347,8 +1356,12 @@ class LLMCommandNode(ManualRecovery, Node):
             if state in terminal:
                 raise RuntimeError((self._retrieval_status or {}).get(
                     "message") or f"Retrieval ended in {state}")
+            if time.monotonic() >= deadline:
+                self.get_logger().warn(
+                    f'Retrieval {status.get("run_id")} exceeded warning deadline; '
+                    f'current state={state or "unknown"}; retaining the active run')
+                deadline = time.monotonic() + float(self.get_parameter("retrieval_timeout_s").value)
             self._sleep(0.2)
-        raise TimeoutError(f"Retrieval did not finish within {self.get_parameter('retrieval_timeout_s').value:g}s")
 
     def _h_stop_cycle(self, _args):
         if self.get_parameter("dry_run").value:
@@ -1623,19 +1636,24 @@ class LLMCommandNode(ManualRecovery, Node):
         done = {s.upper() for s in p("pallet_done").value}
         fail = {s.upper() for s in p("pallet_fail").value}
         idle = {s.upper() for s in p("pallet_idle").value}
-        t0, seen_active = time.time(), after_t is not None
-        while time.time() - t0 < p("pallet_timeout_s").value:
+        deadline, seen_active = time.time() + p("pallet_timeout_s").value, after_t is not None
+        while time.time() < deadline:
             self._check_abort()
             data = self._pallet_status or {}
+            resumed_id = data.get('last_resumed_checkpoint_id')
+            operation_id = data.get('operation_id')
             if (time.time() - self._pallet_state_t > 3.
                     or (after_t is not None and self._pallet_state_t <= after_t)
-                    or data.get('last_resumed_checkpoint_id', 0) < after_resume_id
-                    or (after_operation_id is not None and data.get('operation_id', -1) <= after_operation_id)):
+                    or (after_resume_id > 0 and (not isinstance(resumed_id, int)
+                        or isinstance(resumed_id, bool) or resumed_id < after_resume_id))
+                    or (after_operation_id is not None and (not isinstance(operation_id, int)
+                        or isinstance(operation_id, bool) or operation_id <= after_operation_id))):
                 self._sleep(.1)
                 continue
             st = self._pallet_state
             if st and st not in done | fail | idle:
                 seen_active = True
+                deadline = max(deadline, time.time() + 5.0)
             if st in fail:
                 return False
             if st in done and (seen_active or after_operation_id is not None):

@@ -144,6 +144,8 @@ DEFAULTS = {
     'require_stable': True,
     'max_tf_jump_m': 0.05,          # map->odom nhay > nguong trong luc detect -> khong on dinh
     'max_tf_jump_deg': 2.5,
+    'retrieval_tf_jump_m': 0.10,
+    'retrieval_tf_jump_deg': 10.0,
     # hieu chinh he thong (khung pallet: +x vao pallet, +y trai)
     'pallet_lat_offset_m': -0.02,     # >0 dich diem dich sang TRAI huong vao pallet
     'pallet_yaw_offset_deg': 0.0,
@@ -1529,6 +1531,11 @@ class PalletMission(PalletRecovery, Node):
         if ctx is None:
             self._fail_retrieval_pick_navigation('Missing retrieval staging navigation context')
             return
+        if ctx.get('tf_hold_since') is not None:
+            paused = max(0.0, now - ctx['tf_hold_since'])
+            ctx['started'] += paused
+            self._settle_t0 += paused
+            ctx['tf_hold_since'] = now
         if self._retrieval_pick_nav_elapsed + now - ctx['started'] > float(self.p['retrieval_nav_timeout_s']):
             self._fail_retrieval_pick_navigation('Retrieval staging navigation/settle timeout')
             return
@@ -1578,9 +1585,12 @@ class PalletMission(PalletRecovery, Node):
         current = self._map_to_ins(self._result['x'], self._result['y'], self._result['yaw'])
         stored = self._pallet_ins
         if (current is None or not all(math.isfinite(v) for v in current)
-                or math.hypot(current[0] - stored[0], current[1] - stored[1]) > float(self.p['max_tf_jump_m'])
-                or abs(math.degrees(norm_angle(current[2] - stored[2]))) > float(self.p['max_tf_jump_deg'])):
-            self._fail_retrieval_pick_navigation('Locked retrieval pallet pose no longer agrees with map/odom')
+                or math.hypot(current[0] - stored[0], current[1] - stored[1]) > float(self.p['retrieval_tf_jump_m'])
+                or abs(math.degrees(norm_angle(current[2] - stored[2]))) > float(self.p['retrieval_tf_jump_deg'])):
+            self._halt()
+            ctx['tf_hold_since'] = now
+            if self._msg != 'Waiting for stable map/odom at retrieval staging':
+                self._set_state(SETTLING, 'Waiting for stable map/odom at retrieval staging')
             return
         self._retrieval_pick_nav = None
         self._begin_alignment()
@@ -2309,6 +2319,13 @@ class PalletMission(PalletRecovery, Node):
 
     def _restore_after_sensor_wait(self, message):
         prior = self._sensor_return_state
+        started = self._tf_wait_since if self._waiting_sensor == 'tf' else self._range_wait_since
+        if started is not None:
+            pause = max(0.0, time.monotonic() - started)
+            for key in ('t_start', 't_phase', '_wait_t0', '_pulse_until'):
+                value = getattr(self._ctl, key, None)
+                if value is not None:
+                    setattr(self._ctl, key, value + pause)
         if prior not in (ALIGNING, INSERTING, AUTO_RECOVERING):
             prior = ALIGNING if self._ctl.phase in self._ctl.ALIGN_PHASES else INSERTING
         self._waiting_sensor = ''
@@ -2330,8 +2347,9 @@ class PalletMission(PalletRecovery, Node):
         if self._state != WAITING_FOR_SENSOR or self._msg != message:
             self._set_state(WAITING_FOR_SENSOR, message)
         if started is not None and now - started >= float(timeout_s):
-            self._finish(FAILED, f'{kind} sensor unavailable for {now-started:.2f}s: {message}',
-                         fail_phase=f'{kind.upper()}_STALE')
+            self.get_logger().warn(
+                f'[WAITING_FOR_SENSOR] {kind} unavailable for {now-started:.1f}s; '
+                'mission and zero velocity retained', throttle_duration_sec=5.0)
 
     def _trim_rack_before_sidestep(self, now, previous_sidesteps):
         """Legacy TF trim once; True means this tick must stay stopped."""
@@ -2380,14 +2398,20 @@ class PalletMission(PalletRecovery, Node):
         return True
 
     def _control(self, now: float):
+        hold_since = getattr(self, '_auto_hold_since', None)
+        if hold_since is not None and not self._waiting_sensor:
+            paused = max(0.0, now - hold_since)
+            for key in ('t_start', 't_phase', '_wait_t0', '_pulse_until'):
+                value = getattr(self._ctl, key, None)
+                if value is not None:
+                    setattr(self._ctl, key, value + paused)
+            self._auto_hold_since = now
         pose = self._robot_pose(self.p['insertion_frame'])
         if pose is None:
             self._tf_miss += 1
             tf_timeout = float(self.p['tf_miss_max']) / 20.0
-            self._wait_for_sensor('tf', now, 'robot TF missing; motion command is zero', float('inf'))
-            if self._tf_miss >= int(self.p['tf_miss_max']):
-                self._finish(FAILED, f'Mat TF robot sau {tf_timeout:.1f}s -> dung xe',
-                             fail_phase=self._approach_fail_phase())
+            self._auto_hold_since = None
+            self._wait_for_sensor('tf', now, 'robot TF missing; motion command is zero', tf_timeout)
             return
         if self._waiting_sensor == 'tf':
             self._restore_after_sensor_wait('Robot TF restored; resuming saved controller phase')
@@ -2398,7 +2422,9 @@ class PalletMission(PalletRecovery, Node):
             # follow a large map-trim/odometry displacement into another column.
             error = self._retrieval_alignment_error(pose)
             if error:
-                self._finish(FAILED, error, fail_phase='RETRIEVAL_ALIGN')
+                self._halt()
+                self._auto_hold_since = now
+                self._set_state(AUTO_RECOVERING, error + '; waiting for a valid stationary stance')
                 return
         previous_phase = self._ctl.phase
         previous_sidesteps = self._ctl.sidesteps
@@ -2407,6 +2433,7 @@ class PalletMission(PalletRecovery, Node):
             e_yaw, e_lat, a = line_errors(*pose, *self._line, self._ctl.p['face_offset_m'])
             depth = a - self._ctl._a_lock0
             if depth >= float(self._ctl.p['us_arm_m']) and not us_fresh:
+                self._auto_hold_since = None
                 self._wait_for_sensor(
                     'ultrasonic', now,
                     'ultrasonic stale at armed LOCK depth; robot held at zero',
@@ -2432,11 +2459,41 @@ class PalletMission(PalletRecovery, Node):
 
         if fail:
             if self._try_alignment_recovery(now, pose, fail):
+                self._auto_hold_since = None
                 return
+            prelift = (not self._ctl.insertion_only and not self._drop_lifted
+                       and self._ctl.phase in (*self._ctl.ALIGN_PHASES, self._ctl.CONVERGE,
+                                                self._ctl.GATE))
             e_lat, e_yaw, a = self._ctl.err
+            speed = getattr(self, '_drop_odom_speed', None)
+            stopped = (now - getattr(self, '_drop_odom_t', 0.0) <= float(self.p['drop_odom_stale_s'])
+                       and speed is not None and all(math.isfinite(v) for v in speed)
+                       and speed[0] <= float(self.p['drop_stop_linear_mps'])
+                       and speed[1] <= float(self.p['drop_stop_angular_rps']))
+            restage_clear = a <= -float(self._ctl.p['rot_clear_m'])
+            if (prelift and self._mode == 'drop' and stopped and restage_clear
+                    and getattr(self, '_auto_restage_attempts', 0) < 1):
+                self._halt()
+                ok, why = self._resume_drop_navigation()
+                if ok:
+                    self._auto_restage_attempts += 1
+                    self._auto_restage_active = True
+                    self._auto_hold_since = None
+                    return
+                self.get_logger().warn(f'[AUTO_RECOVERING] DROP restaging deferred: {why}')
+            if prelift or (self._ctl.insertion_only and
+                           self._ctl.phase in (self._ctl.CONVERGE, self._ctl.GATE, self._ctl.LOCK)):
+                self._halt()
+                self._auto_hold_since = now
+                reason = (f'{self._mode.upper()} phase {self._ctl.phase}: {fail}; '
+                          'holding zero until geometry or safety data changes')
+                if self._state != AUTO_RECOVERING or self._msg != reason:
+                    self._set_state(AUTO_RECOVERING, reason)
+                return
             self._finish(FAILED, f'{fail} [lat={e_lat * 100:+.1f}cm yaw={math.degrees(e_yaw):+.1f}deg]',
                          fail_phase=self._approach_fail_phase())
             return
+        self._auto_hold_since = None
         if done:
             self._ins_msg = done
             if self._retrieval_align_only:
@@ -2477,7 +2534,48 @@ class PalletMission(PalletRecovery, Node):
                     self._phase_shown = None
                     return
         if self._mode == 'drop' and ph == 'CONVERGE' and not self._drop_lifted:
-            # Da can xong o D_1: nang lift len muc "dut vao ke" de sieu am thoang, roi moi tien.
+            # The forks may rise only at a stopped, verified staging pose.
+            lat, yaw, along = self._ctl.err
+            speed = self._drop_odom_speed
+            stopped = (now - self._drop_odom_t <= float(self.p['drop_odom_stale_s'])
+                       and speed is not None and all(math.isfinite(v) for v in speed)
+                       and speed[0] <= float(self.p['drop_stop_linear_mps'])
+                       and speed[1] <= float(self.p['drop_stop_angular_rps']))
+            geometry_ok = (self._line is not None and self._drop is not None
+                           and self._drop_staging_reached()
+                           and along <= -float(self._ctl.p['rot_clear_m'])
+                           and abs(lat) * 100.0 <= float(self._ctl.p['gate_lat_cm'])
+                           and abs(math.degrees(yaw)) <= float(self._ctl.p['gate_yaw_deg']))
+            range_ok = (us_fresh and self._us_count == 0)
+            if (stopped and range_ok and self._retrieval_navigation_idle()
+                    and self._line is not None and along <= -float(self._ctl.p['rot_clear_m'])
+                    and (abs(lat) * 100.0 > float(self._ctl.p['gate_lat_cm'])
+                         or abs(math.degrees(yaw)) > float(self._ctl.p['gate_yaw_deg']))):
+                self._halt()
+                self._ctl.restart_align(now)
+                self._set_state(AUTO_RECOVERING, 'DROP pre-lift geometry drifted; realigning with forks low')
+                return
+            if (stopped and range_ok and self._retrieval_navigation_idle()
+                    and self._line is not None and along <= -float(self._ctl.p['rot_clear_m'])
+                    and not self._drop_staging_reached()
+                    and getattr(self, '_auto_restage_attempts', 0) < 1):
+                self._halt()
+                ok, why = self._resume_drop_navigation()
+                if ok:
+                    self._auto_restage_attempts += 1
+                    self._auto_restage_active = True
+                    return
+                self.get_logger().warn(f'[AUTO_RECOVERING] DROP restaging deferred: {why}')
+            if not (stopped and geometry_ok and range_ok and self._retrieval_navigation_idle()):
+                self._halt()
+                self._auto_hold_since = now
+                reason = (f'DROP pre-lift staging not confirmed: stopped={stopped}, '
+                          f'geometry={geometry_ok}, ultrasonic={range_ok}, '
+                          f'nav_idle={self._retrieval_navigation_idle()}')
+                if self._state != AUTO_RECOVERING or self._msg != reason:
+                    self._set_state(AUTO_RECOVERING, reason)
+                return
+            self._auto_hold_since = None
             self._drop_lifted = True
             self._halt()
             d = self._drop
@@ -2991,6 +3089,9 @@ class PalletMission(PalletRecovery, Node):
             return
         self._line = ins
         self._drop_nav = None
+        if getattr(self, '_auto_restage_active', False):
+            self._ctl._goto(self._ctl.ENTER, time.monotonic())
+            self._auto_restage_active = False
         self._tf_miss = 0
         self._phase_shown = None
         self._rack_trimmed = False
@@ -3099,6 +3200,9 @@ class PalletMission(PalletRecovery, Node):
         self._rack_trim_frame = frame
         self._rack_trimmed = False
         self._drop_lifted = False
+        self._auto_restage_attempts = 0
+        self._auto_restage_active = False
+        self._auto_hold_since = None
         self._trimmed = False       # pick yaw-trim flag; rack trim is separate
         self._drop = {'slot': sid, 'level': lvl, 'type': ctype, 'frame': frame,
                       'insert_cm': insert_cm, 'release_cm': release_cm}

@@ -31,6 +31,7 @@ Chạy (cùng pallet_mission.launch.py, KHONG chay them mission_manager rieng):
 import json
 import math
 from amr_mission_manager.pallet_recovery import navigation_stopped
+from amr_mission_manager.aruco_route_gate import ArucoRouteGate
 import time
 import threading
 import uuid
@@ -43,7 +44,7 @@ from rclpy.parameter import Parameter
 from action_msgs.msg import GoalStatusArray
 from action_msgs.srv import CancelGoal
 from rcl_interfaces.srv import GetParameters, SetParameters
-from std_msgs.msg import String, Int8MultiArray
+from std_msgs.msg import String, Bool, Int8MultiArray
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
 from std_srvs.srv import Empty, SetBool, Trigger
@@ -57,6 +58,11 @@ from amr_mission_manager.shelf_model import ShelfModel, UNKNOWN, EMPTY, FULL
 from amr_mission_manager.mission_queue import normalize_mission_queue, task_after_placement, mission_start_blockers
 
 NODE_NAME = 'mission_supervisor'
+
+
+def status_counter(status, field):
+    value = status.get(field) if isinstance(status, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 IDLE = 'IDLE'
 GOTO_PICK = 'GOTO_PICK'
@@ -182,6 +188,11 @@ class MissionSupervisor(Node):
         # leaks ROS entities and makes startup/recovery progressively less
         # responsive when a server is offline.
         self._service_clients = {}
+        # Separate grants; this node alone publishes their safe combination.
+        self._aruco_route_gate = ArucoRouteGate()
+        self._retrieval_aruco_gate = ArucoRouteGate()
+        self._retrieval_gate_status = None
+        self._retrieval_gate_t = 0.0
 
         # ---------------- State ----------------
         self._state = IDLE
@@ -223,6 +234,8 @@ class MissionSupervisor(Node):
         self._pm_session_id = None
         self._pm_operation_id = -1
         self._await_operation_after = None
+        self._uncertain_child_request = None
+        self._uncertain_child_session = None
         self._await_resume_checkpoint = None
         self._pm_recovery = None
         self._pm_handling_status = None
@@ -289,6 +302,10 @@ class MissionSupervisor(Node):
 
         # ---------------- ROS I/O ----------------
         self.pub_status = self.create_publisher(String, f'/{NODE_NAME}/status', 10)
+        gate_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.pub_aruco_gate = self.create_publisher(Bool, '/aruco_b1/enable', gate_qos)
+        self._publish_aruco_gate()  # Fail closed on launch/restart.
         route_qos = QoSProfile(depth=1)
         route_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         route_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -296,6 +313,8 @@ class MissionSupervisor(Node):
             String, '/navigation/route_yaml_path', self._on_route_path, route_qos)
         self.create_subscription(
             String, f'/{self.p["pallet_mission_node"]}/status', self._on_pm_status, 10)
+        self.create_subscription(String, '/pallet_retrieval/status',
+                                 self._on_retrieval_gate_status, 10)
         self.create_subscription(String, '/pallet/target_status',
                                  self._on_detector_status, 10)
         self.create_subscription(Image, self.p['camera_topic'], self._on_camera,
@@ -380,12 +399,42 @@ class MissionSupervisor(Node):
             self._recovery_route = self._route_path_loaded
             self._request_recovery_stop()
         self._state = state
+        self._aruco_route_gate.transition(previous, state, self._pm_cargo)
+        self._publish_aruco_gate()  # Push OFF immediately for STOP/RECOVERY/DROP.
         self._msg = msg
         self._t_state = time.monotonic()
         self._shelf_bad_t0 = None
         self._stuck_t0 = None
         self._start_refusals = 0
         self.get_logger().info(f'[{state}] {msg}')
+
+    def _publish_aruco_gate(self):
+        # Repeated at supervisor status heartbeat (0.5s) so ArUco detects a
+        # vanished supervisor via its lease timeout, not a stale latched True.
+        publisher = getattr(self, 'pub_aruco_gate', None)
+        if publisher is not None:
+            now = time.monotonic()
+            status = self._retrieval_gate_status
+            fresh = self._retrieval_gate_t > 0.0 and now - self._retrieval_gate_t <= 2.0
+            self._retrieval_aruco_gate.retrieval_transition(
+                status, nav_goal_active=status.get('nav_goal_active') if isinstance(status, dict) else False,
+                fresh=fresh)
+            placement_fresh = self._pm_status_t > 0.0 and now - self._pm_status_t <= 2.0
+            enabled = ArucoRouteGate.combine(
+                self._state, self._aruco_route_gate.enabled, placement_fresh,
+                status, self._retrieval_aruco_gate.enabled, fresh)
+            self._aruco_gate_effective = bool(enabled)
+            publisher.publish(Bool(data=bool(enabled)))
+
+    @_state_locked
+    def _on_retrieval_gate_status(self, msg):
+        try:
+            status = json.loads(msg.data)
+        except (TypeError, ValueError):
+            status = None
+        self._retrieval_gate_status = status if isinstance(status, dict) else None
+        self._retrieval_gate_t = time.monotonic() if self._retrieval_gate_status else 0.0
+        self._publish_aruco_gate()  # In particular, d1 -> slot sends OFF immediately.
 
     def _handling_status(self):
         """Fine-grained safety activity while keeping the legacy mission state."""
@@ -460,7 +509,8 @@ class MissionSupervisor(Node):
             return
         self._stop_after_late_request()
 
-    def _call_service_result(self, cli, req, timeout: float = 5.0, on_late=None):
+    def _call_service_result(self, cli, req, timeout: float = 5.0, on_late=None,
+                             retain_on_timeout=False):
         epoch = self._mission_epoch
         if self._stale_step() or not cli.wait_for_service(timeout_sec=min(max(timeout, 0.0), 0.2)):
             return None
@@ -474,6 +524,12 @@ class MissionSupervisor(Node):
         while not fut.done() and time.monotonic() < t_end:
             time.sleep(0.02)
         if not fut.done():
+            if retain_on_timeout:
+                self._uncertain_child_request = fut
+                self._uncertain_child_session = self._pm_session_id
+                self.get_logger().warn(
+                    f'Child service {cli.srv_name} timed out; keeping operation pending until response/status')
+                return None
             def late(_):
                 with self._transition_lock:
                     if epoch != self._mission_epoch:
@@ -492,8 +548,35 @@ class MissionSupervisor(Node):
             return fut.result()
         except Exception as exc:
             self.get_logger().error(f'Auto service result unconfirmed epoch={epoch}: {exc}')
+            if retain_on_timeout:
+                self._uncertain_child_request = fut
+                self._uncertain_child_session = self._pm_session_id
+                return None
             self._late_service_result(epoch)
             return None
+
+    def _pending_child_result(self):
+        future = self._uncertain_child_request
+        if future is None:
+            return True, None
+        if (self._pm_session_id == self._uncertain_child_session
+                and self._await_operation_after is not None
+                and self._pm_operation_id > self._await_operation_after
+                and self._pm_state not in (None, IDLE, 'READY')):
+            # A fresh status from the new operation confirms acceptance even
+            # when the original Trigger response was lost.
+            self._uncertain_child_request = None
+            self._uncertain_child_session = None
+            return True, None
+        if not future.done():
+            return False, None
+        self._uncertain_child_request = None
+        self._uncertain_child_session = None
+        try:
+            return True, future.result()
+        except Exception as exc:
+            self.get_logger().warn(f'Child service response uncertain: {exc}')
+            return False, None
 
     def _service_client(self, srv_type, service_name):
         key = (srv_type, service_name)
@@ -938,6 +1021,8 @@ class MissionSupervisor(Node):
 
     def _clear_auto_cycle(self):
         self._mission_epoch += 1
+        self._aruco_route_gate.reset()
+        self._publish_aruco_gate()
         self._cancel_requested = self._discard_requested = self._resume_inflight = False
         self._resume_state = self._recovery_origin = None
         self._active_mission = self._active_dest = None
@@ -1280,15 +1365,21 @@ class MissionSupervisor(Node):
             d = json.loads(msg.data)
         except Exception:
             return
+        operation_id = status_counter(d, 'operation_id')
+        resume_id = status_counter(d, 'last_resumed_checkpoint_id')
+        if operation_id is None or resume_id is None:
+            self.get_logger().warn('Ignoring pallet status with invalid operation/checkpoint ID',
+                                   throttle_duration_sec=5.0)
+            return
         same_session = self._pm_session_id == d.get('session_id')
         if (same_session and self._await_resume_checkpoint is not None
-                and d.get('last_resumed_checkpoint_id', 0) < self._await_resume_checkpoint):
+                and resume_id < self._await_resume_checkpoint):
             return
         if (same_session and self._go_called and self._await_operation_after is not None
-                and d.get('operation_id', -1) <= self._await_operation_after):
+                and operation_id <= self._await_operation_after):
             return
         self._await_resume_checkpoint = None
-        self._pm_operation_id = d.get('operation_id', -1)
+        self._pm_operation_id = operation_id
         self._pm_session_id = d.get('session_id')
         self._pm_recovery = d.get('recovery')
         self._pm_handling_status = d.get('handling_status')
@@ -1304,6 +1395,8 @@ class MissionSupervisor(Node):
         self._pm_fail_phase = d.get('fail_phase')
         self._pm_insertion_only = d.get('insertion_only') is True
         self._pm_msg = d.get('msg') or ''
+        self._pm_err = d.get('err') if isinstance(d.get('err'), dict) else None
+        self._pm_retries = d.get('retries') if isinstance(d.get('retries'), dict) else None
         self._pm_status_t = time.monotonic()
 
     def _on_camera(self, _msg: Image):
@@ -1423,12 +1516,9 @@ class MissionSupervisor(Node):
         """pallet_mission tu choi Drop (xe KHONG chuyen dong): thu lai vai lan roi moi RECOVERY,
         va hien dung ly do (truoc day ly do bi bo, chi con 'can kiem tra pallet/lift')."""
         self._start_refusals += 1
-        if self._start_refusals <= int(self.p['start_retries']):
-            self.get_logger().warn(f'[DROPPING] {why} -> thu lai {self._start_refusals}/{self.p["start_retries"]}')
-            self._retry_wait_until = now + 2.0
-            return
-        self._set_state('RECOVERY', why)
-        self._resume_state = DROPPING
+        self.get_logger().warn(f'[DROPPING] start deferred ({self._start_refusals}): {why}',
+                               throttle_duration_sec=5.0)
+        self._retry_wait_until = now + max(2.0, float(self.p['retry_backoff_s']))
 
     def _can_auto_retry(self, used: int) -> bool:
         blockers = []
@@ -1685,6 +1775,8 @@ class MissionSupervisor(Node):
                 # RESUME khi xe da dung o D_1: KHONG gui lai Nav2 (se di chuyen them va
                 # lam lech pose truoc khi vao ke).
                 self.get_logger().info('[GOTO_D] Xe da o D_1 -> bo qua gui lai mission Nav2')
+                self._aruco_route_gate.arrived_d1()
+                self._publish_aruco_gate()
                 self._triggered = True
                 self._resume_free_nav = False
                 return
@@ -1728,6 +1820,8 @@ class MissionSupervisor(Node):
                 self._stuck_t0 = None
                 self._near_t0 = self._near_t0 or now
             if self._near_t0 is not None and now - self._near_t0 >= float(self.p['arrive_settle_s']):
+                self._aruco_route_gate.arrived_d1()
+                self._publish_aruco_gate()
                 if not (self._shelf_ok() and self._shelf_bits is not None):
                     if self._shelf_expired(now):
                         self._set_state('RECOVERY', 'Mat ket noi/cam bien ke stale khi den D_1')
@@ -1758,8 +1852,7 @@ class MissionSupervisor(Node):
                 return
             if not (self._shelf_ok() and self._shelf_bits is not None):
                 if self._shelf_expired(now):
-                    self._set_state('RECOVERY', 'Du lieu ke stale/mat ket noi truoc khi bat dau drop')
-                    self._resume_state = DROPPING
+                    self._enter_waiting_slot('Du lieu ke stale/mat ket noi truoc khi bat dau drop')
                 return
             sid, frame, why = self._select_drop_slot_for(self._pm_cargo_type)
             if sid is None:
@@ -1770,8 +1863,7 @@ class MissionSupervisor(Node):
             self._drop_slot_chosen = (sid, frame)
             cli = self._service_client(SetParameters, f'/{pm}/set_parameters')
             if not cli.wait_for_service(timeout_sec=0.2):
-                self._set_state('RECOVERY', 'Pallet mission set_parameters chua san sang')
-                self._resume_state = DROPPING
+                self._drop_refused(now, 'Pallet mission set_parameters chua san sang')
                 return
             req = SetParameters.Request()
             req.parameters = [
@@ -1782,8 +1874,7 @@ class MissionSupervisor(Node):
             if self._cancel_requested:
                 return
             if result is None or not all(x.successful for x in result.results):
-                self._set_state('RECOVERY', 'Khong dat duoc drop_slot cho pallet_mission')
-                self._resume_state = DROPPING
+                self._drop_refused(now, 'Khong dat duoc drop_slot cho pallet_mission')
                 return
             drop = self._service_client(Trigger, f'/{pm}/drop')
             if not drop.wait_for_service(timeout_sec=0.2):
@@ -1792,8 +1883,14 @@ class MissionSupervisor(Node):
             if self._cancel_requested:
                 return
             self._await_operation_after = self._pm_operation_id
-            result = self._call_service_result(drop, Trigger.Request(), timeout=3.)
+            result = self._call_service_result(
+                drop, Trigger.Request(), timeout=3., retain_on_timeout=True)
             if self._cancel_requested:
+                return
+            if result is None and self._uncertain_child_request is not None:
+                self._go_called = True
+                self._pm_state = None
+                self._t_state = now
                 return
             if result is None or not result.success:
                 why = result.message if result else 'service khong tra loi trong 3s'
@@ -1803,6 +1900,13 @@ class MissionSupervisor(Node):
             self._go_called = True
             self._pm_state = None      # bo status cu (FAILED lan truoc)
             self._t_state = now
+            return
+        ready, pending_result = self._pending_child_result()
+        if not ready:
+            return
+        if pending_result is not None and not pending_result.success:
+            self._go_called = False
+            self._drop_refused(now, pending_result.message)
             return
         if self._pm_state == DONE and self._pm_cargo is False:
             # The pallet operation reaches DONE only after its owned Nav2 goal
@@ -1892,17 +1996,9 @@ class MissionSupervisor(Node):
             self._set_state('RECOVERY', 'DROP stopped; inspect pallet and staging before Resume')
             self._resume_state = DROPPING
         elif now - self._t_state > float(self.p.get('drop_timeout_s', 360.0)):
-            # DROP now owns a Nav2 staging leg as well as local/lift actions.
-            # Stop the child before releasing supervision on this timeout.
-            try:
-                self._request_owned_navigation_stop()
-            except Exception as e:
-                self.get_logger().warn(f'DROP timeout Nav2 cancel failed: {e}')
-            cli = self._service_client(Trigger, f'/{pm}/stop')
-            result = self._call_service_result(cli, Trigger.Request(), timeout=1.0)
-            stop_msg = 'stop requested' if result is not None and result.success else 'stop unconfirmed'
-            self._set_state('RECOVERY', f'Drop timeout ({stop_msg}); can kiem tra pallet va lift truoc Resume')
-            self._resume_state = DROPPING
+            self.get_logger().warn('DROP duration exceeded warning deadline; child operation retained',
+                                   throttle_duration_sec=5.0)
+            self._t_state = now
 
     def _do_return_home(self, now):
         if not self._triggered:
@@ -2180,9 +2276,14 @@ class MissionSupervisor(Node):
                             self._set_state('RECOVERY', 'Camera con frame nhung detector khong gui target status')
                             self._resume_state = PICKING
                             return
-                        unknown = int(self._detector_status.get('unknown_loaded', 0))
-                        compatible = int(self._detector_status.get('compatible_pallets', 0))
-                        unlocalized = int(self._detector_status.get('unlocalized_loaded', 0))
+                        unknown = status_counter(self._detector_status, 'unknown_loaded')
+                        compatible = status_counter(self._detector_status, 'compatible_pallets')
+                        unlocalized = status_counter(self._detector_status, 'unlocalized_loaded')
+                        if None in (unknown, compatible, unlocalized):
+                            self.get_logger().warn(
+                                'Detector target status has null/missing counters; waiting for valid data',
+                                throttle_duration_sec=5.0)
+                            return
                         if unknown > 0 or compatible > 0 or unlocalized > 0:
                             self._pick_retry(
                                 'Detector thay pallet nhung chua the khoa class-compatible target '
@@ -2216,13 +2317,14 @@ class MissionSupervisor(Node):
             self._drop_slot_chosen = (sid, frame)
             cli = self._service_client(Trigger, f'/{pm}/go_to_pallet')
             self._await_operation_after = self._pm_operation_id
-            res = self._call_service_result(cli, Trigger.Request())
+            res = self._call_service_result(cli, Trigger.Request(), retain_on_timeout=True)
             if self._cancel_requested:
                 return
             if res is None:
-                if now - self._t_state > 30.0:
-                    self._set_state('RECOVERY', 'Service go_to_pallet khong du')
-                    self._resume_state = PICKING
+                if self._uncertain_child_request is not None:
+                    self._go_called = True
+                    self._pm_state = None
+                    self._t_state = now
                 return
             if res.success:
                 self._go_called = True
@@ -2233,11 +2335,18 @@ class MissionSupervisor(Node):
             return
 
         # Wait pallet_mission terminal state (qua status topic)
+        ready, pending_result = self._pending_child_result()
+        if not ready:
+            return
+        if pending_result is not None and not pending_result.success:
+            self._pick_retry(pending_result.message)
+            return
         if self._pm_state in (DONE, FAILED, STOPPED, 'CARRYING'):
             self._finish_picking(self._pm_state)
         if now - self._t_state > float(self.p['pick_timeout_s']):
-            self._set_state('RECOVERY', f'PICKING qua thoi gian (pm_state={self._pm_state})')
-            self._resume_state = GOTO_D if self._pm_cargo is True else PICKING
+            self.get_logger().warn('PICK duration exceeded warning deadline; child operation retained',
+                                   throttle_duration_sec=5.0)
+            self._t_state = now
 
     def _pick_retry(self, reason: str):
         self._retries += 1
@@ -2297,6 +2406,7 @@ class MissionSupervisor(Node):
     # ==================================================================
     @_state_locked
     def _publish_status(self):
+        self._publish_aruco_gate()
         detector = self._detector_status or {}
         now = time.monotonic()
         nav_fresh = self._nav_status_t > 0.0 and now - self._nav_status_t <= 2.0
@@ -2365,6 +2475,7 @@ class MissionSupervisor(Node):
             'cancel_pending': self._discard_requested,
             'stop_reason': stop_reason or getattr(self, '_stop_reason', ''),
             'state': self._state,
+            'aruco_detection_enabled': bool(getattr(self, '_aruco_gate_effective', False)),
             'handling_status': self._handling_status(),
             'msg': self._msg,
             'progress_percent': progress_percent,
@@ -2442,6 +2553,8 @@ class MissionSupervisor(Node):
             'pm_phase': self._pm_phase,
             'pm_live': self._pm_live,
             'pm_msg': self._pm_msg,
+            'pm_err': getattr(self, '_pm_err', None),
+            'pm_retries': getattr(self, '_pm_retries', None),
             'pm_fail_phase': self._pm_fail_phase,
             'pm_insertion_only': self._pm_insertion_only,
             'cargo_why': self._pm_cargo_why,

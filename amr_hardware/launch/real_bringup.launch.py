@@ -71,8 +71,11 @@ def generate_launch_description():
         'aruco_marker_y', default_value='0.0',
         description='ArUco center Y offset from slot_B1 origin (m)')
     aruco_marker_z_arg = DeclareLaunchArgument(
-        'aruco_marker_z', default_value='0.122',
+        'aruco_marker_z', default_value='0.115',
         description='ArUco center Z offset from slot_B1 origin (m)')
+    aruco_auto_update_amcl_arg = DeclareLaunchArgument(
+        'aruco_auto_update_amcl', default_value='true',
+        description='Correct AMCL from stable ArUco B1 poses when visible')
 
     # Tat point cloud cua driver neu khong co node nao dung /points
     # (tiet kiem CPU dang ke: driver khong phai tao cloud 640x480 @30Hz)
@@ -308,7 +311,8 @@ def generate_launch_description():
         condition=IfCondition(camera_enable)
     )
 
-    # Independent RGB ArUco pose estimate for comparison; never changes AMCL.
+    # Independent RGB ArUco pose estimate. Optional gated /initialpose updates
+    # AMCL; AMCL alone continues publishing map -> odom.
     aruco_b1_localizer = Node(
         package='aruco_b1_package',
         executable='aruco_b1_localizer',
@@ -324,15 +328,16 @@ def generate_launch_description():
             'aruco_base_frame': 'base_footprint_aruco',
             'marker_id': 0,
             'dictionary': 'DICT_4X4_50',
-            'marker_size_m': 0.10,
+            'marker_size_m': 0.15,
             'marker_xyz_slot_m': ParameterValue(
                 PythonExpression([
                     '[', LaunchConfiguration('aruco_marker_x'), ', ',
                     LaunchConfiguration('aruco_marker_y'), ', ',
                     LaunchConfiguration('aruco_marker_z'), ']']),
                 value_type=List[float]),
-            'auto_update_amcl': False,
-            'search_hz': 1.5,
+            'auto_update_amcl': ParameterValue(
+                LaunchConfiguration('aruco_auto_update_amcl'), value_type=bool),
+            'search_hz': 2.0,
             'track_hz': 8.0,
         }],
         condition=IfCondition(camera_enable),
@@ -511,6 +516,7 @@ def generate_launch_description():
         aruco_marker_x_arg,
         aruco_marker_y_arg,
         aruco_marker_z_arg,
+        aruco_auto_update_amcl_arg,
         enable_pointcloud_arg,
         use_vo_arg,
         vo_decimation_arg,

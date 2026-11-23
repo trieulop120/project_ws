@@ -57,5 +57,9 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
   RENAME pallet_retrieval
 )
-
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/amr_mission_manager/aruco_route_gate.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME aruco_route_gate
+)
 ament_package()

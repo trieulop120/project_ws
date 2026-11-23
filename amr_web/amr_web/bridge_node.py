@@ -116,6 +116,7 @@ class WebBridge(Node):
     _CYCLE_BLOCKED_COMMANDS = _CYCLE_RUNNING | {'RECOVERY', 'STOPPING'}
     _RETRIEVAL_ACTIVE = {
         'HOMING_LIFT', 'NAVIGATING_TO_D1', 'ALIGNING_TO_SLOT', 'LOADING_DETECTOR',
+        'AUTO_RECOVERING', 'WAITING_FOR_SENSOR',
         'DETECTING', 'PICKING', 'NAVIGATING_TO_D2', 'PLACING_AT_D2',
         'RETURNING_HOME', 'CANCELING', 'RECOVERY',
     }
@@ -734,7 +735,8 @@ class WebBridge(Node):
 
         if getattr(self, '_pallet_resume_pending', False):
             resume_id = d.get('last_resumed_checkpoint_id', 0)
-            if resume_id >= getattr(self, '_pallet_resume_checkpoint_id', 0):
+            if (isinstance(resume_id, int) and not isinstance(resume_id, bool)
+                    and resume_id >= getattr(self, '_pallet_resume_checkpoint_id', 0)):
                 self._pallet_resume_pending = False
 
     def _on_mission_supervisor_status(self, msg: String) -> None:
@@ -866,6 +868,10 @@ class WebBridge(Node):
                 'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY')
             self._pallet_retrieval_status = {
                 **data, 'ts': time.time(),
+                'discarded_supervisor_key': (
+                    previous.get('discarded_supervisor_key') if same_run and previous.get('discarded_supervisor_key')
+                    else [supervisor.get('supervisor_session_id'), supervisor.get('run_id'), supervisor.get('revision')]
+                    if data.get('discarded') and new_state == 'CANCELED' else None),
                 'superseded': terminal and (new_state == 'DONE' or bool(data.get('discarded')) or
                     (same_run and previous.get('superseded', False)) or auto_active),
             }

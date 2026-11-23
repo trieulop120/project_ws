@@ -107,6 +107,9 @@ class PalletRecovery:
             return False, 'Missing DROP staging context or Nav2 server'
         if self._ctl.insertion_only or self._drop_lifted:
             return False, 'Raised forks cannot restart DROP navigation'
+        if (self._nav_pending is not None or any(not f.done() for f in self._nav_results)
+                or not self._retrieval_navigation_idle()):
+            return False, 'Previous navigation ownership has not been released'
         # Re-send the same staging goal, retaining the original DROP/controller.
         ctx = {'started': time.monotonic(), 'handoff': False,
                'cancel_at': None, 'stopped_since': None}

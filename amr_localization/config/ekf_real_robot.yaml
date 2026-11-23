@@ -4,7 +4,7 @@
     use_sim_time: false
 
     # Frequency & Timeouts
-    frequency: 100.0
+    frequency: 50.0
     sensor_timeout: 0.1
 
     two_d_mode: true # Robot di chuyển trên mặt phẳng 2D

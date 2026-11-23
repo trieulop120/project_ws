@@ -11,14 +11,16 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
   RENAME aruco_b1_localizer
 )
+install(PROGRAMS
+  ${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}/anchor_policy.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME anchor_policy
+)
 
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
 
-install(DIRECTORY test
-  DESTINATION share/${PROJECT_NAME}
-)
 install(FILES README_VI.md DESTINATION share/${PROJECT_NAME})
 
 ament_package()

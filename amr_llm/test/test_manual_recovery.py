@@ -178,19 +178,20 @@ class ManualRecoveryTests(unittest.TestCase):
             self.assertIs(n._manual_checkpoint, cp)
             self.assertFalse(busy.locked())
 
-    def test_timed_out_service_is_stopped_again_when_its_response_arrives_late(self):
+    def test_timed_out_service_does_not_trigger_emergency_stop(self):
         callbacks, stops = [], []
         event = NS(wait=lambda _: False, set=lambda: None)
         fn = method('llm_command_node.py', '_call', dict(threading=NS(Event=lambda: event), Aborted=Aborted))
         client = NS(srv_name='lift', wait_for_service=lambda **_: True,
                     call_async=lambda _: NS(add_done_callback=callbacks.append))
-        n = NS(_check_abort=lambda: None, _stop_requested_at=0.)
+        n = NS(_check_abort=lambda: None, _stop_requested_at=0.,
+               get_logger=lambda: NS(warn=lambda *_: None))
         def stop(reason):
             stops.append(reason); n._stop_requested_at += 1.
         n._emergency_stop = stop
         with self.assertRaises(TimeoutError): fn(n, client, NS(), timeout=.01)
         callbacks[0](NS(result=lambda: NS(success=True)))
-        self.assertEqual(len(stops), 2)
+        self.assertEqual(stops, [])
 
 
 if __name__ == '__main__': unittest.main()

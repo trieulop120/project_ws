@@ -331,7 +331,10 @@
             document.body.appendChild(fl);
             document.body.appendChild(fab);
             el.fab = fab;
-            fab.onclick = () => { fl.hidden = !fl.hidden; };
+            fab.onclick = () => {
+                fl.hidden = !fl.hidden;
+                if (!fl.hidden) scrollToBottom(true);
+            };
             el.float = fl;
         }
         el.mic.onclick = () => {
@@ -405,8 +408,7 @@
             (s.location ? '  ·  ' + t.locLabel.replace(/:$/, '') + ': ' + s.location : '');
     }
 
-    // Ô chat có thể cuộn: chỉ tự cuộn xuống đáy khi người dùng đang ở gần đáy
-    // (hoặc vừa cuộn lên), nếu không thì giữ nguyên vị trí để người dùng đọc lại.
+    // Only the chat container scrolls; status-only heartbeats leave history alone.
     function atBottom() {
         if (!el.chat) return true;
         return el.chat.scrollHeight - el.chat.scrollTop - el.chat.clientHeight < 40;
@@ -414,17 +416,16 @@
 
     function scrollToBottom(force) {
         if (!el.chat) return;
-        if (force === true || atBottom()) {
-            el.chat.scrollTop = el.chat.scrollHeight;
-        }
+        if (force !== true && !atBottom()) return;
+        const chat = el.chat;
+        requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
     }
 
     function addMsg(kind, text, extra) {
-        const stick = atBottom();
         const m = h('div', 'llm-msg ' + kind + (extra ? ' ' + extra : ''), text);
         el.chat.appendChild(m);
         while (el.chat.children.length > 80) el.chat.removeChild(el.chat.firstChild);
-        scrollToBottom(stick);
+        scrollToBottom(true);
         return m;
     }
 
@@ -475,7 +476,7 @@
         row.appendChild(no);
         b.appendChild(row);
         el.chat.appendChild(b);
-        scrollToBottom();
+        scrollToBottom(true);
         planBubble = { el: b, row: row };
     }
 
@@ -493,7 +494,7 @@
         row.appendChild(no);
         b.appendChild(row);
         el.chat.appendChild(b);
-        scrollToBottom();
+        scrollToBottom(true);
         planBubble = { el: b, row: row };
     }
 
