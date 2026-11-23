@@ -306,6 +306,11 @@ class NavBridge:
             return True
         return False
 
+    def get_active_map_id(self) -> Optional[str]:
+        """Map của phiên Nav2 hiện hành, để gắn danh tính cho pose map-frame."""
+        with self._lock:
+            return self._session.get('map_id') if self._nav_active and not self._stopping else None
+
     def is_nav_active(self) -> bool:
         """Kiểm tra navigation state."""
         return self._nav_active

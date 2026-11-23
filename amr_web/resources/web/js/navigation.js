@@ -188,6 +188,7 @@
         window.selectedNavMap = null;
         window.selectedNavRoute = null;
         window.currentRoute = null;
+        window.navigation3D?.onMapSelectionChanged(null);
         if (navMapSelect) navMapSelect.innerHTML = '<option value="">-- Select a map --</option>';
         if (navRouteSelect) navRouteSelect.innerHTML = '<option value="">-- Select a route --</option>';
         if (navModalConfirm) navModalConfirm.disabled = true;
@@ -274,6 +275,7 @@
             window.selectedNavMap = null;
             window.selectedNavRoute = null;
             window.currentRoute = null;
+            window.navigation3D?.onMapSelectionChanged(null);
             if (navModalConfirm) navModalConfirm.disabled = true;
             if (statusMsg) statusMsg.style.display = 'none';
             isBindingInProgress = false;
@@ -281,6 +283,7 @@
         }
 
         window.selectedNavMap = selectedMapId;
+        window.navigation3D?.onMapSelectionChanged(selectedMapId);
 
         if (mapToRouteMap[selectedMapId]) {
             const routeInfo = mapToRouteMap[selectedMapId];
@@ -328,6 +331,7 @@
             window.selectedNavMap = null;
             window.selectedNavRoute = null;
             window.currentRoute = null;
+            window.navigation3D?.onMapSelectionChanged(null);
             if (navModalConfirm) navModalConfirm.disabled = true;
             if (statusMsg) statusMsg.style.display = 'none';
             isBindingInProgress = false;
@@ -340,6 +344,7 @@
         if (linkedMapId) {
             if (navMapSelect) navMapSelect.value = linkedMapId;
             window.selectedNavMap = linkedMapId;
+            window.navigation3D?.onMapSelectionChanged(linkedMapId);
 
             window.currentRoute = linkedRoute.rawData;
 
@@ -465,6 +470,7 @@
         const seq = ++navMapLoadSeq;
         navMapLoading = true;
         navMapLoadingId = mapId;
+        window.navigation3D?.onMapLoading(mapId);
 
         try {
             const res = await fetch(`/api/map/image/${encodeURIComponent(mapId)}`);
@@ -492,7 +498,8 @@
                         info: json.info,
                         data: json.image_data,
                         is_pgm_raw: true,
-                        frame_id: window.selectedNavMap
+                        frame_id: window.selectedNavMap,
+                        ros_frame_id: json.info?.frame_id || 'map'
                     };
                     window.mapImageData = buildMapImageData();
                     if (typeof window.renderMap === 'function') {
@@ -502,9 +509,20 @@
                         window.updateOverviewMapCard(window.mapData);
                     }
                 }
+                if (window.mapData?.is_pgm_raw &&
+                        (window.mapData.map_id || window.mapData.frame_id) === mapId) {
+                    window.navigation3D?.onMapLoaded(mapId);
+                } else {
+                    window.navigation3D?.onMapLoadFailed(mapId, 'Map data unavailable');
+                }
+            } else {
+                window.navigation3D?.onMapLoadFailed(mapId, json.message || 'Map data unavailable');
             }
         } catch (e) {
             console.error('[Nav] Failed to load PGM map:', e);
+            if (seq === navMapLoadSeq && window.selectedNavMap === mapId) {
+                window.navigation3D?.onMapLoadFailed(mapId, e.message || 'Map request failed');
+            }
         } finally {
             if (seq === navMapLoadSeq) {
                 navMapLoading = false;
@@ -604,6 +622,7 @@
         window.selectedNavMap = null;
         window.selectedNavRoute = null;
         window.currentRoute = null;
+        window.navigation3D?.onMapSelectionChanged(null);
         isMissionActive = false;
         window.autoMissionStartPending = false;
         lastManualTarget = '--';
@@ -1987,6 +2006,7 @@
         }
 
         window.isNavigationActive = sessionActive;
+        window.navigation3D?.onMapVisibilityChange();
         if (sessionActive) navStarting = false;
         // Apply the session visibility change on direct command snapshots too,
         // not only on WebSocket broadcasts from ros_connection.js.
@@ -2006,6 +2026,7 @@
         if (navState.map_id) {
             window.selectedNavMap = navState.map_id;
             window.selectedNavRoute = navState.route_id;
+            window.navigation3D?.onMapSelectionChanged(navState.map_id);
 
             // Khi F5/reload: load PGM map neu chua co
             if (navState.nav2_running && !navStopping && (!window.mapData || !window.mapData.is_pgm_raw)) {
@@ -2428,6 +2449,7 @@
     }
 
     window.showNavSetupModal = showNavSetupModal;
+    window.cancelNavMapTool = cancelDrag;
     window.updateNavUI = updateNavUI;
     window.onNavTransportChange = function (connected) {
         if (!connected) { navStarting = false; setActiveTool(null); stopManualTeleop(); }

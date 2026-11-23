@@ -38,6 +38,7 @@
 
         function showMap() {
             center.classList.remove('rack-mode');
+            window.navigation3D?.onMapVisibilityChange();
             rackView.hidden = true;
             toggle.setAttribute('aria-expanded', 'false');
             toggle.querySelector('span').textContent = 'Pallet Retrieval';
@@ -48,6 +49,7 @@
 
         function showRack() {
             center.classList.add('rack-mode');
+            window.navigation3D?.onMapVisibilityChange();
             rackView.hidden = false;
             toggle.setAttribute('aria-expanded', 'true');
             toggle.querySelector('span').textContent = 'Back to Map';

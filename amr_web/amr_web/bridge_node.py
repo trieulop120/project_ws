@@ -1870,6 +1870,8 @@ class WebBridge(Node):
         map_pose["type"] = "pose"
         map_pose["timestamp"] = time.time()
         map_pose["frame_id"] = self._map_frame
+        map_pose["base_frame_id"] = self._base_frame
+        map_pose["map_id"] = self._nav_bridge.get_active_map_id() if nav_is_running and self._nav_bridge else None
         map_pose["position"] = {"x": round(mx, 4), "y": round(my, 4), "z": 0.0}
         map_pose["orientation"] = {"yaw": round(myaw, 4)}
 

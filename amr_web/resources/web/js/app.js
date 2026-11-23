@@ -57,6 +57,7 @@ const pages = document.querySelectorAll('.page');
 function navigateToPage(p) {
     navItems.forEach(i => i.classList.toggle('active', i.dataset.page === p));
     pages.forEach(i => i.classList.toggle('active', i.id === 'page-' + p));
+    window.navigation3D?.onPageChange(p);
     const titleEl = document.getElementById('pageTitle');
     if (titleEl) titleEl.textContent = p.charAt(0).toUpperCase() + p.slice(1);
 

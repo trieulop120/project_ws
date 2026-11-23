@@ -51,6 +51,7 @@ function setWsConnected(c, phase = c ? 'CONNECTED' : 'DISCONNECTED') {
     }
     window.updateMissionCycle?.(window.currentMissionSupervisorStatus);
     window.onNavTransportChange?.(c);
+    window.navigation3D?.onTransportChange?.(c);
 }
 
 /**
@@ -131,6 +132,8 @@ function connect() {
             try {
                 switch (d.type) {
                     case 'pose':
+                        // Digital Twin uses the same socket as the 2D map.
+                        window.navigation3D?.onPose?.(d);
                         if (typeof updatePose === 'function') updatePose(d);
                         if (typeof updateRobotStatus === 'function') updateRobotStatus(!d.stale);
                         break;
@@ -209,6 +212,7 @@ function connect() {
                         if (d.system_status && typeof updateSystemStatus === 'function') {
                             updateSystemStatus(d.system_status);
                         }
+                        if (d.lift) window.navigation3D?.onLift?.(d.lift);
                         if (d.lift && typeof updateLiftStatus === 'function') {
                             updateLiftStatus(d.lift);
                         }

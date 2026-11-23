@@ -126,6 +126,11 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                     "resolution": yaml_data.get('resolution', 0.05),
                     "width": width,
                     "height": height,
+                    "frame_id": getattr(bridge_node, '_map_frame', 'map'),
+                    "mode": yaml_data.get('mode', 'trinary'),
+                    "negate": yaml_data.get('negate', 0),
+                    "occupied_thresh": yaml_data.get('occupied_thresh', 0.65),
+                    "free_thresh": yaml_data.get('free_thresh', 0.25),
                     "origin": {
                         "x": origin[0],
                         "y": origin[1],
