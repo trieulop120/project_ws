@@ -1,119 +1,128 @@
 {
- "type": "FeatureCollection",
- "name": "D203B Route",
- "crs": {
-  "type": "name",
-  "properties": {
-   "name": "urn:ogc:def:crs:EPSG::4326"
-  }
- },
- "date_generated": "",
- "features": [
-  {
-   "type": "Feature",
-   "properties": {
-    "id": 0,
-    "frame": "map"
-   },
-   "geometry": {
-    "type": "Point",
-    "coordinates": [
-     0.027,
-     0.025
-    ]
-   }
+  "type": "FeatureCollection",
+  "name": "D203B Route",
+  "crs": {
+    "type": "name",
+    "properties": {
+      "name": "urn:ogc:def:crs:EPSG::4326"
+    }
   },
-  {
-   "type": "Feature",
-   "properties": {
-    "id": 1,
-    "frame": "map"
-   },
-   "geometry": {
-    "type": "Point",
-    "coordinates": [
-     1.764,
-     0.562
-    ]
-   }
-  },
-  {
-   "type": "Feature",
-   "properties": {
-    "id": 2,
-    "frame": "map"
-   },
-   "geometry": {
-    "type": "Point",
-    "coordinates": [
-     2.588,
-     1.812
-    ]
-   }
-  },
-  {
-   "type": "Feature",
-   "properties": {
-    "id": 3,
-    "frame": "map"
-   },
-   "geometry": {
-    "type": "Point",
-    "coordinates": [
-     -2.96,
-     0.2
-    ]
-   }
-  },
-  {
-   "type": "Feature",
-   "properties": {
-    "id": 4,
-    "startid": 0,
-    "endid": 1
-   },
-   "geometry": {
-    "type": "MultiLineString",
-    "coordinates": [
-     [
-      [
-       [
-        0.027,
-        0.025
-       ],
-       [
-        1.764,
-        0.562
-       ]
-      ]
-     ]
-    ]
-   }
-  },
-  {
-   "type": "Feature",
-   "properties": {
-    "id": 5,
-    "startid": 1,
-    "endid": 0
-   },
-   "geometry": {
-    "type": "MultiLineString",
-    "coordinates": [
-     [
-      [
-       [
-        1.764,
-        0.562
-       ],
-       [
-        0.027,
-        0.025
-       ]
-      ]
-     ]
-    ]
-   }
-  }
- ]
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 0,
+        "frame": "map"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.027,
+          0.025
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 1,
+        "frame": "map"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          1.764,
+          0.562
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 2,
+        "frame": "map"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          2.49,
+          1.82
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 3,
+        "frame": "map"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          1.87,
+          -0.89
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 4,
+        "frame": "map"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          1,
+          0.02
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 5,
+        "startid": 4,
+        "endid": 1
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              1,
+              0.02
+            ],
+            [
+              1.764,
+              0.562
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 6,
+        "startid": 0,
+        "endid": 4
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              0.027,
+              0.025
+            ],
+            [
+              1,
+              0.02
+            ]
+          ]
+        ]
+      }
+    }
+  ]
 }

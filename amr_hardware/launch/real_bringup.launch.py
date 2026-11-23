@@ -6,12 +6,14 @@ RTAB-Map VO tuned for 20-30Hz / low CPU
 """
 
 import os
+from typing import List
 import xacro
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo, TimerAction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
+from launch.substitutions import PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -61,6 +63,16 @@ def generate_launch_description():
         description='Enable camera driver (true/false)'
     )
     camera_enable = LaunchConfiguration('camera_enable')
+
+    aruco_marker_x_arg = DeclareLaunchArgument(
+        'aruco_marker_x', default_value='0.0',
+        description='ArUco center X offset from slot_B1 origin (m)')
+    aruco_marker_y_arg = DeclareLaunchArgument(
+        'aruco_marker_y', default_value='0.0',
+        description='ArUco center Y offset from slot_B1 origin (m)')
+    aruco_marker_z_arg = DeclareLaunchArgument(
+        'aruco_marker_z', default_value='0.122',
+        description='ArUco center Z offset from slot_B1 origin (m)')
 
     # Tat point cloud cua driver neu khong co node nao dung /points
     # (tiet kiem CPU dang ke: driver khong phai tao cloud 640x480 @30Hz)
@@ -296,6 +308,36 @@ def generate_launch_description():
         condition=IfCondition(camera_enable)
     )
 
+    # Independent RGB ArUco pose estimate for comparison; never changes AMCL.
+    aruco_b1_localizer = Node(
+        package='aruco_b1_package',
+        executable='aruco_b1_localizer',
+        name='aruco_b1_localizer',
+        output='screen',
+        parameters=[{
+            'image_topic': '/color/image_raw',
+            'camera_info_topic': '/color/camera_info',
+            'map_frame': 'map',
+            'base_frame': 'base_footprint',
+            'slot_frame': 'slot_B1',
+            'marker_frame': 'aruco_B1',
+            'aruco_base_frame': 'base_footprint_aruco',
+            'marker_id': 0,
+            'dictionary': 'DICT_4X4_50',
+            'marker_size_m': 0.10,
+            'marker_xyz_slot_m': ParameterValue(
+                PythonExpression([
+                    '[', LaunchConfiguration('aruco_marker_x'), ', ',
+                    LaunchConfiguration('aruco_marker_y'), ', ',
+                    LaunchConfiguration('aruco_marker_z'), ']']),
+                value_type=List[float]),
+            'auto_update_amcl': False,
+            'search_hz': 1.5,
+            'track_hz': 8.0,
+        }],
+        condition=IfCondition(camera_enable),
+    )
+
     # ============================================
     # PointCloud Downsampler Node
     # ============================================
@@ -466,6 +508,9 @@ def generate_launch_description():
         serial_baudrate_arg,
         scan_mode_arg,
         camera_enable_arg,
+        aruco_marker_x_arg,
+        aruco_marker_y_arg,
+        aruco_marker_z_arg,
         enable_pointcloud_arg,
         use_vo_arg,
         vo_decimation_arg,
@@ -488,6 +533,7 @@ def generate_launch_description():
         lidar_node,
         scan_filter_node,
         camera_driver,
+        aruco_b1_localizer,
         pointcloud_filter_node,
         #vo_node,
         #vo_relay_node,

@@ -362,7 +362,7 @@ class PalletDetectorNode(Node):
         # Cargo height is the max/min base-frame Z span of valid depth
         # inside the associated carton masks; no model retraining is needed.
         self.declare_parameter('use_box_height_class', True)
-        self.declare_parameter('box_height_threshold_m', 0.32)  # >= tall, < medium
+        self.declare_parameter('box_height_threshold_m', 0.30)  # >= tall, < medium
         self.declare_parameter('box_height_min_pixels', 30)
         # Empirical correction: reported Z-span bias is +7 cm. This adjusts
         # cargo height only, never camera TF, depth, pallet pose or yaw.
@@ -1391,7 +1391,7 @@ class PalletDetectorNode(Node):
         in_top = v <= polygon[:, 1].min() + band
         if int(in_top.sum()) < self.box_height_min_pixels:
             return None
-        z_top = float(np.percentile(z[in_top], 90))
+        z_top = float(np.max(z[in_top]))
         z_bottom = float(np.percentile(z, 1))
         return z_bottom, z_top
 
@@ -1445,7 +1445,7 @@ class PalletDetectorNode(Node):
         z_min = min(limits[0] for limits in ranges)
         z_max = max(limits[1] for limits in ranges)
         raw_height = z_max - z_min
-        # Remove floating-point residue at the 0.32 m class boundary.
+        # Remove floating-point residue at the 0.30 m class boundary.
         height = round(raw_height, 9)
         if not np.isfinite(height) or height <= 0:
             return

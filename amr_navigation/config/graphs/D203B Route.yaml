@@ -5,7 +5,7 @@ nodes:
     position:
       x: 0.027
       y: 0.025
-      z: 0.0
+      z: 0
     orientation:
       yaw: -0.013
     type: home
@@ -19,7 +19,7 @@ nodes:
     position:
       x: 1.764
       y: 0.562
-      z: 0.0
+      z: 0
     orientation:
       yaw: -1.643
     type: pickup_approach
@@ -28,28 +28,43 @@ nodes:
     name: P_1
   D_1:
     position:
-      x: 2.588
-      y: 1.812
-      z: 0.0
+      x: 2.49
+      y: 1.82
+      z: 0
     orientation:
-      yaw: 1.579
+      yaw: 1.5646876744129163
     type: dropoff_approach
     floor: 1
     description: Node D_1
     name: D_1
   D_2:
+    name: D_2
     position:
-      x: -2.96
-      y: 0.2
-      z: 0.0
+      x: 1.87
+      y: -0.89
+      z: 0
     orientation:
-      yaw: -3.1416
+      yaw: -1.5792010984107323
     type: dropoff_approach
     floor: 1
-    description: Diem tha pallet lay ra tu ke (xuat kho)
-    name: D_2
+    description: ''
+    properties: {}
+  J_1:
+    name: J_1
+    position:
+      x: 1
+      y: 0.02
+      z: 0
+    orientation:
+      yaw: 0.05671636046678576
+    type: transit
+    floor: 1
+    description: ''
+    properties: {}
 edges:
-- from: NODE_HOME
+- from: J_1
   to: P_1
   bidirectional: true
-  weight: 1
+- from: NODE_HOME
+  to: J_1
+  bidirectional: true

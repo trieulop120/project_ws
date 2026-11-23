@@ -48,6 +48,27 @@ Visualization Manager:
       Plane Cell Count: 1000
       Reference Frame: <Fixed Frame>
       Value: true
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Length: 0.35
+      Name: AMCL base_footprint
+      Radius: 0.012
+      Reference Frame: base_footprint
+      Value: true
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Length: 0.45
+      Name: ArUco base_footprint_aruco
+      Radius: 0.018
+      Reference Frame: base_footprint_aruco
+      Value: true
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Length: 0.22
+      Name: ArUco marker B1
+      Radius: 0.012
+      Reference Frame: aruco_B1
+      Value: true
     - Class: rviz_default_plugins/TF
       Enabled: false
       Frame Timeout: 15
