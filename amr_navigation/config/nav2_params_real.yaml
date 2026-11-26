@@ -183,8 +183,8 @@ controller_server:
       vy_max: 0.0
       vy_min: 0.0
 
-      wz_max: 0.8           # PRECISION: slower turning
-      wz_min: -0.8
+      wz_max: 0.5           # PRECISION: slower turning
+      wz_min: -0.5
 
       iteration_count: 1
       prune_distance: 1.0
@@ -501,10 +501,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.25, 0.0, 0.8]    # PRECISION: match controller limits
-    min_velocity: [-0.15, -0.0, -0.8]   # KHÔNG BACKWARD: match vx_min: 0.0
-    max_accel: [0.1, 0.0, 0.4]          # PRECISION: slower acceleration
-    max_decel: [-0.1, -0.0, -0.4]
+    max_velocity: [0.25, 0.0, 0.5]    # PRECISION: match controller limits
+    min_velocity: [-0.15, -0.0, -0.5]   # KHÔNG BACKWARD: match vx_min: 0.0
+    max_accel: [0.1, 0.0, 0.2]          # PRECISION: slower acceleration
+    max_decel: [-0.1, -0.0, -0.2]
     odom_topic: /odometry/filtered
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

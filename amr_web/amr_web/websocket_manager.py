@@ -15,6 +15,7 @@ class WebSocketManager:
 
     def __init__(self):
         self._connections: Dict[WebSocket, asyncio.Lock] = {}
+        self._point_cloud_clients = set()
         self._lock = threading.Lock()
 
     def add(self, websocket: WebSocket) -> None:
@@ -24,6 +25,30 @@ class WebSocketManager:
     def remove(self, websocket: WebSocket) -> None:
         with self._lock:
             self._connections.pop(websocket, None)
+            self._point_cloud_clients.discard(websocket)
+
+    def set_point_cloud_enabled(self, websocket: WebSocket, enabled: bool) -> bool:
+        """Opt a connected client into or out of cloud telemetry."""
+        with self._lock:
+            if websocket not in self._connections:
+                return False
+            if enabled:
+                self._point_cloud_clients.add(websocket)
+            else:
+                self._point_cloud_clients.discard(websocket)
+            return True
+
+    @property
+    def has_point_cloud_clients(self) -> bool:
+        with self._lock:
+            return bool(self._point_cloud_clients)
+
+    async def broadcast_point_cloud(self, message: str) -> None:
+        with self._lock:
+            clients = list(self._point_cloud_clients)
+        if clients:
+            await asyncio.gather(*(self.send(ws, message, drop_if_busy=True)
+                                   for ws in clients))
 
     async def send(self, ws: WebSocket, message: str, drop_if_busy: bool = False) -> bool:
         """Send message to a single WebSocket with per-connection lock."""

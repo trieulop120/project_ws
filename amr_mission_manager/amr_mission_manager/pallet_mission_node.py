@@ -147,7 +147,7 @@ DEFAULTS = {
     'retrieval_tf_jump_m': 0.10,
     'retrieval_tf_jump_deg': 10.0,
     # hieu chinh he thong (khung pallet: +x vao pallet, +y trai)
-    'pallet_lat_offset_m': -0.02,     # >0 dich diem dich sang TRAI huong vao pallet
+    'pallet_lat_offset_m': 0.0,     # >0 dich diem dich sang TRAI huong vao pallet
     'pallet_yaw_offset_deg': 0.0,
     'face_offset_m': 0.0,           # vi tri mat truoc so voi diem detector, doc +X
     # Hieu chinh LECH DO NGHIENG: detector lay tia qua pixel TAM OBB nhung do sau = percentile

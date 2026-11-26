@@ -206,6 +206,7 @@ function connect() {
                         break;
 
                     case 'system_status':
+                        window.navigation3D?.onLidarHeight(d.lidar_height_m);
                         if (d.devices && typeof updateDeviceStatuses === 'function') {
                             updateDeviceStatuses(d.devices);
                         }
@@ -213,6 +214,7 @@ function connect() {
                             updateSystemStatus(d.system_status);
                         }
                         if (d.lift) window.navigation3D?.onLift?.(d.lift);
+                        if (d.warehouse_view) window.navigation3D?.onWarehouse?.(d.warehouse_view);
                         if (d.lift && typeof updateLiftStatus === 'function') {
                             updateLiftStatus(d.lift);
                         }
@@ -253,6 +255,15 @@ function connect() {
                         if (typeof updateLaser === 'function') {
                             updateLaser(d);
                         }
+                        window.navigation3D?.onLaserScan?.(d);
+                        break;
+
+                    case 'point_cloud':
+                        window.navigation3D?.onPointCloud?.(d);
+                        break;
+
+                    case 'semantic_state':
+                        window.navigation3D?.onSemanticState?.(d);
                         break;
 
                     case 'nav_state':
@@ -360,6 +371,7 @@ function sendCommand(cmd) {
         return false;
     }
 }
+window.sendCommand = sendCommand;
 
 // Stop can include coordinator, Nav2 terminal, pallet and process shutdown
 // waits in sequence. These are acknowledgement deadlines, never success timers.

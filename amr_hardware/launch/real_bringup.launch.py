@@ -354,9 +354,9 @@ def generate_launch_description():
         ros_arguments=['--log-level', quiet_log_level],
         parameters=[{
             'use_sim_time': False,
-            'leaf_size': 0.05,
-            'z_min': 0.05,
-            'z_max': 1.20,
+            'height_min': 0.05,
+            'height_max': 1.20,
+            'voxel_leaf_size': 0.05,
         }],
         condition=IfCondition(camera_enable)
     )

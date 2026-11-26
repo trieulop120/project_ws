@@ -12,9 +12,11 @@ import traceback
 import mimetypes
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from typing import Optional
 from amr_web.websocket_manager import WebSocketManager
@@ -144,6 +146,64 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
             if node_logger:
                 node_logger.error(f'Map image {map_id} failed: {e}')
             return {"status": "error", "message": "Map image unavailable; check the selected map files"}
+
+    @app.get("/api/map/scene/{map_id}")
+    def get_map_scene(map_id: str, route_id: Optional[str] = None):
+        if not valid_resource_id(map_id):
+            raise HTTPException(400, "Invalid map identifier")
+        maps_dir = Path("~/project_ws/maps").expanduser().resolve()
+        if not (maps_dir / f"{map_id}.yaml").is_file():
+            raise HTTPException(404, "Map not found")
+        layout = None
+        source = None
+        for directory, relative in [
+            (maps_dir, Path(map_id) / "semantic_scene.json"),
+            (Path(web_dir) / "semantic_maps", Path(f"{map_id}.json")),
+        ]:
+            root = directory.resolve()
+            candidate = (root / relative).resolve()
+            if not candidate.is_relative_to(root):
+                raise HTTPException(400, "Invalid semantic scene path")
+            if candidate.is_file():
+                source = candidate
+                break
+
+        rack = None
+        frame = getattr(bridge_node, '_map_frame', 'map')
+        if route_id and valid_resource_id(route_id) and bridge_node:
+            active = bridge_node.get_nav_state()
+            if active.get('map_id') == map_id and active.get('route_id') == route_id:
+                try:
+                    from amr_mission_manager.shelf_model import ShelfModel
+                    from amr_navigation.route_graph_loader import RouteGraphLoader
+                    from amr_web.shelf_visual import rack_from_route
+                    shelf_path = Path(get_package_share_directory('amr_mission_manager')) / 'config' / 'shelf.yaml'
+                    routes = (maps_dir / map_id / 'routes').resolve()
+                    path = (routes / f'{route_id}.yaml').resolve()
+                    if path.is_relative_to(routes) and routes.is_relative_to(maps_dir) and path.is_file():
+                        rack = rack_from_route(ShelfModel.from_yaml(str(shelf_path)),
+                                               RouteGraphLoader(yaml_path=str(path)), frame)
+                except (ValueError, OSError, KeyError) as error:
+                    if node_logger:
+                        node_logger.warn(f'Warehouse rack unavailable: {error}')
+        headers = {"Cache-Control": "no-store"}
+        if source and not rack:
+            return FileResponse(source, media_type="application/json", headers=headers)
+        if not rack:
+            raise HTTPException(404, "Semantic scene not configured")
+        if source:
+            try:
+                layout = json.loads(source.read_text(encoding='utf-8'), parse_constant=_reject_json_constant)
+            except (OSError, ValueError):
+                if node_logger:
+                    node_logger.warn(f'Warehouse layout could not be read for {map_id}')
+        if (not isinstance(layout, dict) or layout.get('map_id') != map_id or
+                layout.get('frame_id', frame) != frame or not isinstance(layout.get('objects'), list)):
+            layout = {'schema_version': 1, 'map_id': map_id, 'frame_id': frame, 'objects': []}
+        layout['objects'] = [obj for obj in layout['objects']
+                             if not isinstance(obj, dict) or obj.get('id') != rack['id']]
+        layout['objects'].append(rack)
+        return JSONResponse(layout, headers=headers)
 
     @app.get("/api/routes")
     def get_routes(map_id: str = None):
@@ -605,7 +665,17 @@ def create_app(state_bridge: StateBridge, ws_manager: WebSocketManager, node_log
                     completion = asyncio.get_running_loop().create_future()
                     requests[request_id] = (fingerprint, completion)
                 try:
-                    if cmd['command'] in motion_commands and generation != command_generation:
+                    if cmd['command'] == 'point_cloud_stream':
+                        if type(cmd.get('enabled')) is not bool:
+                            response = {'type': 'command_response', 'command': 'point_cloud_stream',
+                                'request_id': request_id, 'status': 'failed',
+                                'message': 'enabled must be a boolean'}
+                        else:
+                            enabled = cmd['enabled']
+                            ws_manager.set_point_cloud_enabled(websocket, enabled)
+                            response = {'type': 'command_response', 'command': 'point_cloud_stream',
+                                'request_id': request_id, 'status': 'ok', 'enabled': enabled}
+                    elif cmd['command'] in motion_commands and generation != command_generation:
                         response = {'type': 'command_response', 'command': cmd['command'],
                             'request_id': request_id, 'status': 'failed', 'message': 'Command superseded by Stop'}
                     else:

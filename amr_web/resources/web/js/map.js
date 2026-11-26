@@ -368,14 +368,7 @@
         route.nodes.forEach(node => {
             const cp = worldToCanvas(node.position.x, node.position.y);
             const radius = (node.type === 'home' ? 5 : 3.5) / vt.scale;
-            const colors = {
-                home: '#f97316',
-                pickup_approach: '#3b82f6',
-                dropoff_approach: '#ef4444',
-                transit: '#10B981',
-                charging: '#9ca3af'
-            };
-            ctx.fillStyle = colors[node.type] || '#10B981';
+            ctx.fillStyle = window.routeNodeColor(node);
             ctx.beginPath();
             ctx.arc(cp.x, cp.y, radius, 0, Math.PI * 2);
             ctx.fill();
@@ -782,6 +775,7 @@
             info,
             data: imageDataBase64,
             is_pgm_raw: true,
+            map_id: mapId,
             frame_id: mapId
         };
 

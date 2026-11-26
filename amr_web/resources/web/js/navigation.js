@@ -33,7 +33,7 @@
     let lastManualTarget = '--';
     let retrievalProgressStep = 0;
     window.navigationRequests = {goal: false, cancel: false};
-    let routeRestoreKey = null;
+    let routeRestoreRequest = null;
     let modalGeneration = 0;
     let modalLoading = false;
     const seenNavResults = new Set();
@@ -370,12 +370,17 @@
     // Khôi phục Route Graph khi F5/reload
     // ============================================
     async function restoreRouteData(mapId, routeId) {
+        const key = JSON.stringify([mapId, routeId]);
+        if (routeRestoreRequest?.key === key) return;
+        const request = {key};
+        routeRestoreRequest = request;
         try {
             const res = await fetch(`/api/routes?map_id=${encodeURIComponent(mapId)}`);
             const json = await res.json();
             if (json.status === 'ok' && json.routes && json.routes.length > 0) {
                 // Tim route khớp với routeId tu backend
-                if (window.selectedNavMap !== mapId || window.selectedNavRoute !== routeId) return;
+                if (routeRestoreRequest !== request || window.selectedNavMap !== mapId ||
+                        window.selectedNavRoute !== routeId) return;
                 const route = json.routes.find(r => r.id === routeId);
                 if (!route) return;
                 window.currentRoute = route;
@@ -388,7 +393,7 @@
         } catch (e) {
             console.error('[Nav] Failed to restore route:', e);
         } finally {
-            if (routeRestoreKey === key) routeRestoreKey = null;
+            if (routeRestoreRequest === request) routeRestoreRequest = null;
         }
     }
 
@@ -2022,7 +2027,11 @@
             ++navMapLoadSeq;
             navMapLoading = false;
         }
-        if (navState.route_id !== window.selectedNavRoute) window.currentRoute = null;
+        if (navState.route_id !== window.selectedNavRoute ||
+                (navState.map_id && navState.map_id !== window.selectedNavMap)) {
+            window.currentRoute = null;
+            routeRestoreRequest = null;
+        }
         if (navState.map_id) {
             window.selectedNavMap = navState.map_id;
             window.selectedNavRoute = navState.route_id;

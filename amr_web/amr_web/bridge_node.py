@@ -17,6 +17,7 @@ import json
 import math
 import os
 import signal
+import struct
 import subprocess
 import tempfile
 import threading
@@ -30,9 +31,10 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from rclpy.time import Time
 from action_msgs.msg import GoalStatusArray
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
-from sensor_msgs.msg import BatteryState, Image, LaserScan, JointState
+from sensor_msgs.msg import BatteryState, Image, LaserScan, JointState, PointCloud2
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from rcl_interfaces.srv import SetParameters
@@ -40,7 +42,7 @@ from std_srvs.srv import Trigger
 import uvicorn
 
 # Phase B05: tf2_ros for pose re-frame (odom -> map)
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import Buffer, TransformListener, TransformException
 
 from amr_web.websocket_manager import WebSocketManager
 from amr_web.state_bridge import StateBridge
@@ -52,6 +54,9 @@ from amr_web.converters import (
 from amr_web.web_server import create_app
 from amr_web.nav_bridge import NavBridge
 from amr_web.navigation_validation import valid_resource_id
+from geometry_msgs.msg import PoseStamped
+from amr_web.warehouse_view import WarehouseView
+from amr_web.point_cloud import read_xyz, transform_xyz
 # History (HISTORY_RESULTS_PLAN.md §6): edge-triggered system events.
 # Import is guarded so a broken history package cannot kill the bridge.
 try:
@@ -137,6 +142,8 @@ class WebBridge(Node):
         self.declare_parameter('camera_topic', '/color/image_raw')
         self.declare_parameter('depth_camera_topic', '/depth/image_raw')
         self.declare_parameter('lidar_topic', '/scan_filtered')
+        self.declare_parameter('lidar_frame', 'lidar_link')
+        self.declare_parameter('point_cloud_topic', '/points_filtered')
         self.declare_parameter('joint_topic', '/joint_states')
         self.declare_parameter('pose_rate', 5.0)
         # Phase B05: frames for tf lookup (map -> base)
@@ -171,6 +178,7 @@ class WebBridge(Node):
         self.declare_parameter('supervisor_status_topic', '/mission_supervisor/status')
         self._supervisor_status_topic = self.get_parameter('supervisor_status_topic').value
         self._lidar_topic = self.get_parameter('lidar_topic').value
+        self._point_cloud_topic = self.get_parameter('point_cloud_topic').value
         self._joint_topic = self.get_parameter('joint_topic').value
         self._pose_rate = self.get_parameter('pose_rate').value
         self._base_frame = self.get_parameter('base_frame').value
@@ -194,6 +202,7 @@ class WebBridge(Node):
         # Pallet mission status (JSON from /pallet_mission/status). None until
         # the mission node publishes; exposed to web as mission{state,cargo,
         # us_cm,lift_cm,ts} piggybacked on the 1Hz system_status broadcast.
+        self._warehouse_view = WarehouseView()
         self._mission_status = None
         self._mission_supervisor_status = None
         self._pallet_retrieval_status = None
@@ -226,6 +235,9 @@ class WebBridge(Node):
         # State Managers
         self._state_bridge = StateBridge()
         self._ws_manager = WebSocketManager()
+        self._cloud_lock = threading.Lock()
+        self._cloud_latest = None  # One-slot mailbox; ROS callback never parses or waits for TF.
+        self._last_cloud_send = 0.0
         self._last_map_hash = None
 
         # Lift state tracking
@@ -281,6 +293,9 @@ class WebBridge(Node):
         self._laser_sub = self.create_subscription(
             LaserScan, self._lidar_topic, self._on_laser, qos_profile=sensor_qos(),
             callback_group=self._cb_sensor)
+        self._cloud_sub = self.create_subscription(
+            PointCloud2, self._point_cloud_topic, self._on_point_cloud,
+            qos_profile=sensor_qos(), callback_group=self._cb_sensor)
 
         # FastAPI Server Setup
         self._app = create_app(
@@ -341,6 +356,12 @@ class WebBridge(Node):
             String, self._mission_status_topic, self._on_mission_status, 10)
         self._mission_supervisor_status_sub = self.create_subscription(
             String, self._supervisor_status_topic, self._on_mission_supervisor_status, 10)
+        self._warehouse_detector_pose = self.create_subscription(
+            PoseStamped, '/pallet/pose', self._on_warehouse_detector_pose, 10)
+        self._warehouse_camera_cargo = self.create_subscription(
+            String, '/pallet/cargo', self._on_warehouse_camera_cargo, 10)
+        self._warehouse_selected_pose = self.create_subscription(
+            PoseStamped, '/pallet_retrieval/selected_pose', self._on_warehouse_selected_pose, 10)
         self._pallet_retrieval_status_sub = self.create_subscription(
             String, '/pallet_retrieval/status', self._on_pallet_retrieval_status, 10)
         self._mission_start_client = self.create_client(Trigger, '/mission/start')
@@ -364,9 +385,6 @@ class WebBridge(Node):
         self._pallet_stop_client = self.create_client(Trigger, '/pallet_mission/stop')
         self._pallet_discard_client = self.create_client(Trigger, '/pallet_mission/discard_recovery')
         self._confirm_empty_client = self.create_client(Trigger, '/pallet_mission/confirm_empty')
-        self._lidar_sub = self.create_subscription(
-            LaserScan, self._lidar_topic, self._on_lidar, qos_profile=sensor_qos(),
-            callback_group=self._cb_sensor)
         self._joint_sub = self.create_subscription(
             JointState, self._joint_topic, self._on_joint, qos_profile=10,
             callback_group=self._cb_sensor)
@@ -571,8 +589,28 @@ class WebBridge(Node):
                 if now - self._last_laser_send >= self._laser_interval:
                     laser = self._state_bridge.get_latest_laser()
                     if laser:
+                        pose = self._laser_visual_pose(laser)
+                        if pose is not None:
+                            laser = {**laser, 'scan_pose': pose}
                         await self._ws_manager.broadcast(json.dumps(laser))
                         self._last_laser_send = now
+
+                if self._ws_manager.has_point_cloud_clients:
+                    if time.monotonic() - self._last_cloud_send >= 0.2:
+                        with self._cloud_lock:
+                            cloud = self._cloud_latest
+                            self._cloud_latest = None
+                        if cloud is not None:
+                            map_id, message = cloud
+                            if map_id == self._nav_bridge.get_active_map_id():
+                                self._last_cloud_send = time.monotonic()
+                                payload = await asyncio.to_thread(self._convert_point_cloud, message)
+                                if payload is not None and map_id == self._nav_bridge.get_active_map_id():
+                                    payload['map_id'] = map_id
+                                    await self._ws_manager.broadcast_point_cloud(json.dumps(payload))
+                else:
+                    with self._cloud_lock:
+                        self._cloud_latest = None
 
                 if self._map_pending and (now - self._last_map_send) >= self._map_interval:
                     map_data = self._state_bridge.get_latest_map()
@@ -705,6 +743,57 @@ class WebBridge(Node):
         # so it only costs CPU when a client selected the 'detect' cam mode.
         self._process_and_broadcast_cam(msg, 'detect')
 
+    def _warehouse_map_id(self):
+        nav = getattr(self, '_nav_bridge', None)
+        return nav.get_active_map_id() if nav else None
+
+    def _warehouse_retrieval(self):
+        status = self._pallet_retrieval_status
+        if (status and not status.get('superseded') and
+                time.time() - status.get('ts', 0) <= 3 and
+                status.get('state') in self._RETRIEVAL_ACTIVE):
+            return status
+        return None
+
+    def _on_warehouse_detector_pose(self, msg):
+        if self._warehouse_retrieval() is None:
+            self._warehouse_selected(msg, None)
+
+    def _on_warehouse_selected_pose(self, msg):
+        retrieval = self._warehouse_retrieval()
+        if retrieval:
+            self._warehouse_selected(msg, retrieval)
+
+    def _on_warehouse_camera_cargo(self, msg):
+        if self._warehouse_retrieval() is not None:
+            return
+        try:
+            data = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if isinstance(data, dict):
+            self._warehouse_view.camera_cargo(self._warehouse_map_id(), data)
+
+    def _warehouse_selected(self, msg, retrieval):
+        if msg.header.frame_id != self._map_frame:
+            return
+        try:
+            stamp = Time.from_msg(msg.header.stamp)
+            age = (self.get_clock().now() - stamp).nanoseconds / 1e9
+        except (TypeError, ValueError):
+            return
+        if stamp.nanoseconds == 0 or not -0.25 <= age <= 3.0:
+            return
+        point, q = msg.pose.position, msg.pose.orientation
+        if not all(math.isfinite(v) for v in (point.x, point.y, point.z, q.x, q.y, q.z, q.w)):
+            return
+        if not 0.99 <= q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w <= 1.01:
+            return
+        yaw = math.atan2(2*(q.w*q.z + q.x*q.y), 1-2*(q.y*q.y + q.z*q.z))
+        self._warehouse_view.pose(self._warehouse_map_id(),
+                                  {'x': point.x, 'y': point.y, 'z': point.z, 'yaw': yaw},
+                                  retrieval, stamp.nanoseconds)
+
     def _on_mission_status(self, msg: String) -> None:
         """Parse /pallet_mission/status JSON; keep a compact view for the web
         cargo card. A malformed/absent payload never blocks the bridge."""
@@ -712,6 +801,10 @@ class WebBridge(Node):
             d = json.loads(msg.data)
         except Exception:
             return
+        if not isinstance(d, dict):
+            return
+        if hasattr(self, '_warehouse_view'):
+            self._warehouse_view.mission(self._warehouse_map_id(), d, self._warehouse_retrieval())
         self._mission_status = {
             'state': d.get('state'),
             'last_resumed_checkpoint_id': d.get('last_resumed_checkpoint_id'),
@@ -1038,6 +1131,16 @@ class WebBridge(Node):
             result['can_start'] = False
         return result
 
+    def get_lidar_height(self):
+        """Read the mounted scan origin for visualization from the existing TF buffer."""
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                self._base_frame, self.get_parameter('lidar_frame').value, rclpy.time.Time())
+        except TransformException:
+            return None
+        height = transform.transform.translation.z
+        return height if math.isfinite(height) and height > 0 else None
+
     def get_web_mission_status(self):
         """Use the same three-source snapshot on connect and periodic updates."""
         now = time.time()
@@ -1049,6 +1152,8 @@ class WebBridge(Node):
             'mission': fresh_copy(self._mission_status),
             'mission_supervisor': self.get_mission_supervisor_status(),
             'pallet_retrieval': fresh_copy(self._pallet_retrieval_status),
+            'lidar_height_m': self.get_lidar_height(),
+            'warehouse_view': self._warehouse_view.snapshot(self._warehouse_map_id(), self._map_frame),
         }
 
     def _is_navigation_goal_active(self) -> bool:
@@ -1800,21 +1905,92 @@ class WebBridge(Node):
             if self._verbose:
                 self.get_logger().warn(f'Plan error: {e}')
 
-    def _on_lidar(self, msg: LaserScan) -> None:
-        self._state_bridge.update_heartbeat('lidar')
+    def _on_point_cloud(self, msg: PointCloud2) -> None:
+        """Keep only the newest requested frame; conversion runs off ROS callbacks."""
+        if not self._ws_manager.has_point_cloud_clients:
+            return
+        map_id = self._nav_bridge.get_active_map_id() if self._nav_bridge else None
+        if map_id is not None:
+            with self._cloud_lock:
+                self._cloud_latest = (map_id, msg)
+
+    def _convert_point_cloud(self, msg: PointCloud2):
+        """Resolve map<-sensor at the sensor stamp, then convert at most 500 points."""
+        stamp = msg.header.stamp
+        if not msg.header.frame_id or (stamp.sec == 0 and stamp.nanosec == 0):
+            return None
+        try:
+            sensor_time = Time.from_msg(stamp)
+            age = (self.get_clock().now() - sensor_time).nanoseconds / 1e9
+            if age > 1.0 or age < -0.25:
+                return None
+            # Never request Time() (latest): historical clouds need their own TF.
+            transform = self._tf_buffer.lookup_transform(
+                self._map_frame, msg.header.frame_id, sensor_time)
+            points = read_xyz(msg, limit=500)
+            if not points:
+                return None
+            t = transform.transform.translation
+            q = transform.transform.rotation
+            mapped = transform_xyz(points, (t.x, t.y, t.z), (q.x, q.y, q.z, q.w))
+            return {
+                'type': 'point_cloud', 'frame_id': self._map_frame,
+                'stamp': {'sec': stamp.sec, 'nanosec': stamp.nanosec},
+                # Visualization-only sensor origin enables map-wall occlusion
+                # checks for clouds on maps whose perimeter is open in 2D.
+                'sensor_origin': [t.x, t.y, t.z],
+                'points': mapped,
+            }
+        except (TransformException, ValueError, TypeError, IndexError, struct.error):
+            return None
 
     def _on_laser(self, msg: LaserScan) -> None:
+        self._state_bridge.update_heartbeat('lidar')
         # Chi convert theo nhip broadcast (10 Hz), bo qua cac ban tin thua
         now = time.time()
         if now - self._last_laser_convert < self._laser_interval:
             return
         self._last_laser_convert = now
         try:
+            nav = getattr(self, '_nav_bridge', None)
+            map_id = nav.get_active_map_id() if nav else None
             laser_data = laser_to_json(msg)
+            stamp = msg.header.stamp
+            laser_data.update(map_id=map_id, stamp={'sec': stamp.sec, 'nanosec': stamp.nanosec},
+                              angle_min_rad=msg.angle_min, angle_increment_rad=msg.angle_increment)
             self._state_bridge.update_laser(laser_data)
         except Exception as e:
             if self._verbose:
                 self.get_logger().warn(f'Laser error: {e}')
+
+    def _laser_visual_pose(self, scan):
+        """Attach TF metadata to the existing scan broadcast, at the first ray stamp."""
+        map_id = scan.get('map_id')
+        frame = scan.get('frame_id')
+        stamp = scan.get('stamp')
+        nav = self._nav_bridge
+        if not map_id or not frame or not stamp or not nav or nav.get_active_map_id() != map_id:
+            return None
+        if not (stamp['sec'] or stamp['nanosec']):
+            return None
+        clock = self.get_clock()
+        scan_time = Time(seconds=stamp['sec'], nanoseconds=stamp['nanosec'], clock_type=clock.clock_type)
+        age_ns = (clock.now() - scan_time).nanoseconds
+        if not 0 <= age_ns <= 500_000_000:
+            return None
+        try:
+            tf = self._tf_buffer.lookup_transform(self._map_frame, frame, scan_time).transform
+            mount = self._tf_buffer.lookup_transform(self._base_frame, frame, scan_time).transform
+        except TransformException:
+            return None
+        t, q = tf.translation, tf.rotation
+        position = [t.x, t.y, t.z]
+        rotation = [q.x, q.y, q.z, q.w]
+        height = mount.translation.z
+        if (not all(math.isfinite(v) for v in (*position, *rotation, height)) or
+                height <= 0 or nav.get_active_map_id() != map_id):
+            return None
+        return {'frame_id': self._map_frame, 'position': position, 'rotation': rotation, 'height_m': height}
 
     def _on_joint(self, msg: JointState) -> None:
         if 'encoder_lift_joint' in msg.name:
@@ -2050,6 +2226,7 @@ class WebBridge(Node):
 
     def get_available_routes(self, map_id: str = None) -> list:
         import yaml
+        from amr_navigation.route_graph_loader import RouteGraphLoader
         routes = []
         try:
             if map_id:
@@ -2066,14 +2243,32 @@ class WebBridge(Node):
 
                             nodes = []
                             edges = []
+                            special_nodes = {}
                             try:
                                 with open(full_path, 'r', encoding='utf-8') as rf:
                                     rdata = yaml.safe_load(rf) or {}
                                     raw_nodes = rdata.get('nodes', {})
                                     if isinstance(raw_nodes, dict):
-                                        nodes = list(raw_nodes.values())
+                                        nodes = [{**node, 'node_id': node_id}
+                                                 for node_id, node in raw_nodes.items() if isinstance(node, dict)]
+                                        loader = RouteGraphLoader(yaml_path=full_path)
+                                        for role, alias in (('HOME', 'NODE_HOME'), ('P_1', 'PICK1'),
+                                                            ('D_1', 'DROP1'), ('D_2', 'DROP2')):
+                                            name = loader.resolve(role) or loader.resolve(alias)
+                                            if name is not None:
+                                                special_nodes[role] = name
                                     elif isinstance(raw_nodes, list):
-                                        nodes = raw_nodes
+                                        nodes = [node for node in raw_nodes if isinstance(node, dict)]
+                                        names = {node.get('name') for node in nodes}
+                                        for role, alias in (('HOME', 'NODE_HOME'), ('P_1', 'PICK1'),
+                                                            ('D_1', 'DROP1'), ('D_2', 'DROP2')):
+                                            if role in names or alias in names:
+                                                special_nodes[role] = role if role in names else alias
+                                        if 'HOME' not in special_nodes:
+                                            for node in nodes:
+                                                if node.get('type') == 'home' and node.get('name'):
+                                                    special_nodes['HOME'] = node['name']
+                                                    break
                                     edges = rdata.get('edges', [])
                             except Exception as re:
                                 self.get_logger().warn(f'Error reading route file {full_path}: {re}')
@@ -2085,6 +2280,7 @@ class WebBridge(Node):
                                 'created': created,
                                 'graph_name': route_id,
                                 'nodes': nodes,
+                                'special_nodes': special_nodes,
                                 'edges': edges,
                                 'nodeCount': len(nodes),
                                 'edgeCount': len(edges)

@@ -2,7 +2,7 @@
 (function () {
     'use strict';
 
-    let layer, button2D, button3D, axesButton, axesLegend, fitButton, wallsButton,
+    let layer, button2D, button3D, wallsButton,
         rawButton, cleanButton, status, viewport, followButton, poseReadout;
     let viewer = null;
     let mode = '2d';
@@ -14,12 +14,17 @@
     let failedMapId = null;
     let failedReason = '';
     let wallsVisible = true;
-    let axesVisible = true;
     let displayMode = 'clean';
+    let cloudRequested = false;
+    let sceneManager = null;
+    let markerFeed = null;
+    let observedRouteId = null;
     let lastPose = null;
     let lastPoseArrival = 0;
     let transportConnected = false;
     let poseMonitor = null;
+    let lastLayoutRefresh = 0;
+    let lidarHeight = null;
     let latestLiftMeters = null;
     let modelKind = 'loading';
     const POSE_TIMEOUT_MS = 3000;
@@ -28,7 +33,7 @@
 
     function setStatus(message) {
         if (!status) return;
-        status.textContent = message;
+        if (status.textContent !== message) status.textContent = message;
         status.hidden = !message;
     }
 
@@ -37,24 +42,10 @@
         followButton.textContent = enabled ? 'Follow Robot: ON' : 'Follow Robot: OFF';
         followButton.setAttribute('aria-pressed', String(enabled));
         followButton.classList.toggle('active', enabled);
-        const hint = document.querySelector('#navThreeLayer .nav-three-hint');
-        if (hint) hint.textContent = enabled
-            ? 'Follow Robot: scroll or pinch to zoom'
-            : 'Drag to pan · Right drag to rotate · Scroll to zoom';
     }
 
     function createRobotControls() {
-        // The original HTML/CSS was not supplied. Inject next to the existing
-        // Fit Map button, preserving the toolbar's native layout and class names.
         followButton = document.getElementById('navThreeFollow');
-        if (!followButton && fitButton?.parentElement) {
-            followButton = document.createElement('button');
-            followButton.id = 'navThreeFollow';
-            followButton.type = 'button';
-            followButton.className = fitButton.className;
-            followButton.title = 'ON: zoom only. OFF: pan, rotate and zoom.';
-            fitButton.insertAdjacentElement('afterend', followButton);
-        }
         followButton?.addEventListener('click', () => {
             if (!viewer || mode !== '3d') return;
             viewer.setFollowRobot(!viewer.isFollowingRobot());
@@ -89,25 +80,27 @@
             : `${label} | ${model}`;
     }
 
+    function hasLiveMapPose(frame) {
+        const age = Date.now() - lastPoseArrival;
+        return transportConnected && displayedMapId && frame && lastPose &&
+            lastPose.stale !== true && age >= 0 && age < POSE_TIMEOUT_MS &&
+            lastPose.map_id === displayedMapId && lastPose.frame_id === frame &&
+            lastPose.base_frame_id === 'base_footprint' &&
+            [lastPose.position?.x, lastPose.position?.y,
+             lastPose.orientation?.yaw].every(Number.isFinite);
+    }
+
     function refreshRobotPose() {
         if (!viewer || mode !== '3d') return;
         const mapFrame = viewer.getMapSummary()?.frame_id;
         if (!displayedMapId || !mapFrame) {
             viewer.setRobotPose(null);
             updatePoseReadout('Waiting for selected map');
+            syncPointCloudStream();
             return;
         }
         const age = Date.now() - lastPoseArrival;
-        const valid = transportConnected &&
-            lastPose && lastPose.stale !== true &&
-            age >= 0 && age < POSE_TIMEOUT_MS &&
-            lastPose.map_id === displayedMapId &&
-            lastPose.frame_id === mapFrame &&
-            lastPose.base_frame_id === 'base_footprint' &&
-            [lastPose.position?.x, lastPose.position?.y,
-             lastPose.orientation?.yaw].every(Number.isFinite);
-
-        if (valid) {
+        if (hasLiveMapPose(mapFrame)) {
             const pose = {
                 x: lastPose.position.x, y: lastPose.position.y,
                 yaw: lastPose.orientation.yaw
@@ -116,11 +109,13 @@
             updatePoseReadout('Live', pose);
         } else {
             viewer.setRobotPose(null);
+            viewer.clearPointCloud();
             const label = !transportConnected ? 'Disconnected' :
                 (!lastPose || age >= POSE_TIMEOUT_MS || lastPose.stale === true)
                     ? 'Pose unavailable/stale' : 'Waiting for map-frame pose';
             updatePoseReadout(label);
         }
+        syncPointCloudStream();
     }
 
     function onPoseMessage(pose) {
@@ -133,15 +128,30 @@
     function onTransportChange(connected) {
         transportConnected = connected === true;
         if (!transportConnected) {
+            lidarHeight = null;
+            viewer?.setLidarHeight(null);
+            cloudRequested = false; // The old socket and its opt-in no longer exist.
+            viewer?.clearPointCloud();
+            viewer?.clearLaserScan();
+            sceneManager?.clearState();
             lastPose = null;
             lastPoseArrival = 0;
         }
         if (mode === '3d') refreshRobotPose();
+        syncPointCloudStream();
     }
 
     function startPoseMonitor() {
         if (poseMonitor !== null) return;
-        poseMonitor = window.setInterval(refreshRobotPose, 500);
+        poseMonitor = window.setInterval(() => {
+            refreshRobotPose();
+            const now = performance.now();
+            if (now - lastLayoutRefresh >= 5000) {
+                lastLayoutRefresh = now;
+                sceneManager?.refresh();
+                markerFeed?.refresh();
+            }
+        }, 500);
     }
 
     function stopPoseMonitor() {
@@ -149,43 +159,81 @@
         poseMonitor = null;
     }
 
+    function syncPointCloudStream() {
+        const wanted = Boolean(mode === '3d' && canDisplay() &&
+            displayedMapId === window.selectedNavMap && hasLiveMapPose(viewer?.getMapSummary()?.frame_id));
+        if (wanted === cloudRequested) return;
+        if (window.sendCommand?.({command: 'point_cloud_stream', enabled: wanted})) {
+            cloudRequested = wanted;
+        }
+        if (!wanted) viewer?.clearPointCloud();
+    }
+
+    async function fetchScene(mapId, signal, routeId) {
+        const request = new AbortController();
+        const cancel = () => request.abort();
+        signal.addEventListener('abort', cancel, {once: true});
+        const timeout = window.setTimeout(cancel, 5000);
+        try {
+            const route = routeId ? `?route_id=${encodeURIComponent(routeId)}` : '';
+            const response = await fetch(`/api/map/scene/${encodeURIComponent(mapId)}${route}`,
+                                         {signal: request.signal, cache: 'no-store'});
+            if (response.status === 404) return null;
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return await response.json();
+        } finally {
+            window.clearTimeout(timeout);
+            signal.removeEventListener('abort', cancel);
+        }
+    }
+
     function renderSelectedMap() {
         if (!viewer || mode !== '3d' || !canDisplay()) return;
         const mapId = window.selectedNavMap;
         const map = window.mapData;
+        const route = mapId ? window.selectedNavRoute ?? null : null;
+        markerFeed.select(mapId || null, route);
+        sceneManager.select(mapId || null, route);
         if (!mapId) {
-            viewer.clearMap();
             displayedMapId = null;
             setStatus(NO_MAP_MESSAGE);
         } else if (failedMapId === mapId) {
-            viewer.clearMap();
+            sceneManager.clearGrid();
             displayedMapId = null;
             setStatus(`Failed to load map "${mapId}": ${failedReason}`);
         } else if (loadingMapId === mapId) {
-            if (displayedMapId !== mapId) viewer.clearMap();
             setStatus(`Loading map "${mapId}"...`);
         } else if (!map?.is_pgm_raw ||
                    (map.map_id || map.frame_id) !== mapId) {
-            viewer.clearMap();
+            if (displayedMapId) sceneManager.clearGrid();
             displayedMapId = null;
             setStatus(`Loading map "${mapId}"...`);
         } else {
             try {
-                viewer.setMap(map);
+                const previousBuild = viewer.getMapSummary().build_count;
+                if (!sceneManager.commit(map)) {
+                    displayedMapId = null;
+                    setStatus(`Loading map "${mapId}"...`);
+                    syncPointCloudStream();
+                    return;
+                }
+                const changedMap = displayedMapId !== mapId;
                 displayedMapId = mapId;
+                if (changedMap || viewer.getMapSummary().build_count !== previousBuild) markerFeed.replay();
                 viewer.setWallsVisible(wallsVisible);
                 viewer.setDisplayMode(displayMode);
-                viewer.setAxesVisible(axesVisible);
                 setStatus('');
+                viewer.setLidarHeight(lidarHeight);
                 if (latestLiftMeters !== null) viewer.setLiftHeight(latestLiftMeters);
                 refreshRobotPose();
             } catch (error) {
-                viewer.clearMap();
+                sceneManager.clearGrid();
                 displayedMapId = null;
                 setStatus(`Cannot display map "${mapId}": ${error.message}`);
                 console.warn('3D map data rejected:', error);
             }
         }
+        syncPointCloudStream();
     }
 
     function canDisplay() {
@@ -210,6 +258,7 @@
         loading = false;
         mode = '2d';
         viewer?.hide();
+        syncPointCloudStream();
         stopPoseMonitor();
         layer.hidden = true;
         updateButtons();
@@ -222,6 +271,7 @@
         if (canDisplay()) {
             layer.hidden = false;
             renderSelectedMap();
+            syncPointCloudStream();
             requestAnimationFrame(() => {
                 if (mode === '3d' && canDisplay()) {
                     viewer.resize();
@@ -233,6 +283,11 @@
         } else {
             viewer.hide();
             stopPoseMonitor();
+            if (displayedMapId) {
+                sceneManager.clearGrid();
+                displayedMapId = null;
+            }
+            syncPointCloudStream();
         }
     }
 
@@ -243,12 +298,20 @@
         updateButtons();
         try {
             if (!viewer) {
-                const { createViewer } = await import('/js/three_viewer.js?v=1.3.2');
+                const [{createViewer}, {createSceneManager}, {createRouteMarkerFeed}] = await Promise.all([
+                    import('/js/three_viewer.js?v=3.2.0'),
+                    import('/js/scene_manager.js?v=1.3.0'),
+                    import('/js/route_marker_feed.js?v=1.1.0'),
+                ]);
                 if (thisRequest !== request) return;
                 viewer = createViewer(() => {
                     show2D();
+                    markerFeed?.select(null, null);
+                    sceneManager?.select(null);
                     viewer?.dispose();
                     viewer = null;
+                    sceneManager = null;
+                    markerFeed = null;
                     window.showToast?.('3D view unavailable. Returned to 2D.', 'warn');
                 }, modelStatus => {
                     modelKind = modelStatus.kind;
@@ -257,6 +320,21 @@
                     }
                     refreshRobotPose();
                 }, updateFollowButton);
+                markerFeed = createRouteMarkerFeed({
+                    fetchRoutes: async (mapId, signal) => {
+                        const response = await fetch(`/api/routes?map_id=${encodeURIComponent(mapId)}`,
+                                                     {signal, cache: 'no-store'});
+                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                        const data = await response.json();
+                        if (data.status !== 'ok' || !Array.isArray(data.routes)) throw new Error('Invalid route catalog');
+                        return data.routes;
+                    },
+                    publish: (mapId, markers) => viewer?.setRouteMarkers(mapId, markers),
+                    colorForNode: window.routeNodeColor,
+                    onError: error => console.warn('3D route markers unavailable:', error),
+                });
+                sceneManager = createSceneManager({viewer, fetchScene, onReady: renderSelectedMap,
+                    onError: error => console.warn('3D semantic layout unavailable:', error)});
             }
             if (thisRequest !== request) return;
             window.cancelNavMapTool?.();
@@ -270,8 +348,12 @@
             syncVisibility();
         } catch (error) {
             console.warn('3D viewer initialization failed:', error);
+            markerFeed?.select(null, null);
+            sceneManager?.select(null);
             viewer?.dispose();
             viewer = null;
+            sceneManager = null;
+            markerFeed = null;
             show2D();
             window.showToast?.('3D view unavailable. Returned to 2D.', 'warn');
         }
@@ -282,29 +364,18 @@
         layer = document.getElementById('navThreeLayer');
         button2D = document.getElementById('navView2D');
         button3D = document.getElementById('navView3D');
-        axesButton = document.getElementById('navThreeAxesToggle');
-        axesLegend = document.getElementById('navThreeAxesLegend');
-        fitButton = document.getElementById('navThreeFit');
         wallsButton = document.getElementById('navThreeWalls');
         rawButton = document.getElementById('navThreeRaw');
         cleanButton = document.getElementById('navThreeClean');
         status = document.getElementById('navThreeStatus');
-        if (!viewport || !layer || !button2D || !button3D || !axesButton || !axesLegend ||
-                !fitButton || !wallsButton || !rawButton || !cleanButton || !status) return;
+        if (!viewport || !layer || !button2D || !button3D ||
+                !wallsButton || !rawButton || !cleanButton || !status) return;
 
         createRobotControls();
         // Reuse the existing WebSocket; no additional connection/subscriber.
         transportConnected = window.navigationTransportState === 'CONNECTED';
         button2D.addEventListener('click', show2D);
         button3D.addEventListener('click', show3D);
-        axesButton.addEventListener('click', () => {
-            axesVisible = !axesVisible;
-            axesButton.textContent = axesVisible ? 'TF Axes On' : 'TF Axes Off';
-            axesButton.setAttribute('aria-pressed', String(axesVisible));
-            axesLegend.hidden = !axesVisible;
-            viewer?.setAxesVisible(axesVisible);
-        });
-        fitButton.addEventListener('click', () => viewer?.fitToMap());
         wallsButton.addEventListener('click', () => {
             wallsVisible = !wallsVisible;
             wallsButton.textContent = wallsVisible ? 'Walls On' : 'Walls Off';
@@ -338,10 +409,16 @@
         }
         window.addEventListener('pagehide', () => {
             ++request;
+            mode = '2d';
+            syncPointCloudStream();
+            markerFeed?.select(null, null);
+            sceneManager?.select(null);
+            sceneManager = null;
+            markerFeed = null;
+            displayedMapId = null;
             stopPoseMonitor();
             viewer?.dispose();
             viewer = null;
-            mode = '2d';
             loading = false;
             layer.hidden = true;
         });
@@ -352,7 +429,29 @@
     window.navigation3D = {
         onPageChange: () => syncVisibility(),
         onPose: onPoseMessage,
+        onLaserScan: scan => {
+            if (transportConnected && mode === '3d' && canDisplay() &&
+                    displayedMapId === window.selectedNavMap && scan?.map_id === displayedMapId) {
+                viewer?.setLaserScan(scan);
+            }
+        },
+        onPointCloud: message => {
+            if (cloudRequested && displayedMapId && displayedMapId === window.selectedNavMap &&
+                    mode === '3d' && canDisplay() && hasLiveMapPose(message?.frame_id)) {
+                viewer?.setPointCloud(message);
+            }
+        },
+        onWarehouse: message => {
+            if (message?.map_id === window.selectedNavMap) sceneManager?.setWarehouse(message);
+        },
+        onSemanticState: message => {
+            if (message?.map_id === window.selectedNavMap) sceneManager?.setState(message);
+        },
         onTransportChange,
+        onLidarHeight: height => {
+            lidarHeight = Number.isFinite(height) && height > 0 ? height : null;
+            viewer?.setLidarHeight(lidarHeight);
+        },
         onLift: lift => {
             if (!lift || !Number.isFinite(lift.height)) return;
             const meters = lift.height / 1000; // system_status lift.height is in mm
@@ -362,18 +461,34 @@
         },
         onMapVisibilityChange: () => syncVisibility(),
         onMapSelectionChanged: mapId => {
-            if (mapId === observedMapId) return;
+            const route = window.selectedNavRoute ?? null;
+            if (mapId === observedMapId) {
+                if (route !== observedRouteId) {
+                    observedRouteId = route;
+                    renderSelectedMap();
+                }
+                return;
+            }
             observedMapId = mapId;
+            observedRouteId = route;
+            if (lastPose?.map_id !== mapId) {
+                lastPose = null;
+                lastPoseArrival = 0;
+            }
             loadingMapId = null;
             failedMapId = null;
-            viewer?.clearMap();
+            markerFeed?.select(null, null);
+            sceneManager?.select(null);
             displayedMapId = null;
+            syncPointCloudStream();
             renderSelectedMap();
         },
         onMapLoading: mapId => {
             loadingMapId = mapId;
             failedMapId = null;
-            if (displayedMapId !== mapId) viewer?.clearMap();
+            if (displayedMapId && displayedMapId !== mapId) sceneManager?.clearGrid();
+            displayedMapId = null;
+            syncPointCloudStream();
             renderSelectedMap();
         },
         onMapLoaded: mapId => {
@@ -387,8 +502,9 @@
             loadingMapId = null;
             failedMapId = mapId;
             failedReason = reason || 'Map data unavailable';
-            viewer?.clearMap();
+            sceneManager?.clearGrid();
             displayedMapId = null;
+            syncPointCloudStream();
             renderSelectedMap();
         },
         isActive: () => mode === '3d',
