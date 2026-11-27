@@ -7,6 +7,7 @@ const MIN_WALL_SPAN_M = 0.24;
 const MIN_WALL_LENGTH_M = 0.10;
 const MAX_EDGE_REPAIR_M = 0.10;
 const MAX_PINHOLE_M = 0.07;
+const MAX_REFINED_AREA_CHANGE = .15;
 
 function distanceTo(mask, width, height, target) {
     // Chamfer distance in thirds of a cell. The diagonal weight approximates
@@ -95,7 +96,7 @@ function components(mask, width, height, queue, consume) {
 
 export function selectWallBands(categories, {width, height, resolution}, queue) {
     if (!categories.includes(1)) {
-        return {wall:new Uint8Array(categories.length), perimeterBands:0,
+        return {wall:new Uint8Array(categories.length), survey:null, perimeterBands:0,
             perimeterCells:0, bridgedWallCells:0};
     }
     const known = categories.map(value => Number(value !== 0));
@@ -104,8 +105,7 @@ export function selectWallBands(categories, {width, height, resolution}, queue) 
         const distance = distanceTo(mask,width,height,dilate ? 1 : 0);
         return Uint8Array.from(distance, value => Number(dilate ? value <= radius : value > radius));
     };
-    function contourDistance(footprint) {
-        const exterior = floodGrid(footprint,width,height,gridBorder(width,height),queue);
+    function contourDistance(exterior) {
         const toOutside = distanceTo(exterior,width,height,1);
         const toInside = distanceTo(exterior,width,height,0);
         return toOutside.map((distance,i) => {
@@ -115,19 +115,21 @@ export function selectWallBands(categories, {width, height, resolution}, queue) 
             return Math.min(distance,borderDistance)+toInside[i];
         });
     }
-    function compactContour(radius) {
-        const opened = morph(morph(known,radius,false),radius,true);
+    function compactSurvey(radius) {
+        const core = morph(known,radius,false);
+        const opened = morph(core,radius,true);
         // An entirely narrow survey can still use its measured outer contour.
         const compact = opened.some(Boolean) ? opened : known;
         const footprint = morph(morph(compact,ENVELOPE_NOTCH_M,true),ENVELOPE_NOTCH_M,false);
-        return contourDistance(footprint);
+        return {core, openingRadiusCells:radius/resolution, exterior:floodGrid(footprint,width,height,gridBorder(width,height),queue)};
     }
-    const contour = compactContour(RAY_FRINGE_M);
+    const survey = compactSurvey(RAY_FRINGE_M);
+    const contour = contourDistance(survey.exterior);
     // Allow for wider coherent scan streaks only when the occupied band
     // itself persists nearby. The second envelope supplies a search region,
     // never new occupied evidence.
-    const coarseContour = compactContour(RAY_FRINGE_M*2);
-    const observedContour = contourDistance(known);
+    const coarseContour = contourDistance(compactSurvey(RAY_FRINGE_M*2).exterior);
+    const observedContour = contourDistance(floodGrid(known,width,height,gridBorder(width,height),queue));
     const nearContour = WALL_SEARCH_M/resolution*3+3;
     const band = categories.map((value,i) => {
         if (value !== 2) return 0;
@@ -188,7 +190,7 @@ export function selectWallBands(categories, {width, height, resolution}, queue) 
         perimeterBands++;
         perimeterCells += cells.length;
     });
-    return {wall, perimeterBands, perimeterCells,
+    return {wall, survey, perimeterBands, perimeterCells,
         bridgedWallCells: [...repaired].filter(i => wall[i]).length};
 }
 
@@ -253,20 +255,22 @@ function lineDistance([x,y],[ax,ay],[bx,by]) {
     return Math.hypot(x-ax-t*dx,y-ay-t*dy);
 }
 
-function simplifyWallRing(points, tolerance) {
+function simplifyWallRing(points, tolerance, fitted = points, corners = []) {
     let split = 1;
     for (let i = 2; i < points.length; i++) {
         if (lineDistance(points[i],points[0],points[0]) >
                 lineDistance(points[split],points[0],points[0])) split = i;
     }
     const loop = [...points,points[0]];
-    const keep = new Set([0,split]);
-    const pending = [[0,split],[split,points.length]];
+    const vertices = [...fitted,fitted[0]];
+    const keep = new Set([0,split,...corners]);
+    const breaks = [...keep].sort((a,b)=>a-b);
+    const pending = breaks.map((a,i)=>[a,breaks[i+1] ?? points.length]);
     while (pending.length) {
         const [a,b] = pending.pop();
         let distance = tolerance, pivot = -1;
         for (let i = a+1; i < b; i++) {
-            const deviation = lineDistance(loop[i],loop[a],loop[b]);
+            const deviation = lineDistance(loop[i],vertices[a],vertices[b]);
             if (deviation <= distance) continue;
             distance = deviation;
             pivot = i;
@@ -275,7 +279,7 @@ function simplifyWallRing(points, tolerance) {
         keep.add(pivot);
         pending.push([a,pivot],[pivot,b]);
     }
-    const result = points.filter((_,i) => keep.has(i));
+    const result = fitted.filter((_,i) => keep.has(i));
     return result.length >= 3 && Math.sign(signedArea(result)) === Math.sign(signedArea(points)) ?
         result : null;
 }
@@ -316,7 +320,7 @@ function ringsMeet(a,b,bounds) {
     return false;
 }
 
-export function prepareWallContours(wall, info) {
+function groupWallRings(wall, info) {
     const groups = [], holes = [];
     for (const ring of traceWallRings(wall,info)) {
         if (signedArea(ring) > 0) groups.push({outer:ring, holes:[]});
@@ -334,14 +338,98 @@ export function prepareWallContours(wall, info) {
         }
         if (owner) owner.holes.push(hole);
     }
-    const tolerance = Math.min(0.035, info.resolution*1.4);
+    return groups;
+}
+
+// Average across a short, symmetric stretch of the traced edge. Keep sharp
+// turns in place: a sustained change of heading on the two sides of a vertex
+// is evidence for a corner. All operations are in grid-local metres.
+function fitWallVertices(ring, resolution, tolerance, corners) {
+    const n = ring.length;
+    const reach = Math.min(6, Math.floor((n-1)/4), Math.ceil(.08/resolution));
+    if (reach < 2) return ring;
+    return ring.map(([x,y],i) => {
+        const left = ring[(i+n-reach)%n], right = ring[(i+reach)%n];
+        const ax = x-left[0], ay = y-left[1], bx = right[0]-x, by = right[1]-y;
+        if (ax*bx+ay*by <= Math.SQRT1_2*Math.hypot(ax,ay)*Math.hypot(bx,by)) {
+            // Pin a corner only if both approach lines have measured support.
+            let supported = Math.min(Math.hypot(ax,ay),Math.hypot(bx,by)) >= 3*resolution;
+            for (let j=1; supported && j<reach; j++) {
+                supported = lineDistance(ring[(i+n-j)%n],left,ring[i]) <= .55*resolution &&
+                    lineDistance(ring[(i+j)%n],ring[i],right) <= .55*resolution;
+            }
+            if (supported) corners.add(i);
+            return ring[i];
+        }
+        let dx = 0, dy = 0;
+        for (let j=1; j<=reach; j++) {
+            const a = ring[(i+n-j)%n], b = ring[(i+j)%n];
+            dx += a[0]+b[0]-2*x;
+            dy += a[1]+b[1]-2*y;
+        }
+        const scale = Math.min(1/(2*reach+1), tolerance*.45/(Math.hypot(dx,dy) || 1));
+        return [x+scale*dx,y+scale*dy];
+    });
+}
+
+export function wallRefinementTolerance(resolution) {
+    return Math.min(.045, 2.25*resolution);
+}
+
+// A thin return or tight bend can force a whole ring to use a smaller RDP
+// tolerance. Merge supported neighbouring segments locally on its straighter
+// runs, keeping the tighter vertices where a shortcut would cross the ring.
+function mergeStraightRuns(candidate, source, fitted, limit, originalArea, corners) {
+    const ring = candidate.slice();
+    const sourceIndex = new Map(fitted.map((point,i) => [point,i]));
+    let area = signedArea(ring);
+    for (let i=0; i<ring.length && ring.length>3;) {
+        const n = ring.length, a = ring[(i+n-1)%n], b = ring[i], c = ring[(i+1)%n];
+        const turn = (b[0]-a[0])*(c[1]-b[1])-(b[1]-a[1])*(c[0]-b[0]);
+        const nextArea = area-turn/2;
+        const advances = (b[0]-a[0])*(c[0]-b[0])+(b[1]-a[1])*(c[1]-b[1]) > 0;
+        let supported = advances && !corners.has(sourceIndex.get(b)) && Math.abs(nextArea/originalArea-1)<=MAX_REFINED_AREA_CHANGE;
+        const end = sourceIndex.get(c);
+        for (let j=sourceIndex.get(a); supported && j!==end; j=(j+1)%source.length) {
+            supported = lineDistance(source[j],a,c)<=limit;
+        }
+        if (supported) {
+            supported = !ring.some((p,j) => {
+                const q = ring[(j+1)%n];
+                return p!==a && p!==c && q!==a && q!==c && segmentsMeet(a,c,p,q);
+            });
+        }
+        if (!supported) { i++; continue; }
+        ring.splice(i,1);
+        area = nextArea;
+        i = Math.max(0,i-1);
+    }
+    return ring;
+}
+
+function simplifyGroups(groups, resolution, refine) {
+    const tolerance = refine ? wallRefinementTolerance(resolution) : Math.min(.035, resolution*1.4);
     const originals = groups.flatMap(({outer, holes}) => [outer,...holes]);
     const simplified = originals.map(ring => {
         // A full-size tolerance can collapse a one-cell diagonal band.
         // Retry with a smaller tolerance before falling back to the raster.
-        for (const scale of [1,0.5,0.25]) {
-            const candidate = simplifyWallRing(ring,tolerance*scale);
-            if (candidate && !ringsMeet(candidate,candidate)) return candidate;
+        const area = signedArea(ring);
+        for (const scale of (refine ? [1,.8,.6,.4,.25] : [1,.5,.25])) {
+            const limit = tolerance*scale;
+            const corners = new Set();
+            const fitted = refine ? fitWallVertices(ring,resolution,limit,corners) : ring;
+            // Split against the original subchain, so fitting and simplifying
+            // share one error budget. Endpoints also stay within this budget.
+            const candidate = simplifyWallRing(ring,limit,fitted,corners);
+            if (!candidate || ringsMeet(candidate,candidate)) continue;
+            // In a one-cell band both sides can be within the distance limit
+            // even if a chord pinches its end. Retry at finer scale in that case.
+            if (refine && Math.abs(signedArea(candidate)/area-1) > MAX_REFINED_AREA_CHANGE) continue;
+            if (refine) {
+                const merged = mergeStraightRuns(candidate,ring,fitted,tolerance,area,corners);
+                if (!ringsMeet(merged,merged)) return merged;
+            }
+            return candidate;
         }
         return ring;
     });
@@ -364,4 +452,14 @@ export function prepareWallContours(wall, info) {
     let offset = 0;
     return groups.map(({holes}) => ({outer:simplified[offset++],
         holes:holes.map(() => simplified[offset++])}));
+}
+
+export function prepareWallContours(wall, info) {
+    return simplifyGroups(groupWallRings(wall,info),info.resolution,false);
+}
+
+export function wallContourVariants(wall, info) {
+    const groups = groupWallRings(wall,info);
+    return {raw:simplifyGroups(groups,info.resolution,false),
+        clean:simplifyGroups(groups,info.resolution,true)};
 }

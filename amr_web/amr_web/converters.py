@@ -343,6 +343,8 @@ def plan_to_json(msg: Path,
         px, py = p.position.x, p.position.y
         if tf is not None:
             px, py, _ = compose_planar(tx, ty, tyaw, px, py, 0.0)
+        if not (math.isfinite(px) and math.isfinite(py)):
+            raise ValueError("Non-finite Nav2 path position")
         raw_points.append((px, py))
 
     # Giam mau

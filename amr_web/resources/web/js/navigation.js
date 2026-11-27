@@ -1990,6 +1990,7 @@
         };
         navState.received_at = Date.now();
         window.latestNavState = navState;
+        window.navigation3D?.onNavState?.(navState);
         if (data.navigation_session_id &&
                 data.navigation_session_id !== window.currentNavigationSessionId) {
             window.currentNavigationSessionId = data.navigation_session_id;

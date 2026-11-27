@@ -283,6 +283,7 @@ function connect() {
                         break;
 
                     case 'nav_result':
+                        window.navigation3D?.onNavResult?.(d);
                         if (typeof handleNavResult === 'function') {
                             handleNavResult(d);
                         }
@@ -317,6 +318,7 @@ function connect() {
                         break;
                     case 'plan':
                         if (window.isSlamActive) break;
+                        window.navigation3D?.onPlan?.(d);
                         if (window.mapRenderer && window.mapRenderer.setPlan) window.mapRenderer.setPlan(d);
                         break;
 

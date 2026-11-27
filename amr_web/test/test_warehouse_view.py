@@ -107,6 +107,50 @@ class WarehouseViewTest(unittest.TestCase):
         self.assertEqual(snapshot()['drops']['B1']['id'], 'shelf_A1')
         self.assertEqual(view.snapshot('different site', 'map')['slots'], {})
 
+    def test_drop_confirmation_precedes_backoff_and_fences_old_cargo(self):
+        view = WarehouseView()
+        def send(op, phase, mode='drop', cargo=True, occupancy='empty', **fields):
+            view.mission('site', dict(session_id='node', operation_id=op, state=phase,
+                                      mode=mode, cargo=cargo, drop={'slot':'A2'},
+                                      shelf={'fresh':True,'states':{'A2':occupancy}}, **fields), None)
+            return view.snapshot('site', 'map')
+        load = send(7, 'CARRYING', 'pick')['carried']
+        before = send(8, 'LIFTING', occupancy='full')
+        self.assertEqual((before['pending_slot'], before['carried']), ('A2', load))
+        self.assertEqual(before['drops'], {})
+        placed = send(8, 'LIFTING', visual_release={'operation_id':8, 'destination':'rack_slot'})
+        self.assertEqual(placed['drops']['A2']['id'], load['id'])
+        for snapshot in (send(8, 'BACKING', occupancy='full'), send(8, 'LOWERING'),
+                         send(7, 'CARRYING', 'pick'), send(8, 'CARRYING', 'pick'),
+                         send(8, 'DONE', cargo=False, occupancy='full')):
+            self.assertIsNone(snapshot['carried'])
+            self.assertEqual(snapshot['drops']['A2']['id'], load['id'])
+
+    @patch('amr_web.warehouse_view.time.monotonic')
+    def test_d2_release_confirmation_age_survives_repeats(self, clock):
+        view = WarehouseView()
+        retrieval = dict(state='PICKING', run_id='r', slot='B2')
+        def send(op, phase, cargo, **fields):
+            view.mission('site', dict(session_id='node', operation_id=op, state=phase,
+                                      mode='pick', cargo=cargo, **fields), retrieval)
+            return view.snapshot('site', 'map')
+        clock.return_value = 100
+        load = send(1, 'CARRYING', True)['carried']
+        retrieval['state'] = 'PLACING_AT_D2'
+        for phase, cargo in [('LOWERING',True), ('FAILED',False)]:
+            snap = send(2, phase, cargo)
+            self.assertEqual(snap['carried'], load)
+            self.assertIsNone(snap['release'])
+        # Coordinator may already have advanced before the bridge gets DONE.
+        retrieval['state'] = 'RETURNING_HOME'
+        snap = send(2, 'DONE', False, visual_release={'operation_id':2, 'destination':'D_2', 'age_s':.25})
+        self.assertEqual(snap['release_age_s'], .25)
+        clock.return_value += 1
+        self.assertEqual(send(2, 'DONE', False)['release_age_s'], 1.25)
+        self.assertIsNone(send(1, 'CARRYING', True)['carried'])
+        retrieval['run_id'] = 'new'
+        self.assertIsNone(send(3, 'IDLE', False)['release'])
+
     def test_detector_target_does_not_become_carried_without_confirmation(self):
         view = WarehouseView()
         locked_pose = dict(x=1, y=2, z=.2, yaw=0)
@@ -158,7 +202,7 @@ class WarehouseViewTest(unittest.TestCase):
         self.assertEqual(snap()['carried']['id'], load['id'])
         update('BACKING',False,op=4,retrieval={**retrieval,'state':'PLACING_AT_D2'},shelf=shelf(A2='full'))
         self.assertIsNone(snap()['carried'])
-        self.assertEqual(snap()['release'], dict(id=load['id'], destination='D_2', pose=None))
+        self.assertEqual(snap()['release'], dict(id=load['id'], destination='D_2', pose=None, run='ret'))
         self.assertIn('A2', snap()['departed'])
         update('IDLE',False,op=4,shelf=shelf(A2='empty'))
         update('IDLE',False,op=4,shelf=shelf(A2='full'))

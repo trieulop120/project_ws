@@ -1,4 +1,4 @@
-export const PALLET_SIZE = Object.freeze({width: 0.40, depth: 0.30, height: 0.05}); // Visualization only, +X along forks.
+export const PALLET_SIZE = Object.freeze({width: 0.30, depth: 0.40, height: 0.05}); // Visualization only, +X along forks.
 export const PALLET_DECK_FRACTION = 0.24;
 const zero = {x: 0, y: 0, z: 0, yaw: 0};
 const poseAxes = ['x', 'y', 'z', 'yaw'];
@@ -73,7 +73,7 @@ export function warehousePallets(snapshot, layout, preview = null) {
                 pallets.push(pallet);
                 continue;
             }
-            if (slots?.[id] !== 'full' || departed?.[id] || (!sourceEmpty && carried?.slot === id)) continue;
+            if (snapshot.pending_slot === id || (!ownership && slots?.[id] !== 'full') || departed?.[id] || (!sourceEmpty && carried?.slot === id)) continue;
             const defaultId = `shelf_${id}`;
             const slotPalletId = reserved.has(defaultId) ? `${defaultId}_replacement` : defaultId;
             pallets.push(makePallet(ownership?.id ?? slotPalletId,parent,slot,ownership,catalog,

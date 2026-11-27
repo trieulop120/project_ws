@@ -104,7 +104,7 @@ The model uses the surveyed 1.875 m width, 0.90 m overall height, 0.35 m slot
 depth and the 0.20/0.55 m support heights. Vertical partitions follow the
 configured columns. Slot centres are halfway into the opening in the approach
 direction. A Retrieval selection marks the existing pallet identity at its
-slot support. The camera face pose is retained in its metadata. The 0.40 m pallet can overhang the 0.35 m shelf.
+slot support. The camera face pose is retained in its metadata. The pallet extends 0.30 m into the 0.35 m shelf and spans 0.40 m across the opening.
 Plate and partition thicknesses are visual conventions.
 
 Automatic geometry uses the shared default mission config deployed by the
@@ -148,7 +148,7 @@ and trims partial overlaps using the part volumes.
 Cartons use kraft faces, a folded lid and two tape bands. An optional catalog
 color tints the tape. For observed pallet poses, the detector reports the face
 centre. The viewer places the origin at the centre of the pallet's bottom plane,
-0.20 m inward along detector yaw and 0.025 m below the observed face centre.
+0.15 m inward along detector yaw and 0.025 m below the observed face centre.
 Local +X follows the approach and fork direction. The orange pallet has
 five open deck boards and three longitudinal runners.
 
@@ -156,10 +156,7 @@ five open deck boards and three longitudinal runners.
 with `map_id` and `frame_id`. A selected Retrieval target uses its source slot
 identity where available. A floor target uses an operation-scoped temporary
 ID. Its preview starts from the detector-confirmed map pose and can use a recent /pallet/cargo estimate until the finalized mission height is available. The viewer blends small pose changes during Detect and holds the pose at the mission lock. The same pallet and carton are moved to the fork attachment on confirmed pickup. Sensor overlap during floor PICKUP uses the displayed pallet/carton volumes without expanding the estimated carton footprint. The bridge tracks confirmed carriage and rack delivery for display only.
-At Retrieval D_2, the release clears carriage and records a release with an
-unknown pose. A fresh, verified map pose may be supplied through the existing
-`semantic_state` contract. For DROP to a rack, the destination slot sensor
-confirms placement. A departed source remains hidden while its sensor still
+After confirmed retrieval release at D_2, the client displays the pallet on the floor for three seconds from confirmation. When the release lacks a measured pose it uses the last valid map transform of the carried load and marks the placement estimated. For rack DROP, completed release transfers ownership to the destination slot, even while the occupancy update is pending. A departed source remains hidden while its sensor still
 reports the pre-pickup full reading. New WebSocket sessions receive the same bridge
 snapshot, and the projection clears on map change. Pallet IDs are display
 identities, with no persisted inventory or serial-number database.

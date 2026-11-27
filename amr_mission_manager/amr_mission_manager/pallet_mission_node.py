@@ -812,6 +812,7 @@ class PalletMission(PalletRecovery, Node):
         # ---------------- State ----------------
         self._session_id = uuid.uuid4().hex
         self._operation_id = 0
+        self._visual_release = None
         self._resume_operation_id = None
         self._last_resumed_checkpoint_id = 0
         self._checkpoint = None
@@ -1084,6 +1085,10 @@ class PalletMission(PalletRecovery, Node):
              'fail_phase': getattr(self, '_fail_phase', None),
              'recovery': self._recovery_status(),
              'err': err}
+        release = self._visual_release
+        if release and release['operation_id'] == self._operation_id:
+            d['visual_release'] = {**release, 'age_s': time.monotonic() - release['at']}
+            del d['visual_release']['at']
         m = String()
         m.data = json.dumps(d)
         self.pub_status.publish(m)
@@ -3258,6 +3263,8 @@ class PalletMission(PalletRecovery, Node):
                            f'Retrieved pallet from {self._retrieval_slot}; '
                            f'lift at transit {h:.1f} cm, ready for D_2')
         elif nxt == 'retrieval_released':
+            self._visual_release = {'operation_id': self._operation_id, 'destination': 'D_2',
+                                    'at': time.monotonic()}
             self._cargo = False
             self._set_state(DONE, f'Pallet lowered at D_2 ({h:.1f} cm)')
         elif nxt == 'pick_done':
@@ -3271,6 +3278,8 @@ class PalletMission(PalletRecovery, Node):
             self._ctl.resume_converge(time.monotonic(), insertion_only=True)
             self._set_state(INSERTING, f'Lift {h:.1f} cm -> tien vao ke')
         elif nxt == 'drop_release':
+            self._visual_release = {'operation_id': self._operation_id, 'destination': 'rack_slot',
+                                    'at': time.monotonic()}
             # Giu `cargo=True` cho toi khi lui xong + lift ve 0 (drop_done).
             # Truoc day dat False o day -> neu BACKING fail giua chung thi pallet
             # da nam tren ke nhung he thong "nghi" xe khong cam gi, supervisor goi

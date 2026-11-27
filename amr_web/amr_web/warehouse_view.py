@@ -27,7 +27,9 @@ class WarehouseView:
         self._drops = {}
         self._departed = {}
         self._release = None
+        self._released_at = None
         self._pickup_key = None
+        self._release_key = None
         self._source_empty = False
 
     def _slot_identity(self, slot):
@@ -132,13 +134,32 @@ class WarehouseView:
             if not map_id:
                 return
             previous = self._mission or {}
+            # DDS status uses increasing operation IDs within a pallet-node session.
+            if (previous.get('session_id') == status.get('session_id') and
+                    isinstance(previous.get('operation_id'), int) and isinstance(status.get('operation_id'), int)
+                    and status['operation_id'] < previous['operation_id']):
+                return
             self._mission, self._at = status, time.monotonic()
             key = (status.get('session_id'), status.get('operation_id'))
             states = self._states(status)
             for slot in list(self._departed):
                 if states.get(slot) == 'empty':
                     del self._departed[slot]
+            # An empty reading can precede sensor settling after DROP. Forget
+            # the association only after an observed full-to-empty change.
+            for slot, drop in list(self._drops.items()):
+                placing = (self._release_key == key and self._release and
+                           self._release.get('slot') == slot and status.get('state') != 'DONE')
+                if states.get(slot) == 'empty' and drop.get('seen_full') and not placing:
+                    del self._drops[slot]
+                elif states.get(slot) == 'full' and not drop.get('seen_full'):
+                    self._drops[slot] = {**drop, 'seen_full': True}
             phase = status.get('state')
+            if self._release and self._release['destination'] == 'D_2' and (
+                    phase == 'DETECTING' or
+                    (retrieval and retrieval.get('run_id') != self._release['run']) or
+                    (key[0] and self._release_key[0] and key[0] != self._release_key[0])):
+                self._release = None
             previous_key = (previous.get('session_id'), previous.get('operation_id'))
             if ((phase == 'DETECTING' and (previous.get('state') != phase or key != previous_key)) or
                     (self._target and not self._target.get('run') and
@@ -153,11 +174,10 @@ class WarehouseView:
                     # Mission cargo_h_cm is the finalized camera estimate.
                     self._target.update({field:value for field, value in cargo.items() if value is not None})
 
-            confirmed_pick = status.get('cargo') is True and (
+            confirmed_pick = status.get('cargo') is True and status.get('mode') == 'pick' and (
                 status.get('state') == 'CARRYING' or
-                (status.get('state') == 'BACKING' and status.get('mode') == 'pick' and
-                 status.get('us_pick_confirmed') is True))
-            if confirmed_pick and not self._carried and key[0] and key != self._pickup_key:
+                (status.get('state') == 'BACKING' and status.get('us_pick_confirmed') is True))
+            if confirmed_pick and not self._carried and key[0] and key not in (self._pickup_key, self._release_key):
                 owned = self._target
                 if owned and owned.get('run') and (not retrieval or retrieval.get('stale') or
                         retrieval.get('run_id') != owned['run'] or retrieval.get('slot') != owned['slot']):
@@ -192,28 +212,36 @@ class WarehouseView:
             slot = self._carried.get('slot')
             if states.get(slot) == 'empty':
                 self._source_empty = True
-            if status.get('cargo') is not False:
-                return
             drop = status.get('drop') or {}
             at_d2 = (retrieval and not retrieval.get('stale') and self._carried.get('run') and
                      retrieval.get('run_id') == self._carried['run'] and
                      retrieval.get('state') == 'PLACING_AT_D2')
-            if at_d2 and status.get('state') in ('DONE', 'BACKING'):
+            event = status.get('visual_release')
+            confirmed = (event.get('destination') if isinstance(event, dict) and
+                         event.get('operation_id') == key[1] else None)
+            empty = status.get('cargo') is False
+            if self._carried.get('run') and (confirmed == 'D_2' or
+                    (at_d2 and empty and phase in ('DONE', 'BACKING'))):
                 # Retrieval BACKING with cargo=False follows the release.
-                self._release = {'id': self._carried['id'], 'destination': 'D_2', 'pose': None}
-            elif status.get('state') != 'DONE':
-                return
-            elif status.get('mode') == 'drop' and isinstance(drop, dict) and drop.get('slot'):
+                self._release = {'id': self._carried['id'], 'destination': 'D_2', 'pose': None,
+                                 'run': self._carried['run']}
+                age = event.get('age_s') if confirmed == 'D_2' else None
+                self._released_at = self._at - (age if type(age) in (float, int) and
+                                                 math.isfinite(age) and age > 0 else 0)
+            elif (status.get('mode') == 'drop' and isinstance(drop, dict) and drop.get('slot') and
+                  (confirmed == 'rack_slot' or phase == 'BACKING' or (phase == 'DONE' and empty))):
                 destination = drop['slot']
-                self._drops[destination] = {**self._carried, 'slot': destination}
+                self._drops[destination] = {**self._carried, 'slot': destination,
+                                            'seen_full': states.get(destination) == 'full'}
                 self._departed.pop(destination, None)
                 self._release = {'id': self._carried['id'], 'destination': 'rack_slot',
-                                 'slot': destination, 'pose': None}
-            elif status.get('mode') == 'pick' and not self._carried.get('run'):
+                                 'slot': destination, 'pose': None, 'run': self._carried.get('run')}
+            elif phase == 'DONE' and empty and status.get('mode') == 'pick' and not self._carried.get('run'):
                 self._release = {'id': self._carried['id'], 'destination': 'unlocalized', 'pose': None}
             else:
                 return
             # A release confirms ownership ended, even when pose is absent.
+            self._release_key = key
             self._carried = None
 
     def snapshot(self, map_id, frame_id):
@@ -226,18 +254,15 @@ class WarehouseView:
             now = time.monotonic()
             fresh = now - self._at <= _TARGET_FRESH_S
             states = self._states(mission) if fresh else {}
-            # An empty reading can precede sensor settling after DROP. Forget
-            # the association only after an observed full-to-empty change.
-            for slot, drop in list(self._drops.items()):
-                if states.get(slot) == 'empty' and drop.get('seen_full'):
-                    del self._drops[slot]
-                elif states.get(slot) == 'full' and not drop.get('seen_full'):
-                    self._drops[slot] = {**drop, 'seen_full': True}
             target = self._target
             if target and not target.get('locked') and (not fresh or now - self._target_at > _TARGET_FRESH_S):
                 target = None
+            drop = mission.get('drop') if mission.get('mode') == 'drop' and self._carried else None
             return {'map_id': map_id, 'frame_id': frame_id, 'slots': states,
                     'target': dict(target) if target else None,
                     'carried': self._carried, 'source_empty': self._source_empty,
                     'drops': dict(self._drops), 'departed': dict(self._departed),
-                    'release': self._release}
+                    'pending_slot': drop.get('slot') if isinstance(drop, dict) else None,
+                    'release': self._release,
+                    'release_age_s': (now - self._released_at if self._release and
+                                      self._release['destination'] == 'D_2' else None)}

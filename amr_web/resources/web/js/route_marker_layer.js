@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 
 // Four flat strips keep the outline visible at oblique angles on WebGL.
-export function createRouteMarkerLayer(scene, {side = 0.80, stroke = 0.024, z = 0.024} = {}) {
+export function createRouteMarkerLayer(scene, {side = 0.80, stroke = 0.024, z = 0.024, anisotropy = 1} = {}) {
     const root = new THREE.Group();
     root.name = 'Route node markers';
     scene.add(root);
@@ -18,7 +18,8 @@ export function createRouteMarkerLayer(scene, {side = 0.80, stroke = 0.024, z = 
     geometry.setIndex(indices);
 
     const labels = new Map();
-    const labelGeometry = new THREE.PlaneGeometry((side - 2*stroke)*0.88, (side - 2*stroke)*0.275);
+    const labelWidth = (side - 2*stroke) * 0.94;
+    const labelGeometry = new THREE.PlaneGeometry(labelWidth, labelWidth / 4);
     const cameraRight = new THREE.Vector3();
     const cameraForward = new THREE.Vector3();
     const topDownThreshold = Math.cos(Math.PI / 9);
@@ -28,20 +29,18 @@ export function createRouteMarkerLayer(scene, {side = 0.80, stroke = 0.024, z = 
     function createLabel(text) {
         const canvas = document.createElement('canvas');
         canvas.width = 512;
-        canvas.height = 160;
+        canvas.height = 128;
         const ctx = canvas.getContext('2d');
-        ctx.font = 'bold 106px Arial, sans-serif';
+        ctx.font = '700 134px Arial, sans-serif';
         ctx.textAlign = 'center';
-        ctx.lineJoin = 'round';
-        ctx.lineWidth = 12;
-        ctx.strokeStyle = '#15191e';
-        ctx.fillStyle = '#faf8f4';
+        ctx.fillStyle = '#343a3d';
         const metrics = ctx.measureText(text);
         const baseline = (canvas.height + metrics.actualBoundingBoxAscent - metrics.actualBoundingBoxDescent)/2;
-        ctx.strokeText(text, canvas.width/2, baseline, canvas.width - 28);
         ctx.fillText(text, canvas.width/2, baseline, canvas.width - 28);
         const texture = new THREE.CanvasTexture(canvas);
         texture.colorSpace = THREE.SRGBColorSpace;
+        texture.minFilter = THREE.LinearMipmapLinearFilter;
+        texture.anisotropy = anisotropy;
         const label = new THREE.Mesh(labelGeometry, new THREE.MeshBasicMaterial({
             map: texture, transparent: true, depthWrite: false, depthTest: !topDown,
         }));

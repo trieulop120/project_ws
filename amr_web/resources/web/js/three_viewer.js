@@ -1,14 +1,16 @@
-import {createRouteMarkerLayer} from './route_marker_layer.js?v=1.3.0';
+import {createContactShadows} from './contact_shadows.js';
+import {createNavPlanLayer} from './nav_plan_layer.js';
+import {createRouteMarkerLayer} from './route_marker_layer.js?v=1.4.0';
 import * as THREE from 'three';
 import { OrbitControls } from '../vendor/three/OrbitControls.js';
 import { buildWallSurfaceData, createCloudBoundary, createDisplayVariants, decodeMap, mapWorldCorners,
-         normalizeMapInfo, occupiedFootprintCells, rackWallClipping, resolveObstacles } from './map_geometry.js?v=2.5.0';
+         normalizeMapInfo, occupiedFootprintCells, rackWallClipping, resolveObstacles } from './map_geometry.js?v=2.8.0';
 import { normalizeSemanticLayout } from './semantic_layout.js?v=1.5.0';
-import { createSemanticScene } from './semantic_scene.js?v=1.7.0';
+import { createSemanticScene } from './semantic_scene.js?v=1.8.0';
 import { createPointCloudLayer } from './point_cloud_layer.js?v=2.5.0';
 import {createLaserObstacleLayer} from './laser_obstacle_layer.js';
 import {laserCoverage} from './laser_obstacles.js?v=1.1.0';
-import { createRobotModel } from './robot_model.js?v=1.2.0';
+import { createRobotModel } from './robot_model.js?v=1.3.0';
 
 // Viewer owns only its WebGL resources. ROS data and the existing 2D canvas stay elsewhere.
 export function createViewer(onError = () => {}, onModelStatus = () => {}, onFollowChange = () => {}) {
@@ -20,6 +22,8 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
     let grid = null;
     let semanticScene = null;
     let routeMarkers = null;
+    let contactShadows = null;
+    let planLayer = null;
     let cloudLayer = null;
     let laserLayer = null;
     let frame = null;
@@ -27,7 +31,6 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
     let mapGroup = null;
     let variants = null;
     let perimeter = null;
-    let wallMesh = null;
     let scanMesh = null;
     let scanMask = null;
     let scanKey = null;
@@ -136,6 +139,7 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
         }
         modelLoading = false;
         robotModel = result;
+        contactShadows.setRobotModel(result.object);
         robotRoot.add(result.object);
         semanticScene?.setRobotAttachment(result.kind === 'glb' ? result.cargoAttachment : null);
         if (liftHeightM !== null) setLiftHeight(liftHeightM);
@@ -171,19 +175,22 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
             grid = new THREE.GridHelper(20, 20, 0x4d6970, 0x2d4148);
             grid.rotation.x = Math.PI / 2; // GridHelper's XZ plane -> ROS XY plane.
             scene.add(grid);
-            scene.add(new THREE.HemisphereLight(0xe8f3f1, 0x708186, 1.1));
-            const sunlight = new THREE.DirectionalLight(0xffffff, 1.25);
-            sunlight.position.set(-3, -4, 8);
-            scene.add(sunlight);
+            const fill = new THREE.HemisphereLight(0xe8f3f1, 0x708186, 1.05);
+            fill.position.set(0, 0, 1); // Sky above the ROS XY floor.
+            const sunlight = new THREE.DirectionalLight(0xffffff, 1.65);
+            sunlight.position.set(-3.5, -4.5, 5.8);
+            scene.add(fill, sunlight);
             robotRoot = new THREE.Group();
             robotRoot.name = 'digital_twin_base_footprint';
             robotRoot.visible = false;
             scene.add(robotRoot);
-            routeMarkers = createRouteMarkerLayer(scene);
+            contactShadows = createContactShadows(scene, robotRoot);
+            planLayer = createNavPlanLayer(scene);
             semanticScene = createSemanticScene(scene, () => {
+                contactShadows?.setSemantic(semanticScene.getFootprints(false));
                 refreshScanStrip();
                 cloudLayer?.refresh();
-            });
+            }, () => !!targetPose && hasDisplayedPose);
             cloudLayer = createPointCloudLayer(scene, reconcileObstacles, {
                 acceptPoint: (point, sensorOrigin) =>
                     cloudBoundary?.allowsObservation(point, sensorOrigin) === true,
@@ -192,6 +199,9 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
             laserLayer = createLaserObstacleLayer(scene, getLaserCoverage);
 
             renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'low-power' });
+            routeMarkers = createRouteMarkerLayer(scene, {
+                anisotropy: Math.min(8, renderer.capabilities.getMaxAnisotropy() || 1),
+            });
             renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
             renderer.domElement.addEventListener('webglcontextlost', onContextLost);
             container.appendChild(renderer.domElement);
@@ -345,7 +355,9 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
     }
 
     function clearMap() {
+        contactShadows?.setFloor(null, null);
         routeMarkers?.update([]);
+        planLayer?.update(null);
         if (mapGroup) {
             scene.remove(mapGroup);
             disposeMapGroup(mapGroup);
@@ -353,7 +365,6 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
         mapGroup = null;
         variants = null;
         perimeter = null;
-        wallMesh = null;
         scanMesh = null;
         scanMask = null;
         scanKey = null;
@@ -438,18 +449,24 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
 
     function reconcileObstacles(boxes, tolerance) {
         laserLayer?.invalidate();
-        if (!perimeter) return [];
-        return resolveObstacles(boxes.filter(cloudBoundary.allowsBox), perimeter.wall, mapInfo,
-            semanticScene.getCloudFootprints(robotRoot?.visible), tolerance);
+        const resolved = perimeter ? resolveObstacles(boxes.filter(cloudBoundary.allowsBox), perimeter.wallEvidence,
+            mapInfo, semanticScene.getCloudFootprints(robotRoot?.visible), tolerance) : [];
+        contactShadows?.setObstacles(resolved);
+        return resolved;
     }
 
     function getLaserCoverage() {
         if (!mapInfo || !cloudBoundary) return null;
         const models = [...semanticScene.getFootprints(robotRoot?.visible), ...cloudLayer.getVisibleBoxes()];
         return {
-            covered: laserCoverage(mapInfo,perimeter.wall,scanMask,cloudBoundary,models),
+            covered: laserCoverage(mapInfo,perimeter.wallEvidence,scanMask,cloudBoundary,models),
             step: Math.max(.005,Math.min(.02,mapInfo.resolution/2)),
         };
+    }
+
+    function setNavPlan(plan) {
+        planLayer?.update(plan && plan.map_id === activeMapId && plan.frame_id === mapInfo?.frame_id ?
+            plan.points : null);
     }
 
     function setRouteMarkers(mapId, markers) {
@@ -461,6 +478,22 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
             console.warn('3D perimeter wall clipped at a rack footprint. Verify its coordinates.',
                          {mapId, ...conflict});
         }
+    }
+
+    function updateWall(mode, variant, group, evidence, info, clipping) {
+        variant.rackWallConflicts = clipping.rackWallConflicts;
+        const key = JSON.stringify(clipping.cuts.map(({x,y,width,depth,yaw}) => [x,y,width,depth,yaw]));
+        if (variant.cutKey === key) return;
+        const surface = buildWallSurfaceData(evidence.wall,info,clipping.cuts,null,variant.contours);
+        const mesh = surface.indices.length ? buildSurfaceMesh(surface,0x6f8b90,0x9bb4b8) : null;
+        if (mesh) {
+            mesh.name = 'Perimeter wall';
+            mesh.visible = mode === displayMode && wallsVisible;
+            group.add(mesh);
+        }
+        variant.wallMesh?.removeFromParent();
+        disposeMapGroup(variant.wallMesh);
+        Object.assign(variant,{wallMesh:mesh, wallFaces:surface.faces, cutKey:key});
     }
 
     function setMap(map, semanticLayout = null) {
@@ -485,22 +518,11 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
         if (key === mapKey && map.data === mapData) return false;
         const sameSource = sourceKey === mapSourceKey && map.data === mapData;
         if (sameSource) {
-            const clipping = rackWallClipping(perimeter.wall, info, layout, perimeter.contours);
-            const cutKey = cuts => JSON.stringify(cuts.map(({x,y,width,depth,yaw}) => [x,y,width,depth,yaw]));
-            if (cutKey(clipping.cuts) !== cutKey(perimeter.cuts)) {
-                const surface = buildWallSurfaceData(perimeter.wall, info, clipping.cuts, null, perimeter.contours);
-                const replacement = surface.indices.length ? buildSurfaceMesh(surface, 0x6f8b90, 0x9bb4b8) : null;
-                wallMesh?.removeFromParent();
-                disposeMapGroup(wallMesh);
-                wallMesh = replacement;
-                if (wallMesh) {
-                    wallMesh.visible = wallsVisible;
-                    mapGroup.add(wallMesh);
-                }
-                perimeter.wallFaces = surface.faces;
+            for (const [mode,variant] of Object.entries(variants)) {
+                const clipping = rackWallClipping(perimeter.wall,info,layout,variant.contours);
+                updateWall(mode,variant,mapGroup,perimeter,info,clipping);
             }
-            Object.assign(perimeter, clipping);
-            reportRackConflicts(mapId, perimeter.rackWallConflicts);
+            reportRackConflicts(mapId, variants[displayMode].rackWallConflicts);
             mapKey = key;
             semanticScene?.setLayout(layout || {map_id: mapId, frame_id: info.frame_id, objects: []});
             return true;
@@ -510,23 +532,18 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
             throw new Error('Map exceeds this browser’s maximum texture size');
         }
         const displayData = createDisplayVariants(decodeMap(map, info), layout);
-        const {raw, clean, cuts, ...nextPerimeter} = displayData;
-        reportRackConflicts(mapId, nextPerimeter.rackWallConflicts);
-        nextPerimeter.cuts = cuts;
+        const {raw,clean,contours,refinedContours,cuts,rackWallConflicts,...nextPerimeter} = displayData;
         const nextGroup = new THREE.Group();
         const nextVariants = {};
-        let nextWall = null;
         try {
             nextGroup.position.set(info.origin.x, info.origin.y, 0);
             nextGroup.rotation.z = info.origin.theta;
-            const surface = buildWallSurfaceData(nextPerimeter.wall, info, cuts, null, nextPerimeter.contours);
-            nextPerimeter.wallFaces = surface.faces;
-            if (surface.indices.length) {
-                nextWall = buildSurfaceMesh(surface, 0x6f8b90, 0x9bb4b8);
-                nextWall.visible = wallsVisible;
-                nextGroup.add(nextWall);
-            }
             for (const [mode, data] of [['raw', raw], ['clean', clean]]) {
+                const outlines = mode === 'raw' ? contours : refinedContours;
+                const clipping = mode === 'raw' ? {cuts,rackWallConflicts} :
+                    rackWallClipping(nextPerimeter.wall,info,layout,outlines);
+                const variant = {...data,contours:outlines};
+                updateWall(mode,variant,nextGroup,nextPerimeter,info,clipping);
                 const image = document.createElement('canvas');
                 image.width = info.width;
                 image.height = info.height;
@@ -535,7 +552,9 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
                 const texture = new THREE.CanvasTexture(image);
                 texture.flipY = true; // Canvas top row corresponds to the map's highest Y row.
                 texture.magFilter = THREE.NearestFilter;
-                texture.minFilter = THREE.NearestFilter;
+                // Average subpixel floor detail in oblique and overview views.
+                texture.minFilter = mode === 'clean' ? THREE.LinearMipmapLinearFilter : THREE.NearestFilter;
+                texture.generateMipmaps = mode === 'clean';
                 texture.colorSpace = THREE.SRGBColorSpace;
                 const floor = new THREE.Mesh(
                     new THREE.PlaneGeometry(info.width * info.resolution, info.height * info.resolution),
@@ -544,10 +563,12 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
                 );
                 floor.geometry.translate(info.width * info.resolution / 2,
                                          info.height * info.resolution / 2, 0);
+                floor.renderOrder = -2; // Floor, contact shadows, then transparent route text.
                 floor.visible = mode === displayMode;
                 nextGroup.add(floor);
 
-                nextVariants[mode] = {...data, floor};
+                variant.floor = floor;
+                nextVariants[mode] = variant;
             }
         } catch (error) {
             disposeMapGroup(nextGroup);
@@ -557,12 +578,11 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
         clearMap();
         mapGroup = nextGroup;
         variants = nextVariants;
+        contactShadows.setFloor(info, variants.clean.floor.material.map);
         perimeter = nextPerimeter;
-        wallMesh = nextWall;
         mapInfo = info;
-        const cloudWall = nextPerimeter.wallEvidence.map((value, index) =>
-            value || nextPerimeter.wall[index] ? 2 : 0);
-        cloudBoundary = createCloudBoundary(info, nextPerimeter.outside, cloudWall);
+        cloudBoundary = createCloudBoundary(info, perimeter.outside, perimeter.wallEvidence);
+        reportRackConflicts(mapId, variants[displayMode].rackWallConflicts);
         mapKey = key;
         mapSourceKey = sourceKey;
         activeMapId = mapId;
@@ -580,16 +600,21 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
 
     function setWallsVisible(value) {
         wallsVisible = value === true;
-        if (wallMesh) wallMesh.visible = wallsVisible;
+        const active = variants?.[displayMode].wallMesh;
+        if (active) active.visible = wallsVisible;
     }
 
     function setDisplayMode(value) {
         if (value !== 'raw' && value !== 'clean') throw new Error('Invalid 3D display mode');
+        if (displayMode === value) return;
         displayMode = value;
         if (variants) {
             for (const mode of ['raw', 'clean']) {
-                variants[mode].floor.visible = mode === displayMode;
+                const variant = variants[mode];
+                variant.floor.visible = mode === displayMode;
+                if (variant.wallMesh) variant.wallMesh.visible = mode === displayMode && wallsVisible;
             }
+            cloudLayer?.refresh();
         }
         refreshScanStrip();
     }
@@ -628,12 +653,13 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
             occupied: variants?.[displayMode].occupiedCells || 0,
             perimeter_cells: perimeter?.perimeterCells || 0,
             perimeter_bands: perimeter?.perimeterBands || 0,
-            wall_faces: perimeter?.wallFaces || 0,
-            rack_wall_conflicts: perimeter?.rackWallConflicts ?? [],
+            wall_faces: variants?.[displayMode].wallFaces || 0,
+            rack_wall_conflicts: variants?.[displayMode].rackWallConflicts ?? [],
             warehouse_fit_issues: semanticScene?.getFitIssues() ?? [],
             bridged_wall_cells: perimeter?.bridgedWallCells || 0,
             raw_occupied: variants?.raw.occupiedCells || 0,
             clean_occupied: variants?.clean.occupiedCells || 0,
+            hidden_free_cells: variants?.clean.hiddenFreeCells || 0,
             filtered_cells: variants?.clean.removedCells || 0,
             filtered_components: variants?.clean.removedComponents || 0,
             clean_max_cells: variants?.clean.maxFilteredCells || 0,
@@ -658,6 +684,8 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
             robotModel = null;
         }
         modelLoading = false;
+        contactShadows?.dispose();
+        contactShadows = null;
         robotRoot = null;
         followPosition = null;
         controls?.dispose();
@@ -674,6 +702,8 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
         cloudLayer?.dispose();
         laserLayer?.dispose();
         semanticScene?.dispose();
+        planLayer?.dispose();
+        planLayer = null;
         routeMarkers?.dispose();
         routeMarkers = null;
         cloudLayer = null;
@@ -686,7 +716,7 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
     }
 
     return { init, show, hide, resize, dispose,
-             setMap, clearMap, setRouteMarkers, setWallsVisible, setDisplayMode, getMapSummary,
+             setMap, clearMap, setNavPlan, setRouteMarkers, setWallsVisible, setDisplayMode, getMapSummary,
              setPointCloud, clearPointCloud, setLaserScan, clearLaserScan, setSemanticState, setWarehouse,
              setRobotPose, setRobotVisible, setLiftHeight, setLidarHeight,
              setFollowRobot, isFollowingRobot, setCameraMode };

@@ -177,7 +177,7 @@ const pictured = normalizeSemanticState({map_id:'warehouse_a', objects:[{
     id:'pallet_1',type:'pallet',state:'destination',pose:{x:4,y:-2},
     width:0.8,depth:0.6,height:0.15,boxes:[{id:'box', z:-0.04,width:.21,depth:.2,height:.3}],
 }]}, layout)[0];
-assert(pictured.width===.4 && pictured.depth===.3 && pictured.height===.05 &&
+assert(pictured.width===.3 && pictured.depth===.4 && pictured.height===.05 &&
        pictured.boxes[0].z===0 && pictured.boxes[0].height===.3,
        'visual pallet uses the surveyed size, and carton starts at or above the deck');
 assert(normalizeSemanticState({map_id: 'other_map', objects: []}, layout) === null,

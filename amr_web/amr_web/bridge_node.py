@@ -641,11 +641,11 @@ class WebBridge(Node):
 
                 if nav_running and self._plan_pending and \
                         (now - self._last_plan_send) >= self._plan_interval:
+                    self._plan_pending = False
                     plan = self._state_bridge.get_latest_plan()
                     if plan:
                         await self._ws_manager.broadcast(json.dumps(plan))
                         self._last_plan_send = now
-                        self._plan_pending = False
 
                 # Phase C cleanup: xoa costmap/plan khi Nav2 tat hoac goal ket thuc
                 # (1 cho duy nhat theo spec, tranh phai sua cac diem gan _current_state)
@@ -1749,7 +1749,7 @@ class WebBridge(Node):
             llm.clear_status('idle', f'Chế độ đã đổi sang {mode}; sẵn sàng cho nhiệm vụ mới')
         return True, stop_message or f'Operating mode set to {mode}'
 
-    def _lookup_map_tf(self, frame_id: str) -> Optional[Tuple[float, float, float]]:
+    def _lookup_map_tf(self, frame_id: str, at=None) -> Optional[Tuple[float, float, float]]:
         """Phase B05: tra TF map_frame -> frame_id. Tra ve (x, y, yaw) hoac None neu loi.
 
         Voi frame_id = base_frame (base_footprint) ket qua CHINH LA pose cua robot
@@ -1760,10 +1760,10 @@ class WebBridge(Node):
             return (0.0, 0.0, 0.0)
         try:
             t = self._tf_buffer.lookup_transform(
-                self._map_frame, frame_id, rclpy.time.Time())
+                self._map_frame, frame_id, at if at is not None else rclpy.time.Time())
             stamp = rclpy.time.Time.from_msg(t.header.stamp)
             age = (self.get_clock().now() - stamp).nanoseconds / 1e9
-            if age < -1.0 or age > 3.0:
+            if at is None and (age < -1.0 or age > 3.0):
                 return None
         except Exception:
             return None
@@ -1889,21 +1889,27 @@ class WebBridge(Node):
         """Cache a valid plan while Nav2 runs; route BTs may publish only once."""
         if not (self._nav_bridge and self._nav_bridge.is_nav_running()):
             return
+        scope = self._nav_bridge.plan_scope()
+        stamp = Time.from_msg(msg.header.stamp)
+        previous = self._state_bridge.get_latest_plan() or {}
+        timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if (previous.get('map_id') == scope['map_id'] and
+                previous.get('plan_goal_id') == scope['plan_goal_id'] and
+                0 < timestamp < previous.get('timestamp', 0)):
+            return
+        data = {'points': [], 'timestamp': timestamp, 'type': 'plan'}
+        frame = msg.header.frame_id
         try:
-            tf = None
-            if msg.header.frame_id != self._map_frame:
-                tf = self._lookup_map_tf(msg.header.frame_id)
-                if tf is None:
-                    return
-            data = plan_to_json(msg, tf=tf)
-            if not data['points']:
-                return
-            self._state_bridge.update_plan(data)
-            self._plan_received_t = time.monotonic()
-            self._plan_pending = True
-        except Exception as e:
+            if frame and all(not ps.header.frame_id or ps.header.frame_id == frame for ps in msg.poses):
+                tf = None if frame == self._map_frame else self._lookup_map_tf(frame, stamp)
+                if frame == self._map_frame or tf is not None:
+                    data = plan_to_json(msg, tf=tf)
+        except (ValueError, OverflowError) as exc:
             if self._verbose:
-                self.get_logger().warn(f'Plan error: {e}')
+                self.get_logger().warn(f'Plan error: {exc}')
+        self._state_bridge.update_plan({**data, **scope, 'frame_id': self._map_frame})
+        self._plan_received_t = time.monotonic()
+        self._plan_pending = True
 
     def _on_point_cloud(self, msg: PointCloud2) -> None:
         """Keep only the newest requested frame; conversion runs off ROS callbacks."""

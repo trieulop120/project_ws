@@ -2305,6 +2305,18 @@
   white-space: nowrap;
 }
 .nav-three-action[aria-pressed="false"] { opacity: .6; }
+.nav-three-telemetry {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 1;
+  padding: 4px 8px;
+  border-radius: 5px;
+  background: rgba(15, 28, 34, .82);
+  color: #e8f3f1;
+  font: 600 12px/1.4 Inter, sans-serif;
+  pointer-events: none;
+}
 .nav-three-status {
   position: absolute;
   top: 50%;

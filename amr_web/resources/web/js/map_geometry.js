@@ -1,5 +1,5 @@
 import {ShapeUtils, Vector2} from '../vendor/three/three.module.js';
-import {floodGrid, gridBorder, pointInRing, prepareWallContours, segmentsMeet,
+import {floodGrid, gridBorder, pointInRing, wallContourVariants, segmentsMeet,
         selectWallBands} from './wall_contours.js';
 
 // Pure ROS grid-to-world conversion. PGM rows start at the top; OccupancyGrid row 0 is at the bottom.
@@ -86,17 +86,18 @@ const COLORS = [
     [63, 78, 85],    // occupied interior footprint
 ];
 
-export function mapPixels(categories, width, height) {
+export function mapPixels(categories, width, height, surveyExterior = null) {
     const pixels = new Uint8ClampedArray(width * height * 4);
     for (let row = 0; row < height; row++) {
         for (let column = 0; column < width; column++) {
-            const category = categories[row * width + column];
+            const index = row * width + column;
+            const category = categories[index];
             const color = COLORS[category];
             const pixel = ((height - 1 - row) * width + column) * 4;
             pixels[pixel] = color[0];
             pixels[pixel + 1] = color[1];
             pixels[pixel + 2] = color[2];
-            pixels[pixel + 3] = category === 0 ? 28 : 255;
+            pixels[pixel + 3] = category === 0 ? (surveyExterior?.[index] ? 0 : 28) : 255;
         }
     }
     return pixels;
@@ -228,7 +229,7 @@ export function extractPerimeter(categories, info) {
         markOutward(col,width,height);
         markOutward(col+(height-1)*width,-width,height);
     }
-    return {...perimeter, wallEvidence:wall, outside};
+    return {...perimeter, wallEvidence:wall, outside, exteriorUnknown:exterior};
 }
 
 // Merge equal horizontal runs on consecutive ROS grid rows into rectangles.
@@ -554,24 +555,111 @@ export function rackWallClipping(wall, info, layout, contours = null) {
     return {rackWallConflicts, cuts};
 }
 
+// Trace free-cell fringe from the measured survey exterior. Labels and
+// display edits stay local to the Clean variant.
+function trimFloorFringe(categories, width, survey) {
+    if (!survey) return 0;
+    const {core, exterior:surveyExterior} = survey;
+    if (!core.includes(1) || !categories.some((v,i) => v === 1 && surveyExterior[i])) return 0;
+    const labels = new Int32Array(categories.length);
+    const queue = new Int32Array(categories.length);
+    let region = 0;
+    let hidden = 0;
+    function neighbours(i, visit) {
+        if (i % width) visit(i-1);
+        if (i % width < width-1) visit(i+1);
+        if (i >= width) visit(i-width);
+        if (i+width < categories.length) visit(i+width);
+    }
+
+    // Positive labels identify supported free regions inside the envelope.
+    // Exterior seeds can then trace a ray all the way to a measured wall,
+    // including its short unsupported root just inside the envelope.
+    // Group contacts at the survey opening scale: a jagged mouth along a
+    // room edge can touch many non-adjacent pixels. Two separated mouths
+    // support a passage even when both lead into the same room.
+    const mouthSize = Math.max(1, Math.ceil(2*survey.openingRadiusCells));
+    const mouthStride = Math.ceil(width/mouthSize) + 2;
+    function mouthBin(i) {
+        return Math.floor(i%width/mouthSize) + mouthStride*Math.floor(Math.floor(i/width)/mouthSize);
+    }
+    function separateEntrances(bins) {
+        if (bins.size < 2) return false;
+        const pending = [bins.values().next().value];
+        bins.delete(pending[0]);
+        while (pending.length) {
+            const bin = pending.pop();
+            for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    const next = bin + dy*mouthStride + dx;
+                    if (bins.delete(next)) pending.push(next);
+                }
+            }
+        }
+        return bins.size > 0;
+    }
+    function visitComponent(seed, label) {
+        let end = 1;
+        const contacts = label < 0 ? new Set() : null;
+        let firstAnchor = 0;
+        let passage = false;
+        queue[0] = seed;
+        labels[seed] = label;
+        function visit(i) {
+            if (categories[i] !== 1 || (label > 0 && surveyExterior[i])) return;
+            if (!labels[i]) {
+                labels[i] = label;
+                queue[end++] = i;
+            } else if (label < 0 && labels[i] > 0) {
+                passage ||= firstAnchor !== 0 && firstAnchor !== labels[i];
+                firstAnchor = labels[i];
+                if (!passage) contacts.add(mouthBin(i));
+            }
+        }
+        for (let n = 0; n < end; n++) neighbours(queue[n], visit);
+        if (label < 0 && !passage && !separateEntrances(contacts)) {
+            for (let n = 0; n < end; n++) categories[queue[n]] = 0;
+            hidden += end;
+        }
+    }
+    for (let i = 0; i < categories.length; i++) {
+        if (core[i] && !surveyExterior[i] && categories[i] === 1 && !labels[i]) visitComponent(i, ++region);
+    }
+    if (!region) return 0;
+    for (let i = 0; i < categories.length; i++) {
+        if (surveyExterior[i] && categories[i] === 1 && !labels[i]) visitComponent(i, -1);
+    }
+    return hidden;
+}
+
 export function createDisplayVariants(decoded, layout = null) {
     const {width, height, resolution} = decoded.info;
     const maxCells = Math.min(8, Math.floor(0.0032 / (resolution * resolution) + 1e-9));
     const maxSpanCells = Math.floor(0.10 / resolution + 1e-9);
     const filtered = cleanSmallOccupiedComponents(decoded.categories, width, height,
                                                   maxCells, maxSpanCells);
-    const perimeter = extractPerimeter(decoded.categories, decoded.info);
-    const contours = prepareWallContours(perimeter.wall, decoded.info);
+    const {survey, exteriorUnknown, ...perimeter} = extractPerimeter(decoded.categories, decoded.info);
+    const hiddenFreeCells = trimFloorFringe(filtered.categories, width, survey);
+    // The measured unknown flood keeps enclosed holes distinguishable even
+    // where the survey opening trims the narrow floor around them.
+    const transparent = survey?.core.includes(1) ? exteriorUnknown : null;
+    if (transparent && hiddenFreeCells) {
+        for (let i = 0; i < transparent.length; i++) {
+            if (decoded.categories[i] === 1 && filtered.categories[i] === 0) transparent[i] = 1;
+        }
+    }
+    const {raw:contours,clean:refinedContours} = wallContourVariants(perimeter.wall, decoded.info);
     const clipping = rackWallClipping(perimeter.wall, decoded.info, layout, contours);
     const interior = categories => categories.map((value, index) =>
         value === 2 && !perimeter.wall[index] ? 2 : 0);
     return {
-        ...perimeter, ...clipping, contours,
+        ...perimeter, ...clipping, contours, refinedContours,
         raw: {interior: interior(decoded.categories), pixels: decoded.pixels, occupiedCells: decoded.occupied.length / 2},
         clean: {
             interior: interior(filtered.categories),
-            pixels: mapPixels(filtered.categories, width, height),
+            pixels: mapPixels(filtered.categories, width, height, transparent),
             occupiedCells: decoded.occupied.length / 2 - filtered.removedCells,
+            hiddenFreeCells,
             removedCells: filtered.removedCells,
             removedComponents: filtered.removedComponents,
             maxFilteredCells: maxCells,

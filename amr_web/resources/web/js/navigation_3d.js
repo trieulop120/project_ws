@@ -5,6 +5,24 @@
     let layer, button2D, button3D, wallsButton,
         rawButton, cleanButton, status, viewport, followButton, poseReadout;
     let viewer = null;
+    let plan = null;
+    let planState = null;
+
+    function syncPlan() {
+        const state = planState;
+        const matches = transportConnected && plan && state && !state.stale && !state.stopping &&
+            state.process_owned && state.nav2_running && state.goal_active &&
+            (state.state === 'ACTIVE' || state.state === 'ACCEPTED') &&
+            state.plan_goal_id && state.plan_goal_start > 0 && !plan.plan_ambiguous &&
+            plan.timestamp >= state.plan_goal_start && plan.bridge_session_id === state.bridge_session_id &&
+            (!plan.plan_goal_id || plan.plan_goal_id === state.plan_goal_id) &&
+            plan.map_id === state.map_id && plan.map_id === window.selectedNavMap;
+        // A one-shot plan may precede its action status or the initial map.
+        // Bind it once, using the ROS acceptance stamp from that action.
+        if (matches && !plan.plan_goal_id) plan = {...plan,plan_goal_id:state.plan_goal_id};
+        viewer?.setNavPlan(matches && displayedMapId === plan.map_id ? plan : null);
+    }
+
     let mode = '2d';
     let request = 0;
     let loading = false;
@@ -26,7 +44,6 @@
     let lastLayoutRefresh = 0;
     let lidarHeight = null;
     let latestLiftMeters = null;
-    let modelKind = 'loading';
     const POSE_TIMEOUT_MS = 3000;
 
     const NO_MAP_MESSAGE = 'Vui lòng chọn bản đồ trong Navigation';
@@ -54,34 +71,14 @@
         updateFollowButton(false);
 
         poseReadout = document.getElementById('navThreeRobotTelemetry');
-        if (!poseReadout && layer) {
-            poseReadout = document.createElement('div');
-            poseReadout.id = 'navThreeRobotTelemetry';
-            poseReadout.setAttribute('role', 'status');
-            poseReadout.setAttribute('aria-live', 'off');
-            Object.assign(poseReadout.style, {
-                position: 'absolute', right: '10px', bottom: '10px', zIndex: '6',
-                pointerEvents: 'none', padding: '6px 9px', borderRadius: '6px',
-                background: 'rgba(15, 28, 34, .8)', color: '#e8f3f1',
-                fontSize: '12px', lineHeight: '1.4', fontFamily: 'monospace',
-                whiteSpace: 'pre-line'
-            });
-            layer.appendChild(poseReadout);
-        }
-        updatePoseReadout('Waiting for pose');
     }
 
-    function updatePoseReadout(label, pose = null) {
-        if (!poseReadout) return;
-        const model = modelKind === 'loading' ? 'Loading model' :
-            (modelKind === 'fallback' ? 'Fallback model' : 'AMR GLB');
-        poseReadout.textContent = pose
-            ? `${label} | ${model}\nX ${pose.x.toFixed(3)} m  Y ${pose.y.toFixed(3)} m  Yaw ${(pose.yaw * 180 / Math.PI).toFixed(1)}°`
-            : `${label} | ${model}`;
+    function updatePoseReadout(label) {
+        if (poseReadout && poseReadout.textContent !== label) poseReadout.textContent = label;
     }
 
     function hasLiveMapPose(frame) {
-        const age = Date.now() - lastPoseArrival;
+        const age = performance.now() - lastPoseArrival;
         return transportConnected && displayedMapId && frame && lastPose &&
             lastPose.stale !== true && age >= 0 && age < POSE_TIMEOUT_MS &&
             lastPose.map_id === displayedMapId && lastPose.frame_id === frame &&
@@ -95,39 +92,45 @@
         const mapFrame = viewer.getMapSummary()?.frame_id;
         if (!displayedMapId || !mapFrame) {
             viewer.setRobotPose(null);
-            updatePoseReadout('Waiting for selected map');
+            updatePoseReadout(transportConnected ? 'Waiting for map' : 'Disconnected');
             syncPointCloudStream();
             return;
         }
-        const age = Date.now() - lastPoseArrival;
+        const age = performance.now() - lastPoseArrival;
         if (hasLiveMapPose(mapFrame)) {
             const pose = {
                 x: lastPose.position.x, y: lastPose.position.y,
                 yaw: lastPose.orientation.yaw
             };
             viewer.setRobotPose(pose);
-            updatePoseReadout('Live', pose);
+            updatePoseReadout('Live');
         } else {
             viewer.setRobotPose(null);
             viewer.clearPointCloud();
             const label = !transportConnected ? 'Disconnected' :
-                (!lastPose || age >= POSE_TIMEOUT_MS || lastPose.stale === true)
-                    ? 'Pose unavailable/stale' : 'Waiting for map-frame pose';
+                (lastPose && (age >= POSE_TIMEOUT_MS || lastPose.stale === true)) ? 'Stale' : 'Waiting for pose';
             updatePoseReadout(label);
         }
         syncPointCloudStream();
     }
 
     function onPoseMessage(pose) {
-        if (!pose || typeof pose !== 'object') return;
+        if (!transportConnected || !pose || typeof pose !== 'object') return;
+        // The bridge may rebroadcast a cached pose. Its source timestamp
+        // advances even for a stationary robot receiving fresh telemetry.
+        if (!Number.isFinite(pose.timestamp) || pose.timestamp !== lastPose?.timestamp ||
+                pose.map_id !== lastPose?.map_id || pose.frame_id !== lastPose?.frame_id) {
+            lastPoseArrival = performance.now();
+        }
         lastPose = pose;
-        lastPoseArrival = Date.now();
         if (mode === '3d') refreshRobotPose();
     }
 
     function onTransportChange(connected) {
         transportConnected = connected === true;
         if (!transportConnected) {
+            plan = planState = null;
+            viewer?.setNavPlan(null);
             lidarHeight = null;
             viewer?.setLidarHeight(null);
             cloudRequested = false; // The old socket and its opt-in no longer exist.
@@ -214,18 +217,18 @@
                 if (!sceneManager.commit(map)) {
                     displayedMapId = null;
                     setStatus(`Loading map "${mapId}"...`);
-                    syncPointCloudStream();
+                    refreshRobotPose();
                     return;
                 }
                 const changedMap = displayedMapId !== mapId;
                 displayedMapId = mapId;
+                syncPlan();
                 if (changedMap || viewer.getMapSummary().build_count !== previousBuild) markerFeed.replay();
                 viewer.setWallsVisible(wallsVisible);
                 viewer.setDisplayMode(displayMode);
                 setStatus('');
                 viewer.setLidarHeight(lidarHeight);
                 if (latestLiftMeters !== null) viewer.setLiftHeight(latestLiftMeters);
-                refreshRobotPose();
             } catch (error) {
                 sceneManager.clearGrid();
                 displayedMapId = null;
@@ -233,7 +236,7 @@
                 console.warn('3D map data rejected:', error);
             }
         }
-        syncPointCloudStream();
+        refreshRobotPose();
     }
 
     function canDisplay() {
@@ -299,7 +302,7 @@
         try {
             if (!viewer) {
                 const [{createViewer}, {createSceneManager}, {createRouteMarkerFeed}] = await Promise.all([
-                    import('/js/three_viewer.js?v=3.2.0'),
+                    import('/js/three_viewer.js?v=3.8.0'),
                     import('/js/scene_manager.js?v=1.3.0'),
                     import('/js/route_marker_feed.js?v=1.1.0'),
                 ]);
@@ -314,7 +317,6 @@
                     markerFeed = null;
                     window.showToast?.('3D view unavailable. Returned to 2D.', 'warn');
                 }, modelStatus => {
-                    modelKind = modelStatus.kind;
                     if (modelStatus.kind === 'fallback') {
                         console.warn('AMR GLB unavailable; using fallback:', modelStatus.reason);
                     }
@@ -341,7 +343,6 @@
             layer.hidden = false;
             viewer.init(layer);
             mode = '3d';
-            modelKind = 'loading';
             updateFollowButton();
             loading = false;
             updateButtons();
@@ -447,6 +448,27 @@
         onSemanticState: message => {
             if (message?.map_id === window.selectedNavMap) sceneManager?.setState(message);
         },
+        onNavState: state => {
+            if (!transportConnected) return;
+            planState = state;
+            syncPlan();
+        },
+        onNavResult: result => {
+            if (result.bridge_session_id === planState?.bridge_session_id && result.goal_id === planState.goal_id) {
+                planState = null;
+                syncPlan();
+            }
+        },
+        onPlan: message => {
+            if (!transportConnected) return;
+            if (message.map_id && window.selectedNavMap && message.map_id !== window.selectedNavMap &&
+                    planState?.map_id === window.selectedNavMap) return;
+            if (plan && message.map_id === plan.map_id && message.bridge_session_id === plan.bridge_session_id &&
+                    message.plan_goal_id === plan.plan_goal_id && message.timestamp > 0 &&
+                    message.timestamp < plan.timestamp) return;
+            plan = message.points?.length >= 2 ? message : null;
+            syncPlan();
+        },
         onTransportChange,
         onLidarHeight: height => {
             lidarHeight = Number.isFinite(height) && height > 0 ? height : null;
@@ -470,6 +492,8 @@
                 return;
             }
             observedMapId = mapId;
+            if (plan?.map_id !== mapId) plan = null;
+            syncPlan();
             observedRouteId = route;
             if (lastPose?.map_id !== mapId) {
                 lastPose = null;

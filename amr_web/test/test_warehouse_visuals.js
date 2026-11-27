@@ -16,7 +16,7 @@ const layout = {objects: [rack], cargo_catalog: [
 ]};
 let pallets = warehousePallets({slots: {A: 'full', B: 'empty'}}, layout);
 assert(pallets.length === 1 && pallets[0].id === 'shelf_A', 'occupied only');
-assert(pallets[0].height === .05 && pallets[0].width === .40 && pallets[0].depth === .30, 'pallet measurements');
+assert(pallets[0].height === .05 && pallets[0].width === .30 && pallets[0].depth === .40, 'pallet measurements');
 assert(pallets[0].boxes[0].suppressCloud === false, 'unverified placeholder does not suppress cloud');
 const selected = {id: 'shelf_A', slot: 'A', pose: {x: 2, y: 1, z: .225, yaw: Math.PI/2}};
 pallets = warehousePallets({slots: {A: 'full'}, target: selected}, layout);
@@ -30,6 +30,14 @@ assert(pallets.length === 1 && pallets[0].state === 'carried' && pallets[0].boxe
 pallets = warehousePallets({slots: {B: 'full'}, drops: {B: {...carried, cargo_type: 'medium'}}}, layout);
 assert(pallets.length === 1 && pallets[0].id === 'shelf_A' && pallets[0].pose.z === .55 &&
        pallets[0].boxes[0].height === .20, 'confirmed destination slot and catalog sizes');
+
+const pending = warehousePallets({carried, pending_slot:'B', slots:{B:'full'}},layout);
+assert(pending.length===1 && pending[0].state==='carried','early occupancy cannot imply release');
+for (const occupancy of ['empty', 'full', 'unknown']) {
+    const placed = warehousePallets({slots:{B:occupancy},drops:{B:carried}},layout);
+    assert(placed.length===1 && placed[0].id===carried.id && placed[0].state==='rack',
+        'confirmed ownership survives asynchronous occupancy');
+}
 
 const yaw = .8;
 const c = Math.cos(yaw), s = Math.sin(yaw);
@@ -135,7 +143,7 @@ const locked = pickupPreview(tracked,{...jitter,locked:true});
 const late = pickupPreview(locked,{...jitter,pose:{...jitter.pose,x:1.1}});
 assert(late.pose===tracked.pose && late.locked,'locked face ignores later camera movement');
 const [floorPallet] = warehousePallets({target:floor},{objects:[]},initial);
-assert(floorPallet.pose.x===1 && floorPallet.pose.z===0 && floorPallet.boxes[0].height===.249,
+assert(near(floorPallet.pose.x,.95) && floorPallet.pose.z===0 && floorPallet.boxes[0].height===.249,
        'pose is the bottom centre, height belongs to the camera carton');
 const [held] = warehousePallets({carried:floor},{objects:[]});
 assert(held.id===floorPallet.id && held.boxes[0].id===floorPallet.boxes[0].id &&

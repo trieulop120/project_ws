@@ -113,6 +113,7 @@ class NavBridge:
         self._cancel_in_progress = False
         self._goal_context = None
         self._observed_goals = {}
+        self._plan_goal_stamps = {}
         self._last_goal_id = None
         self._last_result = None
         self._last_elapsed_s = 0.0
@@ -385,14 +386,32 @@ class NavBridge:
         # Never release ownership merely because a status stream becomes stale.
         return {key: status for key, status in self._observed_goals.items() if status in (1, 2, 3)}
 
+    def plan_scope(self):
+        """Correlate the unstated Path owner with a single Nav2 action interval."""
+        with self._lock:
+            active = self._active_observed_goals()
+            key = next(iter(active)) if len(active) == 1 else None
+            eligible = (key is not None and active[key] in (1, 2) and not self._cancel_requested and
+                        (not self._goal_context or self._goal_context.get('ros_id') == key[1]))
+            return {'map_id': self.get_active_map_id(), 'bridge_session_id': self._bridge_session_id,
+                    'plan_goal_id': key[1] if eligible else None,
+                    'plan_goal_start': self._plan_goal_stamps.get(key) if eligible else None,
+                    'plan_ambiguous': bool(active) and not eligible}
+
     def observe_goal_status(self, name, msg):
         with self._goal_changed:
+            previous = self.plan_scope()
             for item in msg.status_list:
                 key = (name, bytes(item.goal_info.goal_id.uuid).hex())
                 old = self._observed_goals.get(key)
                 # Terminal status is final even if an older callback arrives late.
                 if old not in (4, 5, 6):
                     self._observed_goals[key] = item.status
+                    if item.status in (1, 2):
+                        stamp = item.goal_info.stamp
+                        self._plan_goal_stamps[key] = stamp.sec + stamp.nanosec * 1e-9
+                    else:
+                        self._plan_goal_stamps.pop(key, None)
                 if old in (1, 2, 3) and item.status in (4, 5, 6) and self._goal_context is None:
                     self._current_state = {4: self.STATE_SUCCEEDED, 5: self.STATE_CANCELED,
                                            6: self.STATE_FAILED}[item.status]
@@ -402,6 +421,9 @@ class NavBridge:
             for key in terminal[:-256]:
                 self._observed_goals.pop(key, None)
             self._goal_changed.notify_all()
+            changed = previous != self.plan_scope()
+        if changed:
+            self._broadcast_state()
 
     def _new_goal_context(self):
         ctx = {'id': uuid.uuid4().hex, 'handle': None, 'created': time.monotonic()}
@@ -617,6 +639,7 @@ class NavBridge:
             self._goal_pending = False
             self._goal_context = None
             self._observed_goals.clear()
+            self._plan_goal_stamps.clear()
             self._cancel_requested = False
             self._initial_pose_pending = False
             self._goal_changed.notify_all()
@@ -779,6 +802,7 @@ class NavBridge:
             if ros_id:
                 name = 'navigate_to_pose' if self._mission_type == 'single' else 'navigate_through_poses'
                 self._observed_goals[(name, ros_id)] = status
+                self._plan_goal_stamps.pop((name, ros_id), None)
                 for key in list(self._observed_goals):
                     if key[1] == ros_id:
                         self._observed_goals[key] = status
@@ -1156,6 +1180,7 @@ class NavBridge:
             self._state_sequence += 1
             revision = self._state_sequence
             active = self._active_observed_goals()
+            plan_scope = self.plan_scope()
             busy = self._goal_context is not None or bool(active)
             owned = bool(process and process.poll() is None)
             detected = self._nav_ready() or self._waypoint_ready()
@@ -1197,6 +1222,8 @@ class NavBridge:
             'nav2_detected': detected,
             'stopping': stopping,
             'goal_active': busy,
+            'plan_goal_id': plan_scope['plan_goal_id'],
+            'plan_goal_start': plan_scope['plan_goal_start'],
             'goal_id': goal_id,
             'last_result': last_result,
             'can_send_goal': owned and nav_ready and not busy,

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader } from '../vendor/three/loaders/GLTFLoader.js';
-import {PALLET_DECK_FRACTION, PALLET_SIZE} from './warehouse_visuals.js';
+import {PALLET_DECK_FRACTION, PALLET_SIZE} from './warehouse_visuals.js?v=1.2.0';
 
 const MODEL_URL = '/models/amr_description.glb';
 let templatePromise = null;
