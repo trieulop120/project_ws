@@ -7,6 +7,7 @@
     let viewer = null;
     let plan = null;
     let planState = null;
+    let pathVisible = false;
 
     function syncPlan() {
         const state = planState;
@@ -20,7 +21,7 @@
         // A one-shot plan may precede its action status or the initial map.
         // Bind it once, using the ROS acceptance stamp from that action.
         if (matches && !plan.plan_goal_id) plan = {...plan,plan_goal_id:state.plan_goal_id};
-        viewer?.setNavPlan(matches && displayedMapId === plan.map_id ? plan : null);
+        viewer?.setNavPlan(pathVisible && matches && displayedMapId === plan.map_id ? plan : null);
     }
 
     let mode = '2d';
@@ -302,7 +303,7 @@
         try {
             if (!viewer) {
                 const [{createViewer}, {createSceneManager}, {createRouteMarkerFeed}] = await Promise.all([
-                    import('/js/three_viewer.js?v=3.8.0'),
+                    import('/js/three_viewer.js?v=3.9.0'),
                     import('/js/scene_manager.js?v=1.3.0'),
                     import('/js/route_marker_feed.js?v=1.1.0'),
                 ]);
@@ -377,6 +378,13 @@
         transportConnected = window.navigationTransportState === 'CONNECTED';
         button2D.addEventListener('click', show2D);
         button3D.addEventListener('click', show3D);
+        const pathButton = document.getElementById('navThreePath');
+        pathButton?.addEventListener('click', () => {
+            pathVisible = !pathVisible;
+            pathButton.textContent = pathVisible ? 'Path On' : 'Path Off';
+            pathButton.setAttribute('aria-pressed', String(pathVisible));
+            syncPlan();
+        });
         wallsButton.addEventListener('click', () => {
             wallsVisible = !wallsVisible;
             wallsButton.textContent = wallsVisible ? 'Walls On' : 'Walls Off';

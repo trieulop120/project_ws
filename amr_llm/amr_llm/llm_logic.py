@@ -172,6 +172,7 @@ BACKENDS = {
 }
 
 PROMPT = """\
+Use plain spoken language in say and clarify. No greetings, emoji, decorative symbols or raw diagnostics. Ask one short question when the request is ambiguous. For status and causes use get_robot_status with the matching topic (fault or resume for recovery questions). Only report evidence present in the current telemetry.
 You are the command planner for an AMR forklift in a warehouse. The user may write in English or Vietnamese.
 CRITICAL LANGUAGE RULE:
 - Selected output language: <<LANGUAGE>>.
@@ -313,6 +314,18 @@ def build_system_prompt(location, state=None, language="auto"):
                   .replace("<<STATE>>", json.dumps(state or {}, ensure_ascii=False))
                   .replace("<<LANGUAGE>>", output_language)
                   .replace("<<TOOLS>>", build_tools_text()))
+
+
+# Strip pictograms from generated prose only. Preserve measurements and identifiers.
+_CHAT_ICONS = re.compile(
+    r'[\U0001F000-\U0001FAFF\u2600-\u27bf\u25b6\u25c0\u25c9'
+    r'\u2194-\u2199\u23e9-\u23fa\u2b50\u2b55\ufe0e\ufe0f\u200d]'
+    r'|[#*0-9]\ufe0f?\u20e3'
+)
+
+
+def spoken_text(value):
+    return re.sub(r'[^\S\n]+', ' ', _CHAT_ICONS.sub('', str(value or ''))).strip()
 
 
 def extract_json(raw):

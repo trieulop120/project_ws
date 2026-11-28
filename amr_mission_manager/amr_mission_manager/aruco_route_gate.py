@@ -6,6 +6,11 @@ the phase name alone does not prove that a goal was accepted or is moving.
 """
 
 
+def placement_leg(session, operation):
+    """The pallet node's PICK operation remains current until DROP starts."""
+    return f'placement:{session}:{operation}' if session and operation >= 0 else ''
+
+
 class ArucoRouteGate:
     @staticmethod
     def combine(supervisor_state, placement_grant, placement_fresh,

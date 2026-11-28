@@ -24,7 +24,7 @@ Luong:
                    -> DONE    : xong 1 chu trinh
     [STOP]       -> huy Nav2, dung xe, DUNG LIFT (M0), pause detector inference
 
-Drop / retrieval: xoay + di ngang (ke ca map trim) TRUOC khi nang cang.
+Drop / retrieval: xoay + di ngang TRUOC khi nang cang. DROP giu muc tieu odom tu D_1.
 Sau nang cang: CONVERGE -> GATE -> LOCK, bu goc/ngang trong luc tien.
 Sai lech qua nguong hoac khong qua cong -> dung; khong lui/xoay canh lai.
 
@@ -69,7 +69,9 @@ from rclpy.action import ActionClient
 from rclpy.time import Time
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, qos_profile_sensor_data
-from amr_mission_manager.pallet_recovery import PalletRecovery
+from amr_mission_manager.detector_args import with_cargo_classes
+from amr_mission_manager.aruco_route_gate import placement_leg
+from amr_mission_manager.pallet_recovery import PalletRecovery, finite_pose
 
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
@@ -119,7 +121,7 @@ DEFAULTS = {
     # detector
     'detector_package': 'amr_perception',
     'detector_executable': 'pallet_detector_ov',   # OpenVINO; 'pallet_detector' = best.pt
-    'detector_prewarm': False,       # preload weights; keep inference paused until Detect ON
+    'detector_prewarm': True,        # preload only while travelling to PICK
     'detector_prewarm_retry_s': 5.0,
     'detector_camera_info_in': '/camera/color/camera_info',
     'detector_camera_info_out': '/color/camera_info',
@@ -147,8 +149,12 @@ DEFAULTS = {
     'retrieval_tf_jump_m': 0.10,
     'retrieval_tf_jump_deg': 10.0,
     # hieu chinh he thong (khung pallet: +x vao pallet, +y trai)
-    'pallet_lat_offset_m': 0.0,     # >0 dich diem dich sang TRAI huong vao pallet
-    'pallet_yaw_offset_deg': 0.0,
+    'pallet_lat_offset_m': 0.0,     # Positive shifts the target left in the pallet frame.
+    'pallet_yaw_offset_deg': 0.0,   # Positive turns the target left.
+    # Additional PICK trim at 45 degrees of skew. Lateral values use pallet +Y (left).
+    'pick_right_skew_lat_m': 0.0,
+    'pick_left_skew_lat_m': 0.0,
+    'pick_skew_yaw_trim_deg': 0.0,  # Extra turn towards the detected pallet heading.
     'face_offset_m': 0.0,           # vi tri mat truoc so voi diem detector, doc +X
     # Hieu chinh LECH DO NGHIENG: detector lay tia qua pixel TAM OBB nhung do sau = percentile
     # (gan nhat) -> khi pallet nghieng, diem bi keo ve phia xe va lech ngang cung chieu nghieng.
@@ -210,7 +216,7 @@ DEFAULTS = {
     'lock_yaw_abort_deg': 4.0,
     # dung (sieu am)
     'stop_dist_cm': 4.5,
-    'confirm_count': 2,
+    'confirm_count': 1,
     'us_arm_m': 0.10,               # chi tin sieu am sau khi da di vao >= 10 cm tu cong
     'us_below_min_is_close': True,  # doc < min_range cung tinh la "sat"
     'max_insert_m': 0.90,           # quang toi da tu cong (= chieu dai cang + du)
@@ -255,6 +261,8 @@ DEFAULTS = {
     'drop_start_tol_m': 0.40,       # xe phai o gan D_1: sai so doc/ngang toi da so voi vi tri mong doi
     'drop_start_yaw_deg': 25.0,
     'drop_stage_m': 0.65,           # khoang lui khi can cho xoay; vi tri ke lay tu shelf.yaml
+    'drop_anchor_max_age_s': 2.0,   # Both the image and measured AMCL ACK must still be recent.
+    'drop_prelift_range_stale_s': 2.0,  # Max age of the range message for a stationary lift.
     # DROP Nav2 staging and local retreat use the same base-to-rack distance.
     'drop_nav_timeout_s': 180.0,
     'drop_stop_timeout_s': 10.0,
@@ -283,7 +291,7 @@ DEFAULTS = {
     'map_yaw_trim': False,          # True: truoc khi tien vao, chinh lai huong theo yaw MAP hien tai
                                     # (AMCL) thay vi yaw odom da dong bang luc detect
     'amcl_shift_fail_m': 0.60,
-    # Legacy TF-based trim, once BEFORE committing the lateral manoeuvre.
+    # Retained for parameter-file compatibility. Placement always uses its D_1 target.
     'drop_map_trim': False,
     # Retrieval rack alignment keeps its previous trim default independently.
     'retrieval_map_trim': False,
@@ -837,6 +845,12 @@ class PalletMission(PalletRecovery, Node):
         self._det_proc = None
         self._det_kill_at = None
         self._det_prewarm_retry_t = 0.0
+        self._pick_warming = False
+        self._pick_start_pending = False
+        self._detector_command = None
+        self._pick_route_state = ''
+        self._pick_route_classes = []
+        self._pick_route_time = 0.0
 
         self._goal_handle = None
         self._settle_t0 = 0.0
@@ -855,6 +869,7 @@ class PalletMission(PalletRecovery, Node):
 
         self._calib = None              # (y pallet trong khung xe, yaw pallet so voi xe) luc Detect OFF
         self._us_cm = None
+        self._us_valid_for_prelift = False
         self._us_t = 0.0
         self._us_count = 0
         self._us_pick_confirmed = False
@@ -904,6 +919,7 @@ class PalletMission(PalletRecovery, Node):
         self._bo_after = 'pick'
         self._bo_timeout = float(self.p['backoff_timeout_s'])
         self._drop = None               # dict thong tin lan drop hien tai
+        self._placement_anchor = None
         self._drop_nav = None           # per-goal ownership; late callbacks cannot resume DROP
         self._drop_odom_t = 0.0
         self._drop_odom_speed = None
@@ -944,6 +960,7 @@ class PalletMission(PalletRecovery, Node):
             Bool, '/pallet_detector/enable', detector_enable_qos)
         self.pub_detector_enable.publish(Bool(data=False))
 
+        self.create_subscription(String, '/mission_supervisor/status', self._on_pick_route, 1)
         self.create_subscription(PoseStamped, self.p['pose_topic'], self._on_pose, 10)
         self.create_subscription(PoseStamped, '/pallet_retrieval/selected_pose',
                                  self._on_retrieval_pose, 10)
@@ -955,6 +972,7 @@ class PalletMission(PalletRecovery, Node):
                                  self._on_joint_states, qos_profile_sensor_data)
         self.create_subscription(Odometry, self.p['drop_odom_topic'],
                                  self._on_drop_odom, qos_profile_sensor_data)
+        self.create_subscription(String, '/aruco_b1/status', self._on_anchor_status, 10)
         self.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status',
                                  self._on_retrieval_nav_status, 10)
         self.create_subscription(String, self.p['cargo_topic'], self._on_cargo, 10)
@@ -1085,6 +1103,15 @@ class PalletMission(PalletRecovery, Node):
              'fail_phase': getattr(self, '_fail_phase', None),
              'recovery': self._recovery_status(),
              'err': err}
+        # Display-only travel endpoints. A DROP pre-lift or retrieval alignment
+        # also uses LIFTING, but neither transfers ownership onto a shelf.
+        lifting = (self._state == LIFTING or (self._state in (FAILED, STOPPED)
+                   and (self._checkpoint or {}).get('state') == LIFTING))
+        if lifting and lift is not None:
+            if ((self._lift_next == 'pick_backoff' and self._mode == 'pick' and self._us_pick_confirmed)
+                    or (self._lift_next == 'drop_release' and self._mode == 'drop')):
+                d['visual_lift'] = {'action': self._lift_next, 'start_m': self._lift_h0 / 100,
+                                    'goal_m': self._lift_goal / 100, 'height_m': lift / 100}
         release = self._visual_release
         if release and release['operation_id'] == self._operation_id:
             d['visual_release'] = {**release, 'age_s': time.monotonic() - release['at']}
@@ -1117,6 +1144,11 @@ class PalletMission(PalletRecovery, Node):
                               msg.pose.position.y, yaw_from_quat(msg.pose.orientation)))
 
     def _on_range(self, msg: Range):
+        # +inf is the bridge's explicit no-echo reading. A close, in-range
+        # return can come from the load already on the forks.
+        self._us_valid_for_prelift = msg.range == math.inf or (
+            math.isfinite(msg.range) and msg.range > 0.0
+            and msg.min_range <= msg.range <= msg.max_range)
         cm = msg.range * 100.0 if math.isfinite(msg.range) else float('inf')
         self._us_cm = cm
         self._us_t = time.monotonic()
@@ -1605,6 +1637,7 @@ class PalletMission(PalletRecovery, Node):
             res.success = False
             res.message = f'pallet mission busy or carrying (state={self._state})'
             return res
+        self._pick_warming = False
         ok, message = self._start_detector()
         if ok:
             # Use this node's latched publisher as the single authority for
@@ -1616,8 +1649,7 @@ class PalletMission(PalletRecovery, Node):
 
     def _srv_retrieval_detector_stop(self, _req, res):
         self.pub_detector_enable.publish(Bool(data=False))
-        if not self.p['detector_prewarm']:
-            self._terminate_detector()
+        self._terminate_detector()
         res.success, res.message = True, 'retrieval inference stopped'
         return res
 
@@ -1730,8 +1762,7 @@ class PalletMission(PalletRecovery, Node):
         # loaded robot look empty or erase medium/tall classification.
         carrying = self._cargo is True or self._state == CARRYING
         self.pub_detector_enable.publish(Bool(data=False))
-        if not self.p['detector_prewarm']:
-            self._terminate_detector()
+        self._terminate_detector()
         if not carrying:
             self._retrieval_mode = False
             self._retrieval_align_only = False
@@ -1858,17 +1889,55 @@ class PalletMission(PalletRecovery, Node):
     def _detector_alive(self) -> bool:
         return self._det_proc is not None and self._det_proc.poll() is None
 
-    def _start_detector(self) -> Tuple[bool, str]:
+    def _on_pick_route(self, msg):
+        try:
+            status = json.loads(msg.data)
+        except ValueError:
+            status = None
+        if not isinstance(status, dict):
+            status = {}
+        self._pick_route_state = status.get('state')
+        classes = status.get('pick_prewarm_classes')
+        self._pick_route_classes = (classes if isinstance(classes, list)
+                                    and all(c in ('medium', 'tall') for c in classes) else [])
+        self._pick_route_time = time.monotonic()
+
+    def _prewarm_pick_detector(self, now):
+        fresh = now - self._pick_route_time <= 2.0
+        eligible = (self.p['detector_prewarm'] and fresh and self._checkpoint is None
+                    and self._state in (IDLE, DONE, READY) and self._cargo is not True)
+        if self._pick_warming:
+            if not eligible or self._pick_route_state not in ('GOTO_PICK', 'PICKING'):
+                self._terminate_detector()
+            if self._detector_alive():
+                return
+            self._pick_warming = False
+        if (eligible and self._pick_route_state == 'GOTO_PICK' and self._pick_route_classes
+                and not self._detector_alive() and now >= self._det_prewarm_retry_t):
+            args = with_cargo_classes(self.get_parameter('detector_extra_args').value,
+                                      self._pick_route_classes)
+            ok, why = self._start_detector(args)
+            self._pick_warming = ok
+            self._det_prewarm_retry_t = now + float(self.p['detector_prewarm_retry_s'])
+            if not ok:
+                self.get_logger().warn(f'PICK detector prewarm deferred: {why}')
+
+    def _detector_cmd(self, args=None):
+        cmd = ['ros2', 'run', self.p['detector_package'], self.p['detector_executable'],
+               '--ros-args', '-r',
+               f"{self.p['detector_camera_info_in']}:={self.p['detector_camera_info_out']}"]
+        cmd += self.p['detector_extra_args'] if args is None else args
+        return cmd + ['-p', 'idle_preview_enabled:=false', '-p', 'detection_enabled:=false']
+
+    def _start_detector(self, args=None) -> Tuple[bool, str]:
         if self._detector_alive():
+            if self._det_kill_at is not None:
+                return False, 'Detector shutdown in progress'
             return True, 'detector dang chay'
         if shutil.which('ros2') is None:
             return False, "khong tim thay lenh 'ros2' (chua source workspace?)"
         self.pub_detector_enable.publish(Bool(data=False))
-        cmd = ['ros2', 'run', self.p['detector_package'], self.p['detector_executable'],
-               '--ros-args', '-r',
-               f"{self.p['detector_camera_info_in']}:={self.p['detector_camera_info_out']}"]
-        cmd += [a for a in (self.p['detector_extra_args'] or []) if a]
-        cmd += ['-p', 'detection_enabled:=false']
+        cmd = self._detector_cmd(args)
         env = os.environ.copy()
         n_thr = int(self.p['detector_omp_threads'])
         if n_thr > 0:
@@ -1880,10 +1949,15 @@ class PalletMission(PalletRecovery, Node):
             self._det_proc = None
             return False, f'khong chay duoc detector: {e}'
         self._det_kill_at = None
+        self._detector_command = cmd
         self.get_logger().info('Detector started: ' + ' '.join(cmd))
         return True, 'detector started'
 
     def _terminate_detector(self):
+        self._pick_warming = False
+        self._pick_start_pending = False
+        if self._det_kill_at is not None:
+            return
         if not self._detector_alive():
             self._det_proc = None
             return
@@ -1909,7 +1983,7 @@ class PalletMission(PalletRecovery, Node):
     # ==================================================================
     # TF helpers
     # ==================================================================
-    def _tf_pose(self, parent: str, child: str, check_stale=False):
+    def _tf_pose(self, parent: str, child: str, check_stale=False, *, max_future_s=None):
         """Pose cua `child` trong `parent`: (x, y, yaw) hoac None."""
         try:
             tf = self.tf_buffer.lookup_transform(parent, child, Time())
@@ -1917,6 +1991,9 @@ class PalletMission(PalletRecovery, Node):
             return None
         if check_stale:
             age = (self.get_clock().now() - Time.from_msg(tf.header.stamp)).nanoseconds * 1e-9
+            if max_future_s is not None and (
+                    (tf.header.stamp.sec, tf.header.stamp.nanosec) <= (0, 0) or age < -max_future_s):
+                return None
             if tf.header.stamp.sec != 0 and age > self.p['tf_stale_s']:
                 return None
         t, q = tf.transform.translation, tf.transform.rotation
@@ -1943,6 +2020,10 @@ class PalletMission(PalletRecovery, Node):
         tf = self._tf_pose(ins, mp)
         if tf is None:
             return None
+        return self._transform_planar(tf, x, y, yaw)
+
+    @staticmethod
+    def _transform_planar(tf, x, y, yaw):
         tx, ty, th = tf
         c, s = math.cos(th), math.sin(th)
         return c * x - s * y + tx, s * x + c * y + ty, norm_angle(yaw + th)
@@ -1962,10 +2043,19 @@ class PalletMission(PalletRecovery, Node):
         self._reload_params(recompute_stage=True)
         self._retrieval_mode = False
         self._retrieval_align_only = False
-        ok, why = self._start_detector()
-        if not ok:
-            self._set_state(FAILED, why)
-            return False, why
+        # The shelf may have changed during travel. Activate only a child
+        # started with the final PICK filter and current detector arguments.
+        self._pick_warming = False
+        self._pick_start_pending = False
+        if self._detector_alive() and (self._det_kill_at is not None
+                                      or self._detector_command != self._detector_cmd()):
+            self._terminate_detector()
+            self._pick_start_pending = True
+        else:
+            ok, why = self._start_detector()
+            if not ok:
+                self._set_state(FAILED, why)
+                return False, why
         self._checkpoint = None
         self._samples.clear()
         self._tf_hist.clear()
@@ -1984,7 +2074,8 @@ class PalletMission(PalletRecovery, Node):
             self._esp32(self.p['lift_home_cmd'])        # ha lift ve Home truoc khi di vao pallet
         self._cargo = False               # chu ky moi: chua co box tren thang
         self._set_state(DETECTING, 'Dang detect + ha lift ve Home... (xe phai DUNG YEN, cho detector lay mau)')
-        self.pub_detector_enable.publish(Bool(data=True))
+        if not self._pick_start_pending:
+            self.pub_detector_enable.publish(Bool(data=True))
         return True, 'detect ON'
 
     def _tf_spread(self, window_s: float):
@@ -2004,11 +2095,9 @@ class PalletMission(PalletRecovery, Node):
     def _stop_detect(self) -> Tuple[bool, str]:
         if self._state != DETECTING:
             return False, 'khong o trang thai detect'
-        # Pause inference. With prewarm enabled, keep weights resident for the
-        # next Auto cycle; on-demand mode still releases the child process.
+        # This scan is complete. The next PICK leg can preload its own filter.
         self.pub_detector_enable.publish(Bool(data=False))
-        if not self.p['detector_prewarm']:
-            self._terminate_detector()
+        self._terminate_detector()
         self._reload_params(recompute_stage=True)
         est, why = estimate_pallet(
             list(self._samples), time.monotonic(),
@@ -2022,6 +2111,8 @@ class PalletMission(PalletRecovery, Node):
         # ---- vi tri pallet trong khung xe + hieu chinh lech do pallet NGHIENG (detector) ----
         skew_txt = ''
         self._calib = None
+        lat_offset = self.p['pallet_lat_offset_m']
+        yaw_offset_deg = self.p['pallet_yaw_offset_deg']
         rp = self._robot_pose(self.p['map_frame'])
         if rp is None:
             skew_txt = ' [thieu TF map->base: khong bu nghieng, khong calibrate duoc]'
@@ -2043,10 +2134,16 @@ class PalletMission(PalletRecovery, Node):
                 self.get_logger().info(f'[diag] pallet nghieng {math.degrees(phi):+.1f} deg so voi xe, '
                                        f'bu detector: truoc {xb:.3f},{yb:.3f} -> sau {xb2:.3f},{yb2:.3f} (khung xe)')
             self._calib = (yb2, phi)
+            # The near-straight trial was at 5 degrees and the two skewed
+            # trials at +45 and -49 degrees. Blend between them and cap the trim.
+            weight = clamp((abs(math.degrees(phi)) - 5.0) / (45.0 - 5.0), 0.0, 1.0)
+            trim_key = 'pick_right_skew_lat_m' if phi < 0 else 'pick_left_skew_lat_m'
+            lat_offset += weight * self.p[trim_key]
+            yaw_offset_deg += (weight if phi >= 0 else -weight) * self.p['pick_skew_yaw_trim_deg']
 
         # ---- bu sai so he thong ----
         x, y, yaw = apply_offsets(est['x'], est['y'], est['yaw'],
-                                  self.p['pallet_lat_offset_m'], self.p['pallet_yaw_offset_deg'])
+                                  lat_offset, yaw_offset_deg)
         est['x'], est['y'], est['yaw'] = x, y, yaw
 
         # ---- AMCL (map->odom) co nhay trong luc detect khong? ----
@@ -2056,7 +2153,7 @@ class PalletMission(PalletRecovery, Node):
             est['stable'] = False
 
         txt = (f"x={x:.3f} y={y:.3f} yaw={math.degrees(yaw):.1f}deg{skew_txt} "
-               f"[bu ngang {self.p['pallet_lat_offset_m'] * 100:+.1f}cm, bu yaw {self.p['pallet_yaw_offset_deg']:+.1f}deg] "
+               f"[bu ngang {lat_offset * 100:+.1f}cm, bu yaw {yaw_offset_deg:+.1f}deg] "
                f"(n={est['n']}, std xy={est['pos_std'] * 100:.1f}cm, "
                f"yaw={est['yaw_std_deg']:.1f}deg, AMCL nhay {jm * 100:.1f}cm/{jd:.1f}deg)")
         self._classify_cargo()
@@ -2361,16 +2458,11 @@ class PalletMission(PalletRecovery, Node):
         if self._rack_trimmed or self._ctl.insertion_only:
             return False
         self._rack_trimmed = True
-        trim_enabled = self.p['drop_map_trim'] if self._mode == 'drop' else self.p['retrieval_map_trim']
-        # With DROP trim disabled, keep the frozen line but retain diagnostics.
-        if not trim_enabled and self._mode != 'drop':
+        if self._mode == 'drop' or not self.p['retrieval_map_trim']:
             return False
         slot_map = self._tf_pose(self.p['map_frame'], self._rack_trim_frame)
         now_ins = self._map_to_ins(*slot_map) if slot_map is not None else None
         if now_ins is None:
-            if not trim_enabled:
-                self.get_logger().warn('[diag] DROP: missing rack TF; frozen odom target retained (trim off)')
-                return False
             self._finish(FAILED, 'Khong doc duoc TF o ke de map trim truoc di ngang',
                          fail_phase='MAP_TRIM')
             return True
@@ -2379,9 +2471,6 @@ class PalletMission(PalletRecovery, Node):
         self.get_logger().info(
             f'[diag] {self._mode.upper()} truoc luot di ngang: map->odom dich '
             f'{shift * 100:.1f} cm / {dyaw:+.1f} deg (trim 1 lan truoc lift)')
-        if not trim_enabled:
-            self.get_logger().info('[diag] drop_map_trim=False: giu nguyen muc tieu odom da chot')
-            return False
         if shift > float(self.p['drop_trim_max_shift_m']):
             # Same policy as the legacy drop: a large localization jump is
             # not a new rack target. Keep the existing reference and guards.
@@ -2551,8 +2640,12 @@ class PalletMission(PalletRecovery, Node):
                            and along <= -float(self._ctl.p['rot_clear_m'])
                            and abs(lat) * 100.0 <= float(self._ctl.p['gate_lat_cm'])
                            and abs(math.degrees(yaw)) <= float(self._ctl.p['gate_yaw_deg']))
-            range_ok = (us_fresh and self._us_count == 0)
-            if (stopped and range_ok and self._retrieval_navigation_idle()
+            prelift_fresh = (self._us_t > 0.0 and
+                             0.0 <= now - self._us_t <= self.p['drop_prelift_range_stale_s'])
+            range_ok = prelift_fresh and self._us_valid_for_prelift and self._cargo is True
+            clear_to_reposition = us_fresh and self._us_valid_for_prelift and self._us_count == 0
+            nav_idle = self._retrieval_navigation_idle()
+            if (stopped and clear_to_reposition and nav_idle
                     and self._line is not None and along <= -float(self._ctl.p['rot_clear_m'])
                     and (abs(lat) * 100.0 > float(self._ctl.p['gate_lat_cm'])
                          or abs(math.degrees(yaw)) > float(self._ctl.p['gate_yaw_deg']))):
@@ -2560,7 +2653,7 @@ class PalletMission(PalletRecovery, Node):
                 self._ctl.restart_align(now)
                 self._set_state(AUTO_RECOVERING, 'DROP pre-lift geometry drifted; realigning with forks low')
                 return
-            if (stopped and range_ok and self._retrieval_navigation_idle()
+            if (stopped and clear_to_reposition and nav_idle
                     and self._line is not None and along <= -float(self._ctl.p['rot_clear_m'])
                     and not self._drop_staging_reached()
                     and getattr(self, '_auto_restage_attempts', 0) < 1):
@@ -2571,12 +2664,13 @@ class PalletMission(PalletRecovery, Node):
                     self._auto_restage_active = True
                     return
                 self.get_logger().warn(f'[AUTO_RECOVERING] DROP restaging deferred: {why}')
-            if not (stopped and geometry_ok and range_ok and self._retrieval_navigation_idle()):
+            if not (stopped and geometry_ok and range_ok and nav_idle):
                 self._halt()
                 self._auto_hold_since = now
                 reason = (f'DROP pre-lift staging not confirmed: stopped={stopped}, '
-                          f'geometry={geometry_ok}, ultrasonic={range_ok}, '
-                          f'nav_idle={self._retrieval_navigation_idle()}')
+                          f'geometry={geometry_ok}, ultrasonic_fresh={prelift_fresh}, '
+                          f'ultrasonic_valid={self._us_valid_for_prelift}, cargo={self._cargo}, '
+                          f'nav_idle={nav_idle}')
                 if self._state != AUTO_RECOVERING or self._msg != reason:
                     self._set_state(AUTO_RECOVERING, reason)
                 return
@@ -2932,6 +3026,42 @@ class PalletMission(PalletRecovery, Node):
         return f'hang: {self._cargo_class}{h} -> loai {self._cargo_type}'
 
     # ---- DROP ----
+    def _on_anchor_status(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
+            data = None
+        anchor = data.get('placement_anchor') if isinstance(data, dict) else None
+        self._placement_anchor = anchor if isinstance(anchor, dict) else {}
+
+    def _drop_target_at_d1(self, slot_map, leg):
+        """Snapshot one measured transform, synchronously from data already available."""
+        anchor = self._placement_anchor or {}
+        ins, mp = self.p['insertion_frame'], self.p['map_frame']
+        state, ack_age = 'no_leg_evidence', None
+        if anchor.get('leg') == leg:
+            state = anchor.get('state', 'unknown')
+            if state == 'acknowledged':
+                now = self.get_clock().now().nanoseconds * 1e-9
+                try:
+                    ack_age = now - anchor['ack_stamp']
+                    image_age = now - anchor['image_stamp']
+                    measured = anchor['odom_map']
+                    if (anchor['map_frame'] != mp or anchor['odom_frame'] != ins
+                            or not finite_pose(measured)):
+                        state = 'invalid_ack'
+                    elif not 0 <= ack_age <= image_age <= float(self.p['drop_anchor_max_age_s']):
+                        state = 'stale_ack'
+                    else:
+                        return self._transform_planar(measured, *slot_map), 'aruco_amcl_ack', state, ack_age
+                except (KeyError, TypeError, ValueError):
+                    state = 'invalid_ack'
+        # AMCL postdates map->odom by its transform tolerance. Sample the
+        # latest published edge here, without waiting for a newer scan or TF.
+        tf = self._tf_pose(ins, mp, check_stale=True, max_future_s=1.5)
+        target = self._transform_planar(tf, *slot_map) if finite_pose(tf) else None
+        return target, 'd1_tf', state, ack_age
+
     def _srv_drop(self, req, res):
         res.success, res.message = self._start_drop()
         return res
@@ -3073,8 +3203,7 @@ class PalletMission(PalletRecovery, Node):
             self._begin_drop_alignment()
 
     def _begin_drop_alignment(self):
-        # Re-read the selected slot ONLY at handoff, then freeze in odom.
-        # D_1 is an entry precondition, not a constraint after reaching staging.
+        # Validate staging against the rack in map. This check cannot rebase the local target.
         slot_map = self._tf_pose(self.p['map_frame'], self._drop['frame'])
         if slot_map is None:
             self._fail_drop_navigation('Missing rack TF at DROP handoff')
@@ -3083,11 +3212,11 @@ class PalletMission(PalletRecovery, Node):
         if not self._drop_staging_reached(current_pre):
             self._fail_drop_navigation('Updated rack TF is outside DROP staging tolerance')
             return
-        ins = self._map_to_ins(*slot_map)
+        ins = self._drop.get('target_odom')
         robot_ins = self._robot_pose(self.p['insertion_frame'])
         if (ins is None or robot_ins is None
                 or not all(math.isfinite(v) for v in (*ins, *robot_ins))):
-            self._fail_drop_navigation('Missing map/odom/base TF at DROP handoff')
+            self._fail_drop_navigation('Missing D_1 target or robot odom pose at DROP handoff')
             return
         if self._lift_height_now() is None:
             self._fail_drop_navigation('No fresh lift state at DROP handoff')
@@ -3100,7 +3229,8 @@ class PalletMission(PalletRecovery, Node):
         self._tf_miss = 0
         self._phase_shown = None
         self._rack_trimmed = False
-        self._set_state(ALIGNING, 'DROP staging settled; target frozen in odom for ' + self._drop['slot'])
+        self._set_state(ALIGNING, f"DROP staging settled op={self._operation_id} slot={self._drop['slot']} "
+                        f"controller {self.p['insertion_frame']}={ins} source={self._drop['target_source']}")
 
     def _start_drop(self) -> Tuple[bool, str]:
         if self._checkpoint is not None:
@@ -3183,6 +3313,15 @@ class PalletMission(PalletRecovery, Node):
         if self._lift_height_now() is None:
             return self._fail_drop('khong co /joint_states cua lift')
 
+        if p['insertion_frame'] in (p['map_frame'], p['base_frame']):
+            return self._fail_drop('DROP requires an odometry frame for the D_1 target')
+        leg = placement_leg(self._session_id, self._operation_id)
+        target, source, evidence, ack_age = self._drop_target_at_d1(slot_map, leg)
+        age = 'n/a' if ack_age is None else f'{ack_age:.3f}s'
+        if not finite_pose(target):
+            return self._fail_drop(f'D_1 slot={sid} evidence={evidence} ack_age={age}: '
+                                   f'missing fresh {p["insertion_frame"]} <- {p["map_frame"]} TF')
+
         # ---- bo dieu khien (tham so rieng cho drop) ----
         self._retrieval_mode = False
         self._retrieval_align_only = False
@@ -3199,7 +3338,7 @@ class PalletMission(PalletRecovery, Node):
             'total_timeout_s': float(p['drop_total_timeout_s']),
         })
         self._ctl = ApproachController(pd, stage)
-        self._line = None           # freeze only AFTER Nav2 has stopped at staging
+        self._line = None           # controller takes the stored target only after staging settles
         self._pre = approach_pose(*slot_map, stage)
         self._mode = 'drop'
         self._rack_trim_frame = frame
@@ -3210,6 +3349,7 @@ class PalletMission(PalletRecovery, Node):
         self._auto_hold_since = None
         self._trimmed = False       # pick yaw-trim flag; rack trim is separate
         self._drop = {'slot': sid, 'level': lvl, 'type': ctype, 'frame': frame,
+                      'target_odom': target, 'target_source': source,
                       'insert_cm': insert_cm, 'release_cm': release_cm}
         self._tf_miss = 0
         self._phase_shown = None
@@ -3224,6 +3364,8 @@ class PalletMission(PalletRecovery, Node):
         self._goal_handle = None
         self._handoff_t0 = None
         self._set_state(NAVIGATING, f'DROP {sid}: Nav2 toi staging cach mat ke {stage:.2f} m')
+        self.get_logger().info(f'[drop] D_1 op={self._operation_id} leg={leg} slot={sid} source={source} '
+                               f'evidence={evidence} ack_age={age} {p["insertion_frame"]}={target}')
         self._publish_pose(self.pub_pre, *self._pre)
         try:
             future = self._nav.send_goal_async(self._staging_goal())
@@ -3322,8 +3464,7 @@ class PalletMission(PalletRecovery, Node):
                 pass
             self._goal_handle = None
         self.pub_detector_enable.publish(Bool(data=False))
-        if not self.p['detector_prewarm']:
-            self._terminate_detector()
+        self._terminate_detector()
         # Retain operation context, insertion-only guard and consumed alignment budget.
         self._halt()
         self._lift_stop()
@@ -3348,6 +3489,15 @@ class PalletMission(PalletRecovery, Node):
         if self._retrieval_mode and self._mode == 'pick' and self._state in (NAVIGATING, SETTLING):
             self._retrieval_pick_staging_tick(now)
             return
+        if self._state == DETECTING and self._pick_start_pending:
+            if self._detector_alive():
+                return
+            self._pick_start_pending = False
+            ok, why = self._start_detector()
+            if not ok:
+                self._set_state(FAILED, why)
+                return
+            self.pub_detector_enable.publish(Bool(data=True))
         if self._state == DETECTING and self._det_proc is None:
             self._set_state(FAILED, 'Detector tu thoat bat ngo')
             return
@@ -3371,14 +3521,7 @@ class PalletMission(PalletRecovery, Node):
     def _slow_tick(self):
         self._nav_results = [future for future in self._nav_results if not future.done()]
         self._stop_request_futures = [future for future in self._stop_request_futures if not future.done()]
-        if (self.p.get('detector_prewarm', True)
-                and not self._detector_alive()
-                and time.monotonic() >= self._det_prewarm_retry_t):
-            ok, why = self._start_detector()
-            self._det_prewarm_retry_t = (
-                time.monotonic() + float(self.p.get('detector_prewarm_retry_s', 5.0)))
-            if not ok:
-                self.get_logger().warn(f'Detector prewarm deferred: {why}')
+        self._prewarm_pick_detector(time.monotonic())
         if self._state == DETECTING:
             tf = self._tf_pose(self.p['insertion_frame'], self.p['map_frame'])
             if tf is not None:

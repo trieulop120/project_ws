@@ -359,13 +359,10 @@ class PalletDetectorNode(Node):
         # (overhang, OBB inaccuracy, depth jitter).
         self.declare_parameter('box_pallet_margin_px', 15)
         self.box_pallet_margin_px = int(self.get_parameter('box_pallet_margin_px').value)
-        # Cargo height is the max/min base-frame Z span of valid depth
-        # inside the associated carton masks; no model retraining is needed.
+        # Cargo height is measured from the pallet support to the upper lid.
         self.declare_parameter('use_box_height_class', True)
         self.declare_parameter('box_height_threshold_m', 0.30)  # >= tall, < medium
         self.declare_parameter('box_height_min_pixels', 30)
-        # Empirical correction: reported Z-span bias is +7 cm. This adjusts
-        # cargo height only, never camera TF, depth, pallet pose or yaw.
         # Optional mission-level cargo filter. Empty means retain the normal
         # detector policy. When set, SEARCH only locks pallets whose measured
         # tallest carried box belongs to one of these classes.
@@ -1210,6 +1207,11 @@ class PalletDetectorNode(Node):
                             det['mask'] = mask
                         detections.append(det)
 
+            for det in detections:
+                if det['class'] == 'box':
+                    outline = det.get('mask', det['box'])
+                    det['top_clipped'] = outline[:, 1].min() <= off_y + 1
+                    det['bottom_clipped'] = outline[:, 1].max() >= off_y + roi_img.shape[0] - 2
             mode_name = 'retrieval' if retrieval else 'normal'
             completed_at = time.monotonic()
             self._perf_frames[mode_name].append(completed_at)
@@ -1354,46 +1356,198 @@ class PalletDetectorNode(Node):
     # ==================================================================
     # Box height classification (depth only, no re-training)
     # ==================================================================
-    def _box_z_limits(self, det, depth_img, depth_encoding, R_bc, t_bc):
-        """Legacy box-height estimate: P90 top-band Z minus P1 whole-OBB Z.
-
-        Keep the previous estimator's OBB region and robust percentiles. This
-        avoids letting mask-edge/background extrema inflate the height.
-        """
-        box = np.asarray(det['box'], dtype=np.float32).reshape(-1, 2)
-        if len(box) < 3 or not np.isfinite(box).all():
+    def _horizontal_patch_z(self, points, z, vertical, region, span, lid_z=None):
+        """Estimate a lid or a connected deck patch using horizontal depth normals."""
+        middle = slice(span, -span)
+        du = points[middle, 2 * span:] - points[middle, :-2 * span]
+        dv = points[2 * span:, middle] - points[:-2 * span, middle]
+        # Depth discontinuities across an occluding edge are not surface tangents.
+        depth = points[:, :, 2]
+        center = depth[middle, middle]
+        bend_u = depth[middle, 2 * span:] + depth[middle, :-2 * span] - 2 * center
+        bend_v = depth[2 * span:, middle] + depth[:-2 * span, middle] - 2 * center
+        continuous = np.maximum(np.abs(bend_u), np.abs(bend_v)) <= 0.03 * center
+        normal = np.cross(du, dv)
+        norm = np.linalg.norm(normal, axis=2)
+        flat = np.zeros(z.shape, bool)
+        flat[middle, middle] = continuous & (norm > 1e-8) & (
+            np.abs(normal @ vertical) >= math.cos(math.radians(25)) * norm)
+        # Require the normal's endpoints to lie on the selected object.
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (2 * span + 1, 2 * span + 1))
+        interior = cv2.erode(region.astype(np.uint8), kernel,
+                             borderType=cv2.BORDER_CONSTANT, borderValue=0)
+        samples = (interior > 0) & flat
+        if lid_z is not None:
+            # A merged stack mask can contain a second horizontal patch at
+            # the seam. Only the high surface can be the lid. On a narrow
+            # lid, valid normals can be scattered across the same silhouette.
+            samples &= np.abs(z - lid_z) <= 0.025
+        if np.count_nonzero(samples) < self.box_height_min_pixels:
             return None
-        center = box.mean(axis=0)
-        polygon = center + (box - center) * 0.90
+        if lid_z is None:
+            _, labels, stats, _ = cv2.connectedComponentsWithStats(samples.astype(np.uint8))
+            component = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            if stats[component, cv2.CC_STAT_AREA] < self.box_height_min_pixels:
+                return None
+            samples = labels == component
+        rows, cols = np.nonzero(samples)
+        if min(np.ptp(rows), np.ptp(cols)) < 3:
+            return None
+        heights = z[rows, cols]
+        if np.percentile(heights, 90) - np.percentile(heights, 10) > 0.025:
+            return None
+        return float(np.median(heights))
+
+    def _cargo_surfaces(self, pallet, boxes, base_boxes, top_boxes, depth_img, encoding, R, t):
+        """Measure the upper lids relative to their pallet's support elevation."""
+        if not base_boxes or not top_boxes or encoding not in ('16UC1', 'mono16', '32FC1'):
+            return None
+        px, py, pw, ph = cv2.boundingRect(np.float32(pallet['box']))
+        # The pallet detector commonly outlines only its front face. Search
+        # behind that lip too, where the deck can be visible beside the load.
+        deck_y = py - 3 * ph
+        relevant = {id(box): box for box in base_boxes + top_boxes}
+        extent = np.vstack([pallet['box']] + [box['box'] for box in relevant.values()])
+        x0, y0 = np.maximum(np.floor(extent.min(axis=0)).astype(int) - 5, 0)
+        y0 = max(0, min(y0, deck_y - 5))
+        x1, y1 = np.minimum(np.ceil(extent.max(axis=0)).astype(int) + 6, depth_img.shape[1::-1])
+        if x1 - x0 < 11 or y1 - y0 < 11:
+            return None
+        depth = depth_img[y0:y1, x0:x1].astype(np.float32)
+        if encoding != '32FC1':
+            depth *= 0.001
+        valid = np.isfinite(depth) & (depth > self.MIN_DEPTH_M) & (depth < self.MAX_DEPTH_M)
+        depth[~valid] = 0
+        depth = cv2.medianBlur(depth, 3)
+        valid &= depth > self.MIN_DEPTH_M
+        v, u = np.ogrid[y0:y1, x0:x1]
+        points = np.stack(((u - self.cx) * depth / self.fx,
+                           (v - self.cy) * depth / self.fy, depth), axis=-1)
+        z = points @ R[2] + t[2]
+        origin = np.array([x0, y0])
+
+        def polygon(outline):
+            return np.rint(outline - origin).astype(np.int32)
+
+        # The visible lower edge of a supported carton anchors the deck
+        # search in Z. A nearby floor patch must not become the reference.
+        contacts = []
+        bottom_edges = []
+        tops = []
+        base_ids = {id(b) for b in base_boxes}
+        top_ids = {id(b) for b in top_boxes}
+        for key, box in relevant.items():
+            contour = polygon(box.get('mask', box['box']))
+            region = np.zeros(depth.shape, np.uint8)
+            cv2.fillPoly(region, [contour], 1)
+            bx, by, bw, bh = cv2.boundingRect(contour)
+            if key in base_ids and by + y0 + bh < depth_img.shape[0]:
+                center = (u - x0 >= bx + 0.25 * bw) & (u - x0 <= bx + 0.75 * bw)
+                # For a slanted carton, each column has its own bottom edge.
+                bottom = region.shape[0] - 1 - np.argmax(region[::-1], axis=0)
+                strip = (v - y0 >= bottom - 4) & (v - y0 <= bottom - 1)
+                edge = (region > 0) & center & strip & valid
+                if np.count_nonzero(edge) >= self.box_height_min_pixels:
+                    contacts.append(float(np.median(z[edge])))
+                    # Use depth just inside the carton instead of mixed pixels
+                    # on its boundary. Project those samples to the bottom row
+                    # of the silhouette at their own depth.
+                    dz = (bottom - (v - y0))[edge] * depth[edge] * R[2, 1] / self.fy
+                    bottom_edges.append(float(np.median(z[edge] + dz)))
+            if key in top_ids:
+                lid = (region > 0) & valid & (v - y0 <= by + bh * 0.55)
+                if np.count_nonzero(lid) < self.box_height_min_pixels:
+                    return None
+                lid_z = np.percentile(z[lid], 95)
+                # Start with the least noise-sensitive normal, then try shorter
+                # baselines when the visible lid is narrow.
+                for span in (4, 3, 2):
+                    top = self._horizontal_patch_z(points, z, R[2], lid, span, lid_z)
+                    if top is not None:
+                        tops.append(top)
+                        break
+                else:
+                    return None
+        if not contacts:
+            return None
+        deck = ((u >= px) & (u < px + pw) & (v >= deck_y) & (v <= py + ph)).astype(np.uint8)
+        for box in boxes:
+            cv2.fillPoly(deck, [polygon(box.get('mask', box['box']))], 0)
+        contact_z = np.median(contacts)
+        support = (deck > 0) & valid & (np.abs(z - contact_z) <= 0.020)
+        deck_z = self._horizontal_patch_z(points, z, R[2], support, span=2)
+        if deck_z is None:
+            # A wide load can hide the horizontal deck but leave its front lip
+            # visible. Follow the tilted pallet outline independently of the
+            # carton mask. Confirm the lip agrees with the carton contact in Z.
+            face = np.zeros(depth.shape, np.uint8)
+            cv2.fillPoly(face, [polygon(pallet['box'])], 1)
+            upper = np.argmax(face, axis=0)
+            row = v - y0
+            rim = ((face > 0) & (deck > 0) & valid & (row > upper) &
+                   (row <= upper + 4) & (upper + y0 > 0) & (u >= px + 0.1 * pw) &
+                   (u < px + 0.9 * pw))
+            if np.count_nonzero(rim) < self.box_height_min_pixels:
+                return None
+            dz = (upper - row)[rim] * depth[rim] * R[2, 1] / self.fy
+            q25, lip_z, q75 = np.percentile(z[rim] + dz, [25, 50, 75])
+            deck_z = float(np.median(bottom_edges))
+            if q75 - q25 > 0.025 or abs(lip_z - deck_z) > 0.020:
+                return None
+        return deck_z, max(tops)
+
+    def _carton_edge_elevation(self, box, upper, depth_img, encoding, R, t):
+        """Display-only elevation from the visible carton and this frame's depth."""
+        outline = box.get('mask', box['box'])
+        x, y, width, height = cv2.boundingRect(np.float32(outline))
         h, w = depth_img.shape[:2]
-        x0, x1 = max(0, int(np.floor(polygon[:, 0].min()))), min(w, int(np.ceil(polygon[:, 0].max())) + 1)
-        y0, y1 = max(0, int(np.floor(polygon[:, 1].min()))), min(h, int(np.ceil(polygon[:, 1].max())) + 1)
+        if upper and (y <= 1 or box.get('top_clipped')):
+            return None
+        if not upper and (y + height >= h or box.get('bottom_clipped')):
+            return None
+        x0, x1 = max(0, x), min(w, x + width)
+        y0, y1 = max(0, y), min(h, y + height)
         if x1 <= x0 or y1 <= y0:
             return None
-        mask = np.zeros((y1-y0, x1-x0), np.uint8)
-        cv2.fillPoly(mask, [np.rint(polygon - [x0, y0]).astype(np.int32)], 1)
-        v, u = np.nonzero(mask)
-        depth = depth_img[y0:y1, x0:x1][v, u].astype(np.float64)
-        if depth_encoding in ('16UC1', 'mono16'):
+        mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.fillPoly(mask, [np.rint(outline - [x0, y0]).astype(np.int32)], 1)
+        rows, cols = np.nonzero(mask)
+        center = (cols + x0 >= x + 0.2 * width) & (cols + x0 <= x + 0.8 * width)
+        rows, cols = rows[center], cols[center]
+        top = mask.argmax(axis=0)[cols]
+        bottom = mask.shape[0] - 1 - mask[::-1].argmax(axis=0)[cols]
+        fraction = (rows - top) / np.maximum(1, bottom - top)
+        depth = depth_img[y0 + rows, x0 + cols].astype(np.float64)
+        if encoding != '32FC1':
             depth *= 0.001
-        elif depth_encoding != '32FC1':
-            return None
         valid = np.isfinite(depth) & (depth > self.MIN_DEPTH_M) & (depth < self.MAX_DEPTH_M)
-        if valid.sum() < self.box_height_min_pixels:
+        if upper:
+            # Require actual depth high on the carton. Projecting the rear lid
+            # outline at the pallet's front range overstates short cartons.
+            if np.count_nonzero(valid & (fraction < 0.25)) < self.box_height_min_pixels:
+                return None
+            band = valid & (fraction < 0.55)
+        else:
+            band = valid & (fraction >= 0.90)
+            if np.count_nonzero(band) < self.box_height_min_pixels:
+                band = valid & (fraction >= 0.30) & (fraction <= 0.80)
+            rows = bottom  # project front-face samples to the visible contact line
+        if np.count_nonzero(band) < self.box_height_min_pixels:
             return None
-        depth, u, v = depth[valid], u[valid]+x0, v[valid]+y0
-        # Only the Z row is needed; this is R_bc @ P_camera + t_bc.
-        z = (R_bc[2, 0] * (u-self.cx) * depth/self.fx +
-             R_bc[2, 1] * (v-self.cy) * depth/self.fy +
-             R_bc[2, 2] * depth + t_bc[2])
-        band = polygon[:, 1].max() - (polygon[:, 1].min() +
-                                      0.35 * (polygon[:, 1].max() - polygon[:, 1].min()))
-        in_top = v <= polygon[:, 1].min() + band
-        if int(in_top.sum()) < self.box_height_min_pixels:
+        u, v = x0 + cols[band], y0 + rows[band]
+        z = t[2] + depth[band] * (R[2, 0] * (u - self.cx) / self.fx +
+                                  R[2, 1] * (v - self.cy) / self.fy + R[2, 2])
+        return float(np.percentile(z, 95) if upper else np.median(z))
+
+    def _estimate_cargo_height(self, bases, tops, depth_img, encoding, R, t):
+        if not bases or not tops or encoding not in ('16UC1', 'mono16', '32FC1'):
             return None
-        z_top = float(np.max(z[in_top]))
-        z_bottom = float(np.percentile(z, 1))
-        return z_bottom, z_top
+        bottoms = [self._carton_edge_elevation(b, False, depth_img, encoding, R, t) for b in bases]
+        lids = [self._carton_edge_elevation(b, True, depth_img, encoding, R, t) for b in tops]
+        if None in bottoms or None in lids:
+            return None
+        height = max(lids) - float(np.median(bottoms))
+        return height if height > 0 and np.isfinite(height) else None
 
     def measure_box_heights(self, pallet, boxes, depth_img, depth_encoding, header,
                             all_pallets=None):
@@ -1405,6 +1559,7 @@ class PalletDetectorNode(Node):
         pallet.pop('max_box_class', None)
         pallet.pop('cargo_z_min', None)
         pallet.pop('cargo_z_max', None)
+        pallet.pop('estimated_height_m', None)
         pallets = all_pallets if all_pallets is not None else [pallet]
         # Start at cartons touching a pallet, then propagate ownership upward
         # through touching cartons. Do not mix components spanning two pallets.
@@ -1420,6 +1575,8 @@ class PalletDetectorNode(Node):
                 width = max(1., min(a[2]-a[0], b[2]-b[0]))
                 if overlap >= 0.35*width and min(abs(a[3]-b[1]), abs(b[3]-a[1])) <= self.box_pallet_margin_px:
                     links.append((i, j))
+        target = next(i for i, p in enumerate(pallets) if p is pallet)
+        directly_supported = [i for i, owner in enumerate(owners) if owner == {target}]
         for _ in boxes:
             changed = False
             for i, j in links:
@@ -1429,21 +1586,27 @@ class PalletDetectorNode(Node):
                     changed = True
             if not changed:
                 break
-        target = next(i for i, p in enumerate(pallets) if p is pallet)
         associated = [box for box, owner in zip(boxes, owners) if owner == {target}]
         for box in associated:
             box['height_class'], box['height_m'] = 'unknown', None
             box.pop('height_raw_m', None)
+            box.pop('estimated_height_m', None)
         camera_frame = header.frame_id or self.camera_frame_param
         rt = self.lookup_rt(self.base_frame, camera_frame, cam_corr=True)
         if rt is None:
             return
-        ranges = [self._box_z_limits(box, depth_img, depth_encoding, *rt) for box in associated]
-        ranges = [limits for limits in ranges if limits is not None]
-        if not ranges:
+        covered = {i if bounds[i][1] > bounds[j][1] else j for i, j in links}
+        tops = [box for i, box in enumerate(boxes) if owners[i] == {target} and i not in covered]
+        bases = [boxes[i] for i in directly_supported if owners[i] == {target}]
+        surfaces = self._cargo_surfaces(pallet, boxes, bases, tops, depth_img, depth_encoding, *rt)
+        if surfaces is None:
+            estimate = self._estimate_cargo_height(bases, tops, depth_img, depth_encoding, *rt)
+            if estimate is not None:
+                pallet['estimated_height_m'] = estimate
+                for box in associated:
+                    box['estimated_height_m'] = estimate
             return
-        z_min = min(limits[0] for limits in ranges)
-        z_max = max(limits[1] for limits in ranges)
+        z_min, z_max = surfaces
         raw_height = z_max - z_min
         # Remove floating-point residue at the 0.30 m class boundary.
         height = round(raw_height, 9)
@@ -1656,6 +1819,10 @@ class PalletDetectorNode(Node):
             h = det.get('max_box_height_m')
             hcm = f'{h * 100:.0f}cm' if h is not None else '?'
             rows.append(f"Cargo: {det['max_box_class']} ({hcm}) th={self.box_height_threshold_m * 100:.0f}cm")
+        elif self.use_box_height_class and det.get('class') == 'pallet':
+            estimate = det.get('estimated_height_m')
+            rows.append(f'Cargo height: {estimate * 100:.1f}cm (est.)'
+                        if estimate is not None else 'Cargo height: --')
         for i, row in enumerate(rows):
             cv2.putText(debug_img, row, (x + 10, y + 25 + i * 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 255, 0), 1)
@@ -1707,6 +1874,14 @@ class PalletDetectorNode(Node):
             abs(float(p['center'][0]) - width / 2.0),
             -float(p.get('conf', 0.0)))) if pallets else None
 
+    def _measure_preview_height(self, target, detections, depth_img, encoding, header):
+        if target is None or 'max_box_height_m' in target or 'estimated_height_m' in target:
+            return
+        boxes = [d for d in detections if d['class'] == 'box']
+        if boxes:
+            pallets = [d for d in detections if d['class'] == 'pallet']
+            self.measure_box_heights(target, boxes, depth_img, encoding, header, pallets)
+
     @staticmethod
     def _draw_detection_outline(debug_img: np.ndarray, det: dict,
                                 color: tuple, thickness: int = 2) -> None:
@@ -1739,6 +1914,8 @@ class PalletDetectorNode(Node):
         height = det.get('height_m')
         if det.get('class') == 'box' and height is not None and math.isfinite(height):
             label += f" [{det.get('height_class', '')} {height * 100:.1f}cm]"
+        elif det.get('class') == 'box' and det.get('estimated_height_m') is not None:
+            label += f" [est. {det['estimated_height_m'] * 100:.1f}cm]"
         return label
 
     def _draw_roi_target(self, debug_img: np.ndarray,
@@ -1761,7 +1938,8 @@ class PalletDetectorNode(Node):
                         (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     def create_idle_normal_debug_image(self, color_img: np.ndarray,
-                                       detections: List[dict]):
+                                       detections: List[dict], target=None,
+                                       title='PALLET DETECTION'):
         """Normal ROI for RQT (visual-only, no mission target publishing)."""
         debug_img = color_img.copy()
         h, w = debug_img.shape[:2]
@@ -1771,10 +1949,11 @@ class PalletDetectorNode(Node):
             cv2.rectangle(debug_img, (x0, y0), (x1, y1), (0, 255, 255), 2)
             cv2.putText(debug_img, 'ROI', (x0 + 6, y0 + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        target = self._roi_visual_target(detections, w)
+        if target is None:
+            target = self._roi_visual_target(detections, w)
         self._draw_roi_target(debug_img, detections, target)
         if target is not None:
-            self._draw_detection_table(debug_img, target, 'PALLET DETECTION')
+            self._draw_detection_table(debug_img, target, title)
         return debug_img
 
     def create_debug_image(self, color_img: np.ndarray,
@@ -1946,6 +2125,9 @@ class PalletDetectorNode(Node):
             normal_dets = self.detect_pallets(color_img)
             retrieval_dets = self.detect_pallets(color_img, retrieval=True)
             if self.publish_debug:
+                for preview in (normal_dets, retrieval_dets):
+                    target = self._roi_visual_target(preview, color_img.shape[1])
+                    self._measure_preview_height(target, preview, depth_img, depth_encoding, header)
                 self.publish_debug_image(
                     self.create_idle_normal_debug_image(color_img, normal_dets),
                     header, stream='normal', legacy=False)
@@ -1972,6 +2154,8 @@ class PalletDetectorNode(Node):
                 f'[retrieval] central-strip pallet detections={len(retrieval_pallets)}, '
                 f'localized poses={localized_count}', throttle_duration_sec=1.0)
             if self.publish_debug:
+                target = self._roi_visual_target(retrieval_detections, color_img.shape[1])
+                self._measure_preview_height(target, retrieval_detections, depth_img, depth_encoding, header)
                 debug_img = self.create_retrieval_debug_image(
                     color_img, retrieval_detections, localized_count)
                 self.publish_debug_image(debug_img, header, stream='retrieval')
@@ -2205,6 +2389,19 @@ class PalletDetectorNode(Node):
         self.detections_pub.publish(det_msg)
 
         if self.publish_debug:
+            if best_detection is None and self.locked_target_base is None:
+                preview = self._pend_det or self._roi_visual_target(search_pool, color_img.shape[1])
+                self._measure_preview_height(preview, detections, depth_img, depth_encoding, header)
+                if (self._pend_det is None and preview is not None and
+                        ('max_box_height_m' in preview or 'estimated_height_m' in preview)):
+                    # A visible load can have a height even while pose/mission
+                    # selection is pending. Identify this as a visual target.
+                    debug_img = self.create_idle_normal_debug_image(
+                        color_img, detections, preview, 'PALLET PREVIEW')
+                    cv2.putText(debug_img, 'SEARCH - preview', (10, 26),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    self.publish_debug_image(debug_img, header)
+                    return
             debug_img = self.create_debug_image(
                 color_img, detections, best_detection, mode=mode_label)
             self.publish_debug_image(debug_img, header)

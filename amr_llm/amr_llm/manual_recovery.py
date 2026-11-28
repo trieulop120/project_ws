@@ -11,7 +11,7 @@ except ImportError:
 
 
 def resume_requested(text):
-    return bool(re.fullmatch(r'(?:resume(?: (?:plan|recovery|mission))?|tiep tuc(?: (?:ke hoach|lenh|cong viec|mission))?)[.!?]*', normalize(text).strip()))
+    return bool(re.fullmatch(r'(?:(?:cho xe )?chay tiep(?: di)?|resume(?: (?:plan|recovery|mission))?|tiep tuc(?: (?:ke hoach|lenh|cong viec|mission))?)[.!?]*', normalize(text).strip()))
 
 
 def resume_scope(text):

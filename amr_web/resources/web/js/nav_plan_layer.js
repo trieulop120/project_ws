@@ -2,18 +2,43 @@ import * as THREE from 'three';
 
 // Path centres are already in ROS map XY. Keep the ribbon outside mapGroup,
 // whose origin and yaw apply only to the occupancy raster.
-const HALF_WIDTH = .015;
+const HALF_WIDTH = .045;
 const MAX_POINTS = 2000; // Shared plan_to_json limit.
 const Z = .012;
 
 export function createNavPlanLayer(scene) {
-    // Per segment: two ribbon triangles, one bevel and at most one arrow.
-    const positions = new THREE.BufferAttribute(new Float32Array(MAX_POINTS*12*3),3);
+    // Two ribbon triangles and at most one bevel per segment.
+    const positions = new THREE.BufferAttribute(new Float32Array(MAX_POINTS*9*3),3);
     positions.setUsage(THREE.DynamicDrawUsage);
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position',positions);
+    const coords = new THREE.BufferAttribute(new Float32Array(MAX_POINTS*9*2),2);
+    coords.setUsage(THREE.DynamicDrawUsage);
+    geometry.setAttribute('uv',coords);
     geometry.setDrawRange(0,0);
-    const material = new THREE.MeshBasicMaterial({color:0x387bd7,side:THREE.DoubleSide});
+    const reducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)');
+    const material = new THREE.ShaderMaterial({
+        side: THREE.DoubleSide, transparent: true, depthWrite: false,
+        uniforms: {time: {value: 0}},
+        vertexShader: `
+            varying vec2 pathUV;
+            void main() {
+                pathUV = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
+            }`,
+        fragmentShader: `
+            uniform float time;
+            varying vec2 pathUV;
+            void main() {
+                float edge = abs(pathUV.y);
+                float phase = (pathUV.x + edge * .055) / .23;
+                float mark = 1. - smoothstep(.035, .12, abs(fract(phase+.5)-.5));
+                float pulse = .78 + .22*cos(pathUV.x*5.-time*3.);
+                vec3 green = mix(vec3(.012,.19,.055), vec3(.20,1.,.35)*pulse, mark);
+                gl_FragColor = vec4(green, (.32 + .65 * mark)*(1.-smoothstep(.82,1.,edge)));
+                #include <colorspace_fragment>
+            }`,
+    });
     const mesh = new THREE.Mesh(geometry,material);
     mesh.name = 'Nav2 global plan';
     mesh.frustumCulled = false;
@@ -39,9 +64,12 @@ export function createNavPlanLayer(scene) {
             return;
         }
         previous = points;
-        let count=0, distance=0, nextArrow=.75;
+        let count=0, distance=0;
         let lastX=0, lastY=0;
-        const vertex=(x,y)=>positions.setXYZ(count++,x,y,Z);
+        const vertex=(x,y,along,side)=>{
+            positions.setXYZ(count,x,y,Z);
+            coords.setXY(count++,along,side);
+        };
         for (let i=1; i<points.length; i++) {
             const [x,y]=points[i-1], [bx,by]=points[i];
             const dx=bx-x, dy=by-y, length=Math.hypot(dx,dy);
@@ -49,24 +77,23 @@ export function createNavPlanLayer(scene) {
             const nx=-dy/length*HALF_WIDTH, ny=dx/length*HALF_WIDTH;
             if (count) {
                 const side = lastX*ny-lastY*nx > 0 ? -1 : 1;
-                vertex(x,y); vertex(x+side*lastX,y+side*lastY); vertex(x+side*nx,y+side*ny);
+                vertex(x,y,distance,0);
+                vertex(x+side*lastX,y+side*lastY,distance,side);
+                vertex(x+side*nx,y+side*ny,distance,side);
             }
-            vertex(x+nx,y+ny); vertex(x-nx,y-ny); vertex(bx+nx,by+ny);
-            vertex(bx+nx,by+ny); vertex(x-nx,y-ny); vertex(bx-nx,by-ny);
-            if (distance+length>=nextArrow) {
-                const t=(nextArrow-distance)/length;
-                const ax=x+t*dx, ay=y+t*dy;
-                vertex(ax+.045*dx/length,ay+.045*dy/length);
-                vertex(ax-.035*dx/length+2.6*nx,ay-.035*dy/length+2.6*ny);
-                vertex(ax-.035*dx/length-2.6*nx,ay-.035*dy/length-2.6*ny);
-                nextArrow=distance+length+1.25;
-            }
-            distance+=length;
+            const end=distance+length;
+            vertex(x+nx,y+ny,distance,1); vertex(x-nx,y-ny,distance,-1); vertex(bx+nx,by+ny,end,1);
+            vertex(bx+nx,by+ny,end,1); vertex(x-nx,y-ny,distance,-1); vertex(bx-nx,by-ny,end,-1);
+            distance=end;
             lastX=nx; lastY=ny;
         }
         geometry.setDrawRange(0,count);
         positions.needsUpdate=true;
+        coords.needsUpdate=true;
         mesh.visible=count>0;
     }
-    return {update,dispose() { mesh.removeFromParent(); geometry.dispose(); material.dispose(); }};
+    function tick(timestamp) {
+        if (mesh.visible) material.uniforms.time.value = reducedMotion?.matches ? 0 : timestamp/1000;
+    }
+    return {update,tick,dispose() { mesh.removeFromParent(); geometry.dispose(); material.dispose(); }};
 }

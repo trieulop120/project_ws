@@ -6,6 +6,8 @@ llm_command_node - ra lệnh cho AMR bằng tiếng Việt / tiếng Anh.
       -> kiểm tra whitelist + vị trí -> /llm/plan -> (xác nhận /llm/confirm)
       -> gọi service/action sẵn có từng bước -> /llm/status
 """
+from collections import OrderedDict
+import hashlib
 import json
 import math
 from copy import deepcopy
@@ -47,6 +49,7 @@ try:  # chay trong package (ros2 launch) - import tuong doi
         build_system_prompt,
         extract_json,
         is_stop,
+        spoken_text,
         mission_from_to,
         validate_plan,
     )
@@ -64,6 +67,7 @@ except ImportError:  # chay theo tung file (python3 llm_command_node.py)
             build_system_prompt,
             extract_json,
             is_stop,
+            spoken_text,
             mission_from_to,
             validate_plan,
         )
@@ -80,21 +84,30 @@ except ImportError:  # chay theo tung file (python3 llm_command_node.py)
             build_system_prompt,
             extract_json,
             is_stop,
+            spoken_text,
             mission_from_to,
             validate_plan,
         )
 
 
 try:
-    from .robot_queries import answer_query, build_context, classify_query
+    from .robot_queries import (answer_query, build_context, classify_query,
+                                nav_failure, reported_reason, resolve_reference)
 except ImportError:
-    from amr_llm.robot_queries import answer_query, build_context, classify_query
+    from amr_llm.robot_queries import (answer_query, build_context, classify_query,
+                                nav_failure, reported_reason, resolve_reference)
 
 
 try:
     from .manual_recovery import ManualRecovery, resume_requested, resume_scope
 except ImportError:
     from amr_llm.manual_recovery import ManualRecovery, resume_requested, resume_scope
+
+
+class PlannerUnavailable(RuntimeError):
+    def __init__(self, detail, connection_failed):
+        super().__init__(detail)
+        self.connection_failed = connection_failed
 
 
 class LLMCommandNode(ManualRecovery, Node):
@@ -181,6 +194,7 @@ class LLMCommandNode(ManualRecovery, Node):
         self._lift_t = 0.0
         self._battery_percent = None
         self._battery_t = 0.0
+        self._subjects = OrderedDict()
         self._clarify_ctx = None
         self._sup_state = None
         self._sup_state_t = 0.0
@@ -273,6 +287,34 @@ class LLMCommandNode(ManualRecovery, Node):
         if self._cycle_run_id and not kw.get('observational'):
             kw.setdefault('run_id', self._cycle_run_id)
             kw.setdefault('operation_id', self._cycle_operation_id)
+        if state == 'clarify' and not kw.get('low_confidence'):
+            kw['clarify_until'] = time.time() + 90
+        if state in ('failed', 'error'):
+            detail = str(kw.get('msg') or '')
+            self.get_logger().error(f'{state}: {detail}')
+            kw['error_id'] = hashlib.sha256(detail.encode()).hexdigest()[:16]
+            en = lang == 'en'
+            kind = kw.setdefault('error_kind', 'mission')
+            if kind == 'planner_connection':
+                message = ('The planning service did not respond. No command was sent to the robot.' if en else
+                           'Dịch vụ lập kế hoạch chưa phản hồi. Lệnh này chưa được gửi tới xe.')
+            elif kind == 'planner':
+                message = ('The assistant could not prepare a plan. No command was sent.' if en else
+                           'Trợ lý chưa lấy được kế hoạch. Lệnh này chưa được gửi tới xe.')
+            elif kind == 'plan_validation':
+                message = (reported_reason(detail, en) or
+                           ('I could not prepare this command for confirmation. Please check the request.' if en else
+                            'Mình chưa lập được kế hoạch để xác nhận. Bạn kiểm tra lại yêu cầu nhé.'))
+            else:
+                message = nav_failure(detail, False, en) or reported_reason(detail, en)
+                if not message:
+                    step = kw.get('step')
+                    message = ((f'Step {step} did not complete.' if en else f'Bước {step} chưa hoàn tất.') if step else
+                               ('The mission did not report completion.' if en else 'Xe chưa báo nhiệm vụ hoàn tất.'))
+            kw['msg'] = message
+        for field in ('msg', 'say'):
+            if field in kw:
+                kw[field] = spoken_text(kw[field])
         self.pub_status.publish(String(data=json.dumps(
             {"state": state, "location": self._location, "op_mode": self._op_mode,
              "dry_run": bool(self.get_parameter("dry_run").value),
@@ -330,7 +372,7 @@ class LLMCommandNode(ManualRecovery, Node):
                     return
                 threading.Thread(
                     target=self._switch_to_new_command,
-                    args=(pending["text"], lang),
+                    args=(pending["text"], lang, pending.get("conversation", "")),
                     daemon=True,
                 ).start()
             else:
@@ -406,6 +448,10 @@ class LLMCommandNode(ManualRecovery, Node):
             return f"navigating route {route}" if en else f"di chuyển tuyến {route}"
         if act == "quick_goal" and "target" in args:
             return f"navigating to {args['target']}" if en else f"di chuyển tới {args['target']}"
+        if act in ('lift_home', 'lift_to'):
+            return 'adjusting the forks' if en else 'điều chỉnh độ cao càng'
+        if act == 'relative_move':
+            return 'carrying out a short move' if en else 'thực hiện chặng di chuyển ngắn'
         if act == "detect_pallet":
             return "detecting pallet" if en else "nhận diện pallet"
         if self._is_cycle_active():
@@ -416,7 +462,7 @@ class LLMCommandNode(ManualRecovery, Node):
                     else f"xử lý lệnh '{self._current_command_text}'")
         return "executing the previous command" if en else "thực hiện câu lệnh trước đó"
 
-    def _switch_to_new_command(self, text, language):
+    def _switch_to_new_command(self, text, language, conversation=""):
         self._switching_command = True
         try:
             if self._busy.locked():
@@ -442,7 +488,7 @@ class LLMCommandNode(ManualRecovery, Node):
         self._abort.clear()
         self._confirm_evt.clear()
         self._confirm_val = False
-        self._worker(text, language)
+        self._worker(text, language, conversation)
 
     def _on_set_loc(self, msg):
         candidate = msg.data.strip().lower()
@@ -562,6 +608,7 @@ class LLMCommandNode(ManualRecovery, Node):
 
     def _on_command(self, msg):
         language = "auto"
+        conversation = ""
         speech_confidence = None
         raw = msg.data.strip()
         try:
@@ -569,10 +616,14 @@ class LLMCommandNode(ManualRecovery, Node):
             if isinstance(envelope, dict) and "text" in envelope:
                 raw = str(envelope.get("text", ""))
                 language = str(envelope.get("language", "auto")).lower()
+                if isinstance(envelope.get("conversation_id"), str):
+                    conversation = envelope["conversation_id"][:80]
                 confidence = envelope.get("speech_confidence")
                 if isinstance(confidence, (int, float)) and 0.0 <= float(confidence) <= 1.0:
                     speech_confidence = float(confidence)
             elif isinstance(envelope, dict) and envelope.get("internal_abort") is True:
+                with self._lock:
+                    self._subjects.clear()
                 if self._busy.locked():
                     self._abort.set()
                     self._confirm_evt.set()
@@ -587,25 +638,30 @@ class LLMCommandNode(ManualRecovery, Node):
         text = raw.strip()
         if not text:
             return
-        if is_stop(text):
+        clarify = self._clarify_ctx
+        plan_reply = clarify and clarify[3] == conversation and time.time() - clarify[2] < 90
+        topics = classify_query(text, plan_reply=bool(plan_reply))
+        if is_stop(text) and topics not in (['fault'], ['motion']):
             with self._lock:
                 self._pending_interrupt = None
+                self._subjects.pop(conversation, None)
             self._emergency_stop("stop command" if en else "lệnh dừng")
             return
         if speech_confidence is not None and speech_confidence < 0.55:
-            prompt = ("I didn't hear that clearly. Please repeat the command."
-                      if en else "Mình nghe chưa rõ. Bạn vui lòng nhắc lại lệnh.")
-            self._status("clarify", msg=prompt, low_confidence=True, language=self._current_lang)
+            prompt = ("I didn't catch that. Could you say it again?"
+                      if en else "Mình nghe chưa rõ. Bạn nhắc lại được không?")
+            self._status("answer" if topics else "clarify", msg=prompt, low_confidence=True,
+                         observational=bool(topics), conversation_id=conversation,
+                         language=language if language != "auto" else self._current_lang)
             return
-        topics = classify_query(text)
         if topics:
             # Observations never acquire/release the action lock, clear abort,
             # consume a pending confirmation, or alter the running task language.
             reply_language = language if language in ("vi", "en") else self._current_lang
-            context = self._mission_context()
-            self._status("answer", msg=answer_query(topics, context, text, reply_language),
-                         observational=True, topics=topics, facts=context, language=reply_language)
+            self._answer(topics, text, reply_language, conversation)
             return
+        with self._lock:
+            self._subjects.pop(conversation, None)
         if language in ("vi", "en"):
             self._current_lang = language
         coordinator_resume = (resume_requested(text) and self._sup_state == "RECOVERY")
@@ -617,7 +673,7 @@ class LLMCommandNode(ManualRecovery, Node):
                 self._status("non_interruptible", msg=block_reason, language=self._current_lang)
                 return
             with self._lock:
-                self._pending_interrupt = {"text": text, "language": self._current_lang}
+                self._pending_interrupt = {"text": text, "language": self._current_lang, "conversation": conversation}
             task_desc = self._describe_active_task(self._current_lang)
             prompt = (
                 f"Robot is currently {task_desc}. Confirm cancelling the current action to run '{text}', or continue the current action?"
@@ -636,7 +692,7 @@ class LLMCommandNode(ManualRecovery, Node):
         self._abort.clear()
         self._confirm_evt.clear()
         self._confirm_val = False
-        threading.Thread(target=self._worker, args=(text, self._current_lang), daemon=True).start()
+        threading.Thread(target=self._worker, args=(text, self._current_lang, conversation), daemon=True).start()
 
     def _srv_stop(self, _req, resp):
         self._emergency_stop("service llm/stop")
@@ -689,7 +745,25 @@ class LLMCommandNode(ManualRecovery, Node):
         self._confirm_evt.set()
         self._status("stopped", msg=f"{why} (mission={state or 'unknown'})")
 
-    def _worker(self, text, language="auto"):
+    def _answer(self, topics, text, language, conversation):
+        with self._lock:
+            topics, slots = resolve_reference(topics, text, self._subjects.pop(conversation, None))
+            self._subjects[conversation] = (tuple(topics), slots)
+            if len(self._subjects) > 128:
+                self._subjects.popitem(last=False)
+        context = self._mission_context()
+        action = self._current_action
+        if 'mission' in topics and action in ('relative_move', 'lift_home', 'lift_to', 'go_mission', 'quick_goal'):
+            if not self.get_parameter('dry_run').value:
+                task = self._describe_active_task(language)
+                context['local_action'] = (f'The robot is {task}.' if language == 'en' else f'Xe đang {task}.')
+        if 'resume' in topics and self._manual_checkpoint and self._manual_checkpoint.get('paused_at') is not None:
+            context['manual_resume_reason'] = self._manual_resume_blocked()
+        self._status("answer", msg=answer_query(topics, context, text, language, slots),
+                     observational=True, conversation_id=conversation, topics=topics, language=language,
+                     facts=context)
+
+    def _worker(self, text, language="auto", conversation=""):
         en = self._is_en(language)
         self._cycle_run_id = None
         self._cycle_operation_id = None
@@ -697,7 +771,7 @@ class LLMCommandNode(ManualRecovery, Node):
         try:
             self._status("planning", msg=text, language=language)
             ctx, self._clarify_ctx = self._clarify_ctx, None
-            if ctx and time.time() - ctx[2] < 90:
+            if ctx and ctx[3] == conversation and time.time() - ctx[2] < 90:
                 if en:
                     request = (f"Original request: {ctx[0]}\nRobot asked: {ctx[1]}\n"
                                f"User replied: {text}\n"
@@ -727,8 +801,8 @@ class LLMCommandNode(ManualRecovery, Node):
                 plan = self._plan(request, language)
             self.get_logger().info(f"LLM trả lời sau {time.time() - t0:.2f}s: {plan}")
             if plan.get("clarify"):
-                self._clarify_ctx = (base, plan["clarify"], time.time())
-                self._status("clarify", msg=plan["clarify"], language=language)
+                self._clarify_ctx = (base, spoken_text(plan["clarify"]), time.time(), conversation)
+                self._status("clarify", msg=plan["clarify"], language=language, conversation_id=conversation)
                 return
             p = self.get_parameter
             allow_unmeasured = (p("allow_unmeasured_lift").value or p("dry_run").value)
@@ -740,15 +814,13 @@ class LLMCommandNode(ManualRecovery, Node):
                 return
             if steps[0]["action"] == "get_robot_status":
                 topic = steps[0]["args"]["topic"]
-                context = self._mission_context()
-                self._status("answer", msg=answer_query([topic], context, text, language),
-                             observational=True, facts=context, language=language)
+                self._answer([topic], text, language, conversation)
                 return
             summary = self._action_summary(steps, language, self._location)
             self._confirm_evt.clear()
             self._confirm_val = False
             self.pub_plan.publish(String(data=json.dumps(
-                {"say": plan.get("say", ""), "steps": steps,
+                {"say": spoken_text(plan.get("say")), "steps": steps,
                  "action_summary": summary, "language": language}, ensure_ascii=False)))
             if not p("require_confirm").value:
                 self.get_logger().warning("require_confirm=false bị bỏ qua")
@@ -769,13 +841,36 @@ class LLMCommandNode(ManualRecovery, Node):
                              if en else "Trạng thái robot thay đổi; hãy gửi lại lệnh.")
                 self._status("stale_plan", msg=stale_msg, language=language)
                 return
-            self._run_plan(steps, language, resume_checkpoint=resume_cp)
+            try:
+                self._run_plan(steps, language, resume_checkpoint=resume_cp)
+            except Aborted:
+                raise
+            except Exception as exc:
+                self._status("failed", msg=str(exc), language=language)
         except Aborted:
             if not self._switching_command:
                 self._status("stopped", msg="stopped" if en else "đã dừng", language=language)
-        except Exception as e:  # noqa: BLE001
-            self.get_logger().error(f"Lỗi: {e}")
-            self._status("error", msg=str(e), language=language)
+        except PlannerUnavailable as exc:
+            self._status("error", msg=str(exc), language=language,
+                         error_kind="planner_connection" if exc.connection_failed else "planner")
+        except ValueError as exc:
+            # The planner may return a mixed or incomplete action despite its prompt.
+            detail = str(exc)
+            if detail.startswith('Câu hỏi trạng thái phải tách'):
+                question = ('Would you like the status or a control plan first?' if en else
+                            'Bạn muốn kiểm tra trạng thái hay lập lệnh điều khiển trước?')
+            elif detail.startswith(('retrieve_pallet.slot=', 'start_single_cycle.drop_slot=')):
+                question = ('Which slot do you want?' if en else 'Bạn muốn chọn ô nào?')
+            else:
+                question = ''
+            if question:
+                self.get_logger().warning(detail)
+                self._clarify_ctx = (base, question, time.time(), conversation)
+                self._status('clarify', msg=question, language=language, conversation_id=conversation)
+            else:
+                self._status("error", msg=detail, error_kind="plan_validation", language=language)
+        except Exception as exc:
+            self._status("error", msg=str(exc), error_kind="plan_validation", language=language)
         finally:
             self._current_action = None
             self._current_action_args = None
@@ -848,7 +943,7 @@ class LLMCommandNode(ManualRecovery, Node):
                 self._current_action = st["action"]
                 self._current_action_args = st["args"]
                 self._status("running", step=i, total=len(steps),
-                             msg=f"{st['action']} {st['args']}", language=language)
+                             msg=self._action_summary([st], language, self._location)[0], language=language)
                 if dry:
                     self.get_logger().info(f"[dry_run] {st}")
                     self._sleep(0.5)
@@ -945,7 +1040,7 @@ class LLMCommandNode(ManualRecovery, Node):
                 current = {"HOME": "home", "P_1": "p1", "D_2": "d2", "D_1": "d1"}[args["target"]]
             elif action == "go_mission":
                 source, dest = mission_from_to(args["name"])
-                route = f"{loc.get(source, 'anywhere')} → {loc[dest]}"
+                route = f"{loc.get(source, 'anywhere' if en else 'vị trí hiện tại')} {'to' if en else 'đến'} {loc[dest]}"
                 summary.append(f"Run route {route}" if en else f"Chạy tuyến {route}")
                 current = dest
             elif action == "pick_pallet":
@@ -1018,7 +1113,9 @@ class LLMCommandNode(ManualRecovery, Node):
                 kind, detail = self._backend_failure(e)
                 self.get_logger().warning(f"LLM backend={name} model={model} result={kind} elapsed={elapsed:.2f}s detail={detail}")
                 failures.append((name, kind, detail))
-        raise RuntimeError(self._user_backend_failure(failures, language))
+        connection_failed = bool(failures) and all(
+            kind in ('connection_error', 'timeout') for _, kind, _ in failures)
+        raise PlannerUnavailable(self._user_backend_failure(failures, language), connection_failed)
 
     @staticmethod
     def _backend_failure(exc):

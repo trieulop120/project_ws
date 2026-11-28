@@ -30,8 +30,9 @@ Chạy (cùng pallet_mission.launch.py, KHONG chay them mission_manager rieng):
 
 import json
 import math
+from amr_mission_manager.detector_args import with_cargo_classes
 from amr_mission_manager.pallet_recovery import navigation_stopped
-from amr_mission_manager.aruco_route_gate import ArucoRouteGate
+from amr_mission_manager.aruco_route_gate import ArucoRouteGate, placement_leg
 import time
 import threading
 import uuid
@@ -305,6 +306,7 @@ class MissionSupervisor(Node):
         gate_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                               durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.pub_aruco_gate = self.create_publisher(Bool, '/aruco_b1/enable', gate_qos)
+        self.pub_aruco_route = self.create_publisher(String, '/aruco_b1/route', gate_qos)
         self._publish_aruco_gate()  # Fail closed on launch/restart.
         route_qos = QoSProfile(depth=1)
         route_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
@@ -419,11 +421,17 @@ class MissionSupervisor(Node):
             self._retrieval_aruco_gate.retrieval_transition(
                 status, nav_goal_active=status.get('nav_goal_active') if isinstance(status, dict) else False,
                 fresh=fresh)
-            placement_fresh = self._pm_status_t > 0.0 and now - self._pm_status_t <= 2.0
+            placement_fresh = (self._pm_cargo is True and self._pm_status_t > 0.0
+                               and now - self._pm_status_t <= 2.0)
             enabled = ArucoRouteGate.combine(
                 self._state, self._aruco_route_gate.enabled, placement_fresh,
                 status, self._retrieval_aruco_gate.enabled, fresh)
             self._aruco_gate_effective = bool(enabled)
+            route = ''
+            if enabled:
+                route = (placement_leg(self._pm_session_id, self._pm_operation_id)
+                         if self._state == GOTO_D else 'retrieval')
+            self.pub_aruco_route.publish(String(data=route))
             publisher.publish(Bool(data=bool(enabled)))
 
     @_state_locked
@@ -1269,14 +1277,7 @@ class MissionSupervisor(Node):
         else:
             self.get_logger().warn('[sampling] SetParameters timeout')
 
-    def _apply_detector_filter(self) -> bool:
-        """Pass shelf-compatible cargo classes to the detector child process.
-
-        Keep pallet_mission untouched: update its existing detector_extra_args
-        parameter through ROS, preserving any launch-time detector arguments.
-        pallet_mission reloads those args when Detect ON starts the child.
-        """
-        pm = self.p['pallet_mission_node']
+    def _pick_detector_classes(self):
         classes = []
         if self._select_drop_slot_for('A')[0] is not None:
             classes.append('medium')
@@ -1285,10 +1286,15 @@ class MissionSupervisor(Node):
         requested = str(self.p.get('target_cargo_class') or '').strip().lower()
         if requested:
             classes = [requested] if requested in classes else []
+        return classes
+
+    def _apply_detector_filter(self) -> bool:
+        pm = self.p['pallet_mission_node']
+        classes = self._pick_detector_classes()
         if not classes:
             self.get_logger().warn(
                 '[detector] no compatible shelf class is available for requested '
-                f'class {requested or "any"}')
+                f'class {self.p.get("target_cargo_class") or "any"}')
             return False
 
         get_cli = self._service_client(GetParameters, f'/{pm}/get_parameters')
@@ -1324,19 +1330,7 @@ class MissionSupervisor(Node):
             self.get_logger().error(f'[detector] cannot read detector_extra_args: {exc}')
             return False
 
-        # Replace a prior filter pair if present; leave all other launch args.
-        clean, i = [], 0
-        while i < len(args):
-            arg = args[i]
-            if arg == '-p' and i + 1 < len(args) and args[i + 1].startswith('target_cargo_classes:='):
-                i += 2
-                continue
-            if arg.startswith('target_cargo_classes:='):
-                i += 1
-                continue
-            clean.append(arg)
-            i += 1
-        clean.extend(['-p', 'target_cargo_classes:=' + ','.join(classes)])
+        clean = with_cargo_classes(args, classes)
 
         set_cli = self._service_client(SetParameters, f'/{pm}/set_parameters')
         if not set_cli.wait_for_service(timeout_sec=0.2):
@@ -1476,17 +1470,21 @@ class MissionSupervisor(Node):
     # ==================================================================
     # Shelf occupancy (loi 2 ESP serial -> /shelf/occupancy)
     # ==================================================================
+    @_state_locked
     def _on_shelf(self, msg: Int8MultiArray):
         # 4 bit 0/1 theo thu tu o (bin co hang = 1). esp32_bridge gui
         # [-1,-1,-1,-1] khi stale -> coi la mat ket noi (ghi None).
         # [0,0,0,0] (tat ca tron) la tinh TRANG HOP LE, khong phai stale.
         data = list(msg.data)
         self._shelf_input = data
-        if any(v < 0 for v in data):
-            self._shelf_bits = None
-        else:
-            self._shelf_bits = [1 if v > 0 else 0 for v in data]
+        self._shelf_bits = data if len(data) == 4 and all(v in (0, 1) for v in data) else None
         self._shelf_last_t = time.monotonic()
+        if self._reserved_drop_slots and self._shelf_bits is not None:
+            # Observe FULL even between missions. After that, the sensor alone
+            # determines when the pallet has been removed.
+            for slot, state in self._shelf_states().items():
+                if state == FULL:
+                    self._reserved_drop_slots.discard(slot)
 
     def _shelf_ok(self) -> bool:
         """True neu van chap nhan du lieu khoang /shelf/occupancy (khong stale)."""
@@ -1612,25 +1610,27 @@ class MissionSupervisor(Node):
         return (self._select_drop_slot_for('A')[0] is not None
                 or self._select_drop_slot_for('B')[0] is not None)
 
+    @_state_locked
     def _select_drop_slot_for(self, cargo_type):
         if self._shelf_model is None:
             return None, None, 'Khong doc duoc shelf.yaml'
-        states = dict(self._shelf_states())
-        for sid in tuple(self._reserved_drop_slots):
-            if states.get(sid) == FULL:
-                self._reserved_drop_slots.discard(sid)
-        # A just-placed box can take a sensor update cycle to appear. Reserve
-        # confirmed drop slots for this mission so a multi-item request cannot
-        # select the same apparently-empty slot twice.
+        states = self._shelf_states()
         for sid in self._reserved_drop_slots:
-            states[sid] = FULL
+            if states.get(sid) == EMPTY:
+                states[sid] = 'reserved'
         requested = str(self.p.get('target_drop_slot') or '').strip().upper()
         if requested:
             slot = self._shelf_model._slot_by_id.get(requested)
             if slot is None or slot.product_type != cargo_type:
                 return None, None, f'O ke {requested} khong phu hop loai hang {cargo_type}'
-            if states.get(requested) != EMPTY:
-                return None, None, f'O ke {requested} khong duoc xac nhan la trong'
+            state = states.get(requested, UNKNOWN)
+            if state != EMPTY:
+                reason = {
+                    FULL: 'cảm biến báo có hàng',
+                    'reserved': 'vừa đặt pallet, đang chờ cảm biến xác nhận có hàng',
+                    UNKNOWN: 'chưa có dữ liệu cảm biến kệ hợp lệ và còn mới',
+                }[state]
+                return None, None, f'Ô kệ {requested}: {reason}'
             return requested, slot.tf_frame, ''
         sid, why = self._shelf_model.select_drop_slot(cargo_type, states)
         if sid is None:
@@ -1921,12 +1921,14 @@ class MissionSupervisor(Node):
                     f'goal_active={self._nav_goal_active}, status_age={nav_age:.1f}s, '
                     f'pending_stop_services={pending_stops}', throttle_duration_sec=5.0)
                 return
-            if not self._drop_slot_chosen:
-                self._set_state('RECOVERY', 'DROP reported DONE without a validated shelf slot')
-                self._resume_state = DROPPING
-                return
-            if self._drop_slot_chosen:
-                self._reserved_drop_slots.add(self._drop_slot_chosen[0])
+            with self._transition_lock:
+                if not self._drop_slot_chosen:
+                    self._set_state('RECOVERY', 'DROP reported DONE without a validated shelf slot')
+                    self._resume_state = DROPPING
+                    return
+                slot = self._drop_slot_chosen[0]
+                if self._shelf_states().get(slot) != FULL:
+                    self._reserved_drop_slots.add(slot)
             self._cycle += 1
             self._task_placed += 1
             self._drop_retries = 0
@@ -2475,6 +2477,8 @@ class MissionSupervisor(Node):
             'cancel_pending': self._discard_requested,
             'stop_reason': stop_reason or getattr(self, '_stop_reason', ''),
             'state': self._state,
+            'pick_prewarm_classes': (self._pick_detector_classes()
+                                    if self._state == GOTO_PICK and self._triggered else []),
             'aruco_detection_enabled': bool(getattr(self, '_aruco_gate_effective', False)),
             'handling_status': self._handling_status(),
             'msg': self._msg,

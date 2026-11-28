@@ -103,7 +103,8 @@ class PalletRecovery:
         self._nav_cancel_future = None  # an earlier operation's cancel cannot prove this STOP
 
     def _resume_drop_navigation(self):
-        if self._drop is None or self._pre is None or not self._nav.server_is_ready():
+        if (not self._drop or not finite_pose(self._drop.get('target_odom'))
+                or self._pre is None or not self._nav.server_is_ready()):
             return False, 'Missing DROP staging context or Nav2 server'
         if self._ctl.insertion_only or self._drop_lifted:
             return False, 'Raised forks cannot restart DROP navigation'

@@ -118,6 +118,7 @@ class NavBridge:
         self._last_result = None
         self._last_elapsed_s = 0.0
         self._bridge_session_id = uuid.uuid4().hex
+        self._navigation_session_id = None
         self._state_sequence = 0
 
         # Navigation state
@@ -311,6 +312,12 @@ class NavBridge:
         """Map của phiên Nav2 hiện hành, để gắn danh tính cho pose map-frame."""
         with self._lock:
             return self._session.get('map_id') if self._nav_active and not self._stopping else None
+
+    @property
+    def navigation_session_id(self) -> Optional[str]:
+        """Last successfully launched Nav2 session, retained through Stop."""
+        with self._lock:
+            return self._navigation_session_id
 
     def is_nav_active(self) -> bool:
         """Kiểm tra navigation state."""
@@ -530,11 +537,12 @@ class NavBridge:
             if log_handle:
                 log_handle.close()
             raise
-        self._nav_process = proc
         if log_handle:
             self._nav_log_handles[proc] = log_handle
 
         with self._lock:
+            self._nav_process = proc
+            self._navigation_session_id = uuid.uuid4().hex
             self._nav_active = True
             self._session = {'map_id': map_id, 'route_id': route_id}
             self._current_state = self.STATE_IDLE
@@ -1170,6 +1178,7 @@ class NavBridge:
             process = self._nav_process
             current_state = self._current_state
             session = dict(self._session)
+            navigation_session_id = self._navigation_session_id
             mission_type = self._mission_type
             waypoint_poses = list(self._waypoint_poses)
             waypoint_index = self._current_waypoint_index
@@ -1213,6 +1222,7 @@ class NavBridge:
         state = {
             'type': 'nav_state',
             'bridge_session_id': self._bridge_session_id,
+            'navigation_session_id': navigation_session_id,
             'revision': revision,
             'state': current_state,
             'timestamp': time.time(),

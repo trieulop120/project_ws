@@ -258,7 +258,20 @@ class WarehouseView:
             if target and not target.get('locked') and (not fresh or now - self._target_at > _TARGET_FRESH_S):
                 target = None
             drop = mission.get('drop') if mission.get('mode') == 'drop' and self._carried else None
+            transfer = None
+            motion = mission.get('visual_lift')
+            if fresh and isinstance(motion, dict) and all(
+                    type(motion.get(k)) in (float, int) and math.isfinite(motion[k])
+                    for k in ('start_m', 'goal_m', 'height_m')):
+                if (motion.get('action') == 'pick_backoff' and mission.get('us_pick_confirmed') is True
+                        and target and target.get('locked') and not self._carried
+                        and motion['goal_m'] > motion['start_m']):
+                    transfer = {**motion, 'id': target['id']}
+                elif (motion.get('action') == 'drop_release' and drop and drop.get('slot')
+                      and motion['goal_m'] < motion['start_m']):
+                    transfer = {**motion, 'id': self._carried['id'], 'slot': drop['slot']}
             return {'map_id': map_id, 'frame_id': frame_id, 'slots': states,
+                    'lift_transfer': transfer,
                     'target': dict(target) if target else None,
                     'carried': self._carried, 'source_empty': self._source_empty,
                     'drops': dict(self._drops), 'departed': dict(self._departed),

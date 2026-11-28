@@ -258,12 +258,26 @@ class LLMBridge:
                     confidence = float(confidence)
                 except (TypeError, ValueError):
                     confidence = None
-                problem = self._precheck() if self._precheck and not classify_query(text) else None
+                conversation = cmd.get('conversation_id')
+                if not isinstance(conversation, str) or len(conversation) > 80:
+                    conversation = ''
+                status = self.last_status or {}
+                plan_reply = (status.get('state') == 'clarify' and not status.get('low_confidence')
+                              and status.get('conversation_id', '') == conversation
+                              and time.time() < status.get('clarify_until', float('inf')))
+                query = classify_query(text, plan_reply=plan_reply)
+                problem = self._precheck() if self._precheck and not query else None
                 if problem:
-                    return self._resp(name, "error", problem)
+                    code = ('navigation' if problem.startswith('Nav2') else
+                            'route' if problem.startswith('Route graph') else 'telemetry')
+                    self._web_node.get_logger().warning(problem)
+                    return {**self._resp(name, "error"), "reason_code": code}
                 self._session_reset = False
-                self.clear_status("pending", "Đang nhận yêu cầu mới")
+                if not query:
+                    self.clear_status("pending", "Đang nhận yêu cầu mới")
                 envelope = {"text": text, "language": language}
+                if conversation:
+                    envelope['conversation_id'] = conversation
                 if confidence is not None:
                     envelope["speech_confidence"] = confidence
                 self._pub_cmd.publish(String(data=json.dumps(envelope, ensure_ascii=False)))
@@ -282,5 +296,6 @@ class LLMBridge:
             else:
                 return self._resp(name, "error", "Lệnh llm_ không tồn tại")
         except Exception as e:  # noqa: BLE001
-            return self._resp(name, "error", str(e))
+            self._web_node.get_logger().error(f"{name}: {e}")
+            return {**self._resp(name, "error"), "reason_code": "unavailable"}
         return self._resp(name)

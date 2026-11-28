@@ -337,6 +337,7 @@ def generate_launch_description():
                 value_type=List[float]),
             'auto_update_amcl': ParameterValue(
                 LaunchConfiguration('aruco_auto_update_amcl'), value_type=bool),
+            'mission_route_topic': '/aruco_b1/route',
             'search_hz': 2.0,
             'track_hz': 8.0,
         }],

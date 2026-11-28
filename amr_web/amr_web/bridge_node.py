@@ -218,8 +218,7 @@ class WebBridge(Node):
         self._mission_status_changed = threading.Event()
         self._auto_stop_target = None
         self._auto_service_requests = []
-        # Recent Missions is history, not part of the current Nav2 session.
-        # Keep the latest 50 entries across Cancel, Stop and Bridge restart.
+        # Keep the latest 50 milestones on disk, across navigation sessions.
         self._recent_missions_lock = threading.RLock()
         self._recent_missions_path = os.path.expanduser('~/.ros/amr_web/recent_missions.json')
         self._recent_supervisor_missions = deque(maxlen=50)
@@ -840,17 +839,20 @@ class WebBridge(Node):
             return
         if isinstance(data, dict):
             previous = self._mission_supervisor_status
+            session_id = self._nav_bridge.navigation_session_id if self._nav_bridge else None
             if (previous and data.get('supervisor_session_id') and
                     data.get('supervisor_session_id') == previous.get('supervisor_session_id') and
                     data.get('revision', 0) < previous.get('revision', 0)):
                 return
             if self._recent_mission_baseline_pending:
                 self._recent_mission_baseline_pending = False
-            elif previous and (not previous.get('supervisor_session_id') or
+            elif previous and previous.get('navigation_session_id') == session_id and (
+                    not previous.get('supervisor_session_id') or
                     not data.get('supervisor_session_id') or
                     previous.get('supervisor_session_id') == data.get('supervisor_session_id')):
-                self._record_supervisor_mission(previous, data)
-            self._mission_supervisor_status = {**data, 'ts': time.time()}
+                self._record_supervisor_mission(previous, data, session_id)
+            self._mission_supervisor_status = {
+                **data, 'navigation_session_id': session_id, 'ts': time.time()}
             target = getattr(self, '_auto_stop_target', None)
             if target is not None and self._auto_stop_complete(target):
                 self._auto_stop_target = None
@@ -899,6 +901,8 @@ class WebBridge(Node):
                 retired_runs.add(accepted_run)
                 self._retrieval_retired_run_ids = retired_runs
             previous = self._pallet_retrieval_status or {}
+            session_id = self._nav_bridge.navigation_session_id if self._nav_bridge else None
+            same_session = not previous or previous.get('navigation_session_id') == session_id
             old_state = previous.get('state')
             slot = str(data.get('slot') or previous.get('slot') or '').strip().upper()
             labels = {
@@ -914,53 +918,53 @@ class WebBridge(Node):
             }
             same_run = (not data.get('run_id') or data.get('run_id') == previous.get('run_id'))
             resumed = same_run and (data.get('resume_revision') or 0) > (previous.get('resume_revision') or 0)
-            if resumed:
+            if same_session and resumed:
                 phase = data.get('recovery_from') or previous.get('recovery_from') or new_state
                 self._append_recent_mission({
                     'time': datetime.now().strftime('%H:%M:%S'),
                     'name': labels.get(phase, f'Retrieve pallet from {slot or "rack"}'),
                     'status': 'Resumed', 'cycle': 0,
-                })
+                }, session_id)
             recovery_returned = new_state == 'RECOVERY' and previous.get('resuming') and not data.get('resuming')
-            if old_state != new_state or resumed or recovery_returned:
+            if same_session and (old_state != new_state or resumed or recovery_returned):
                 if old_state in labels and new_state not in (
                         'FAILED', 'STOPPED', 'CANCELED', 'CANCELING', 'RECOVERY'):
                     self._append_recent_mission({
                         'time': datetime.now().strftime('%H:%M:%S'),
                         'name': labels[old_state], 'status': 'Completed', 'cycle': 0,
-                    })
+                    }, session_id)
                 if new_state == 'RECOVERY' and not data.get('resuming'):
                     phase = data.get('recovery_from') or old_state
                     self._append_recent_mission({
                         'time': datetime.now().strftime('%H:%M:%S'),
                         'name': labels.get(phase, f'Retrieve pallet from {slot or "rack"}'),
                         'status': 'Recovery Required', 'cycle': 0,
-                    })
+                    }, session_id)
                 elif new_state == 'FAILED':
                     self._append_recent_mission({
                         'time': datetime.now().strftime('%H:%M:%S'),
                         'name': f'Retrieve pallet from {slot or "rack"}',
                         'status': 'Failed', 'cycle': 0,
-                    })
+                    }, session_id)
                 elif new_state == 'DONE':
                     self._append_recent_mission({
                         'time': datetime.now().strftime('%H:%M:%S'),
                         'name': f'Retrieve pallet from {slot or "rack"}',
                         'status': 'Completed', 'cycle': 0,
-                    })
+                    }, session_id)
                 elif new_state == 'CANCELED':
                     self._append_recent_mission({
                         'time': datetime.now().strftime('%H:%M:%S'),
                         'name': f'Retrieve pallet from {slot or "rack"}',
                         'status': 'Canceled', 'cycle': 0,
-                    })
+                    }, session_id)
             terminal = new_state in ('DONE', 'FAILED', 'CANCELED', 'STOPPED')
             supervisor = self.get_mission_supervisor_status() or {}
             auto_active = not supervisor.get('stale', True) and supervisor.get('state') in (
                 'GOTO_PICK', 'PICKING', 'GOTO_D', 'DROPPING',
                 'WAITING_SLOT', 'RETURN_HOME', 'RECOVERY')
             self._pallet_retrieval_status = {
-                **data, 'ts': time.time(),
+                **data, 'navigation_session_id': session_id, 'ts': time.time(),
                 'discarded_supervisor_key': (
                     previous.get('discarded_supervisor_key') if same_run and previous.get('discarded_supervisor_key')
                     else [supervisor.get('supervisor_session_id'), supervisor.get('run_id'), supervisor.get('revision')]
@@ -991,14 +995,14 @@ class WebBridge(Node):
         except (OSError, ValueError, TypeError) as exc:
             self.get_logger().warning(f'Cannot load Recent Missions history: {exc}')
 
-    def _append_recent_mission(self, item: dict) -> None:
+    def _append_recent_mission(self, item: dict, session_id: Optional[str]) -> None:
         """Append one completed milestone and persist the bounded history.
 
         Not a mission ownership or safety signal. Persistence failure must never
         interrupt a running robot mission.
         """
         with self._recent_missions_lock:
-            self._recent_supervisor_missions.appendleft(item)
+            self._recent_supervisor_missions.appendleft({**item, 'navigation_session_id': session_id})
             folder = os.path.dirname(self._recent_missions_path)
             temporary = None
             try:
@@ -1054,7 +1058,7 @@ class WebBridge(Node):
             return 'Go to D_2 (haul-out drop point)'
         return 'Pallet mission'
 
-    def _record_supervisor_mission(self, previous: dict, current: dict) -> None:
+    def _record_supervisor_mission(self, previous: dict, current: dict, session_id: Optional[str]) -> None:
         old_state, new_state = previous.get('state'), current.get('state')
         completed = {
             ('GOTO_PICK', 'PICKING'): ('GOTO_PICK', 'Completed'),
@@ -1113,7 +1117,7 @@ class WebBridge(Node):
                 'name': label,
                 'status': event_status,
                 'cycle': cycle.get('number', 0),
-            })
+            }, session_id)
 
     def get_mission_supervisor_status(self):
         """Return a copy of supervisor status with transport freshness metadata."""
@@ -1122,8 +1126,12 @@ class WebBridge(Node):
             return None
         result = dict(data)
         result['stale'] = (time.time() - result.get('ts', 0.0)) > 3.0
+        session_id = self._nav_bridge.navigation_session_id if self._nav_bridge else None
+        result['navigation_session_id'] = session_id
         with self._recent_missions_lock:
-            result['recent_missions'] = list(self._recent_supervisor_missions)
+            result['recent_missions'] = [
+                item for item in self._recent_supervisor_missions
+                if session_id is not None and item.get('navigation_session_id') == session_id]
         target = getattr(self, '_auto_stop_target', None)
         result['web_control_pending'] = target is not None
         result['web_control_action'] = target['command'] if target else None
@@ -2480,7 +2488,6 @@ class WebBridge(Node):
                     return False, 'Navigation startup superseded by Stop'
                 self._state_bridge.clear_map()
                 self._map_pending = False
-                self._mark_recent_supervisor_session_boundary()
             if success and self._verbose:
                 self.get_logger().info(f'Navigation started: map={map_id}, route={route_id}')
 

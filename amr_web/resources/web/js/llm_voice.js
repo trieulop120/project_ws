@@ -68,19 +68,19 @@
             interpretation: 'LLM interpretation: ',
             btnYes: 'Confirm',
             btnNo: 'Cancel',
-            okYes: '✔ confirmed',
-            okNo: '✖ cancelled',
+            okYes: 'confirmed',
+            okNo: 'cancelled',
             btnInterruptYes: 'Cancel & run new',
             btnInterruptNo: 'Continue current',
-            okInterruptYes: '✔ cancelled previous, running new command',
-            okInterruptNo: '▶ continuing current action',
+            okInterruptYes: 'cancelled previous, running new command',
+            okInterruptNo: 'continuing current action',
             speakInterrupt: "Say 'confirm' to cancel and run the new command, or 'continue' to keep the current action.",
             noteNew: '(replaced by a new plan)',
             noteDone: '(handled)',
             step: 'Step',
             speakConfirm: 'Say confirm to run, or cancel.',
-            wsDown: 'Not connected to server (WebSocket).',
-            wsTimeout: 'No response from the LLM node. Is llm_command_node running? (ros2 launch amr_mission_manager llm_system.launch.py)',
+            wsDown: 'The dashboard is disconnected. Your request could not be sent.',
+            wsTimeout: 'I have no response yet, so I cannot confirm whether the command ran.',
             noMic: 'Browser does not support speech recognition (use Chrome, Edge or Safari).',
             micDenied: 'Microphone permission denied (or page is not secure - needs https).',
             micNet: 'Speech recognition needs an Internet connection.',
@@ -126,19 +126,19 @@
             interpretation: 'LLM diễn giải: ',
             btnYes: 'Xác nhận',
             btnNo: 'Hủy',
-            okYes: '✔ đã xác nhận',
-            okNo: '✖ đã hủy',
+            okYes: 'đã xác nhận',
+            okNo: 'đã hủy',
             btnInterruptYes: 'Hủy & chạy lệnh mới',
             btnInterruptNo: 'Tiếp tục lệnh cũ',
-            okInterruptYes: '✔ đã hủy lệnh cũ, chạy lệnh mới',
-            okInterruptNo: '▶ tiếp tục hành động đang chạy',
+            okInterruptYes: 'đã hủy lệnh cũ, chạy lệnh mới',
+            okInterruptNo: 'tiếp tục hành động đang chạy',
             speakInterrupt: "Nói 'xác nhận' để hủy và chạy lệnh mới, hoặc 'tiếp tục' để giữ lệnh cũ.",
             noteNew: '(đã thay bằng kế hoạch mới)',
             noteDone: '(đã xử lý)',
             step: 'Bước',
             speakConfirm: 'Nói xác nhận để chạy, hoặc hủy.',
-            wsDown: 'Chưa kết nối tới server (WebSocket).',
-            wsTimeout: 'Chưa thấy phản hồi từ node LLM. llm_command_node đã chạy chưa? (ros2 launch amr_mission_manager llm_system.launch.py)',
+            wsDown: 'Web đang mất kết nối nên chưa gửi được yêu cầu của bạn.',
+            wsTimeout: 'Mình chưa nhận được phản hồi nên chưa xác nhận được lệnh đã chạy hay chưa.',
             noMic: 'Trình duyệt không hỗ trợ nhận giọng nói (dùng Chrome, Edge hoặc Safari).',
             micDenied: 'Chưa cấp quyền micro (hoặc trang không an toàn - cần https).',
             micNet: 'Nhận giọng nói cần Internet.',
@@ -151,6 +151,11 @@
     // ============================================
     // Trạng thái
     // ============================================
+    function newConversation() {
+        return Array.from(crypto.getRandomValues(new Uint32Array(4))).join('-');
+    }
+    let conversation = newConversation();
+    let lastNotice = '';
     let state = '';
     let listening = false, speaking = false, rec = null;
     let planBubble = null, curSteps = [], lastStep = -1, watchdog = null;
@@ -181,9 +186,6 @@
     function send(cmd) {
         if (typeof sendCommand === 'function') return sendCommand(cmd);
         return false;
-    }
-    function toast(msg, type) {
-        if (typeof window.showToast === 'function') window.showToast(msg, type || 'info');
     }
     function activity(type, msg) {
         if (typeof addActivity === 'function') addActivity(type, msg);
@@ -349,7 +351,7 @@
         applyLang(false);
         addMsg('sys', T().welcome);
         if (!window.isSecureContext) {
-            addMsg('sys', T().httpWarn, 'err');
+            addMsg('sys', T().httpWarn);
         }
     }
 
@@ -421,7 +423,20 @@
         requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
     }
 
+    function assistantText(text) {
+        return String(text ?? '').replace(/[#*0-9]\uFE0F?\u20E3|[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Emoji_Modifier}\u25c9\u2713-\u2718\uFE0E\uFE0F\u200D]/gu, '')
+            .replace(/[^\S\n]+/g, ' ').trim();
+    }
+
+    function notice(text, key, error = false) {
+        if (key && lastNotice === key) return;
+        lastNotice = key;
+        addMsg('robot', text, error ? 'err' : '');
+        speak(text);
+    }
+
     function addMsg(kind, text, extra) {
+        if (kind !== 'user') text = assistantText(text);
         const m = h('div', 'llm-msg ' + kind + (extra ? ' ' + extra : ''), text);
         el.chat.appendChild(m);
         while (el.chat.children.length > 80) el.chat.removeChild(el.chat.firstChild);
@@ -462,10 +477,10 @@
         curSteps = s.steps || [];
         const b = h('div', 'llm-msg llm-plan');
         b.appendChild(h('div', null, T().actionsTitle));
-        if (s.say) b.appendChild(h('div', 'llm-msg sys', T().interpretation + s.say));
+        if (s.say) b.appendChild(h('div', 'llm-msg sys', T().interpretation + assistantText(s.say)));
         const ol = h('ol');
         const summary = Array.isArray(s.action_summary) ? s.action_summary : curSteps.map(describe);
-        summary.forEach((x) => ol.appendChild(h('li', null, String(x))));
+        summary.forEach((x) => ol.appendChild(h('li', null, assistantText(x))));
         b.appendChild(ol);
         const row = h('div', 'llm-row');
         const yes = h('button', 'llm-btn ok', T().btnYes);
@@ -483,7 +498,7 @@
     function showInterruptConfirm(s) {
         closePlan(T().noteNew);
         const b = h('div', 'llm-msg llm-plan');
-        b.appendChild(h('div', null, '⚠ ' + (s.msg || '')));
+        b.appendChild(h('div', null, assistantText(s.msg)));
         const row = h('div', 'llm-row');
         row.style.marginTop = '6px';
         const yes = h('button', 'llm-btn ok', T().btnInterruptYes);
@@ -501,7 +516,7 @@
     // ============================================
     // Điều kiện an toàn + gửi lệnh
     // ============================================
-    function stopAll() {
+    function stopAll(text) {
         if (window.speechSynthesis) window.speechSynthesis.cancel();
         speaking = false;
         if (rec && listening) { try { rec.abort(); } catch (e) { /* bỏ qua */ } }
@@ -509,7 +524,7 @@
         // Let the LLM node select the active mission's stop path (cycle,
         // pallet action, or a standalone Nav2 goal).
         send({ command: 'llm_stop' });
-        addMsg('user', '⛔ STOP');
+        addMsg('user', text);
         activity('warn', 'LLM: stop requested');
     }
 
@@ -517,25 +532,28 @@
         // Server applies motion readiness; read-only questions also work with Nav2 stopped.
         addMsg('user', text);
         activity('info', 'LLM lệnh: ' + text);
-        const command = { command: 'llm_command', text: text, language: lang };
+        lastNotice = '';
+        const command = { command: 'llm_command', text, language: lang, conversation_id: conversation };
         if (Number.isFinite(speechConfidence) && speechConfidence >= 0) command.speech_confidence = speechConfidence;
         if (!send(command)) {
-            addMsg('sys', T().wsDown, 'err');
+            notice(T().wsDown, 'disconnected', true);
             return;
         }
         clearTimeout(watchdog);
-        watchdog = setTimeout(() => addMsg('sys', T().wsTimeout, 'err'), WATCHDOG_MS);
+        watchdog = setTimeout(() => notice(T().wsTimeout, 'timeout', true), WATCHDOG_MS);
     }
 
     // fromVoice: true nếu là câu nói (xác nhận bằng giọng chỉ hoạt động khi bật tùy chọn)
     function processText(raw, fromVoice, speechConfidence) {
-        const text = (raw || '').trim();
-        if (!text) return;
+        const text = raw || '';
+        if (!text.trim()) return;
         el.input.value = '';
         const t = text.toLowerCase().replace(/[.,!?]/g, '').trim();
         const waiting = state === 'waiting_confirm';
         const waitingInterrupt = state === 'confirm_interrupt';
-        if (STOP_RE.test(t)) { stopAll(); return; }
+        const folded = t.normalize('NFD').replace(/\p{M}/gu, '').replace(/đ/g, 'd');
+        const stopQuestion = /^dung (?:vi sao|tai sao|vi ly do gi|luc nao|chua|roi (?:a|ha))$/.test(folded);
+        if (STOP_RE.test(t) && !stopQuestion) { stopAll(text); return; }
         if (waitingInterrupt && (!fromVoice || el.vconfirm.checked)) {
             if (YES_RE.test(t)) { addMsg('user', text); send({ command: 'llm_confirm', ok: true }); closePlan(T().okInterruptYes); return; }
             if (CONTINUE_RE.test(t)) { addMsg('user', text); send({ command: 'llm_confirm', ok: false }); closePlan(T().okInterruptNo); return; }
@@ -544,7 +562,7 @@
             if (YES_RE.test(t)) { addMsg('user', text); send({ command: 'llm_confirm', ok: true }); closePlan(T().okYes); return; }
             if (CANCEL_RE.test(t)) { addMsg('user', text); send({ command: 'llm_confirm', ok: false }); closePlan(T().okNo); return; }
         }
-        if (state === 'running' && CANCEL_RE.test(t)) { stopAll(); return; }   // "hủy/thôi" khi đang chạy = dừng
+        if (state === 'running' && CANCEL_RE.test(t)) { stopAll(text); return; }   // "hủy/thôi" khi đang chạy = dừng
         sendLLM(text, speechConfidence);
     }
 
@@ -616,6 +634,7 @@
     }
 
     function speak(text, cb) {
+        text = assistantText(text);
         if (!el.tts || !el.tts.checked || !text || !window.speechSynthesis) { if (cb) cb(); return; }
         window.speechSynthesis.cancel();
         const code = lang === 'vi' ? 'vi-VN' : 'en-US';
@@ -667,6 +686,8 @@
     }
 
     window.resetLLMSession = function () {
+        conversation = newConversation();
+        lastNotice = '';
         if (window.speechSynthesis) window.speechSynthesis.cancel();
         speaking = false;
         if (rec) {
@@ -716,7 +737,10 @@
             const t = T();
             if (e.error === 'not-allowed') addMsg('sys', t.micDenied, 'err');
             else if (e.error === 'network') addMsg('sys', t.micNet, 'err');
-            else if (e.error !== 'no-speech' && e.error !== 'aborted') addMsg('sys', t.micErr + e.error, 'err');
+            else if (e.error !== 'no-speech' && e.error !== 'aborted') {
+                console.warn('Speech recognition', e.error);
+                addMsg('sys', lang === 'vi' ? 'Micro chưa nhận được lời nói. Bạn có thể nhập câu hỏi.' : 'Speech input is unavailable. You can type your question.', 'err');
+            }
         };
         rec.onend = () => setMic(false);
         try { rec.start(); setMic(true); } catch (e) { /* đang nghe rồi */ }
@@ -725,16 +749,32 @@
     // ============================================
     // Nhận trạng thái từ backend (ros_connection.js gọi)
     // ============================================
+    window.handleLLMCommandResponse = function (d) {
+        if (d.status === 'ok') return;
+        clearTimeout(watchdog);
+        console.warn('LLM request', d.command, d.reason_code || d.status);
+        const messages = {
+            navigation: ['Navigation is not ready. Check Navigation before starting a mission.', 'Điều hướng chưa sẵn sàng. Bạn kiểm tra mục Navigation trước khi chạy nhé.'],
+            route: ['The robot has no usable route. Check the selected route.', 'Xe chưa có tuyến đường sẵn sàng. Bạn kiểm tra tuyến đang chọn nhé.'],
+            telemetry: ['No current mission update. I cannot check this command yet.', 'Chưa có cập nhật mới từ xe để kiểm tra lệnh này.'],
+            unavailable: ['The assistant could not receive this request.', 'Trợ lý chưa nhận được yêu cầu này.']
+        };
+        const message = (messages[d.reason_code] || messages.unavailable)[lang === 'vi' ? 1 : 0];
+        notice(message, [d.command, d.reason_code, d.message].join('|'), d.reason_code !== 'telemetry');
+    };
+
     window.handleLLMStatus = function (msg) {
         const s = (msg && msg.data) ? msg.data : msg;
         if (!s || !s.state || !el.chat) return;
+        if ((s.observational || s.state === 'clarify') && s.conversation_id && s.conversation_id !== conversation) return;
         if (s.state === 'answer' && s.observational === true) {
             clearTimeout(watchdog);
             addMsg('robot', s.msg || '');
             speak(s.msg);
             return; // Preserve running state and confirmation/interrupt controls.
         }
-        clearTimeout(watchdog);
+        if (s.state !== 'pending') clearTimeout(watchdog);
+        if (!['failed', 'error', 'non_interruptible'].includes(s.state)) lastNotice = '';
         const prev = state;
         state = s.state;
         lastStatus = s;
@@ -747,13 +787,13 @@
         if (s.state === 'running') {
             if (s.step !== lastStep) {
                 lastStep = s.step;
-                const d = describe(curSteps[s.step - 1]) || s.msg || '';
-                addMsg('sys', `▶ ${T().step} ${s.step}/${s.total}: ${d}`);
+                const d = s.msg || describe(curSteps[s.step - 1]);
+                addMsg('sys', `${T().step} ${s.step}/${s.total}: ${d}`);
             }
         } else {
             lastStep = -1;
         }
-        if (prev === s.state && s.state !== 'confirm_interrupt' && s.state !== 'non_interruptible') return;
+        if (prev === s.state && !['confirm_interrupt', 'non_interruptible', 'failed', 'error', 'clarify'].includes(s.state)) return;
 
         const t = T();
         switch (s.state) {
@@ -768,46 +808,38 @@
                 speak((s.msg || '') + ' ' + t.speakInterrupt);
                 break;
             case 'non_interruptible':
-                addMsg('robot', '⚠ ' + (s.msg || t.status.non_interruptible), 'err');
-                speak(s.msg || t.status.non_interruptible);
-                toast(s.msg || t.status.non_interruptible, 'warn');
+                notice(s.msg || t.status.non_interruptible, s.state + s.msg);
                 break;
             case 'clarify':
-                addMsg('robot', '❓ ' + s.msg);
+                addMsg('robot', s.msg);
                 speak(s.msg);   // không tự bật mic; người dùng tự bấm mic để trả lời
                 break;
             case 'done':
-                const doneText = s.msg || t.status.done;
-                addMsg('robot', '✔ ' + doneText + '.');
-                speak(doneText + '.');
-                activity('success', 'LLM: ' + doneText);
-                break;
             case 'simulated':
-                addMsg('robot', '◉ ' + (s.msg || t.status.simulated) + '.');
-                speak((s.msg || t.status.simulated) + '.');
-                break;
             case 'started':
-                addMsg('robot', '▶ ' + (s.msg || t.status.started) + '.');
-                speak((s.msg || t.status.started) + '.');
+            case 'stopped': {
+                const text = s.state === 'stopped' ? t.status.stopped : s.msg || t.status[s.state];
+                addMsg('robot', text);
+                speak(text);
                 break;
-            case 'stopped':
-                addMsg('robot', '⛔ ' + t.status.stopped + '.');
-                speak(t.status.stopped + '.');
-                break;
+            }
             case 'cancelled':
                 addMsg('robot', t.status.cancelled + '.');
                 break;
+            case 'stale_plan':
             case 'noop':
                 addMsg('robot', s.msg || t.status.noop + '.');
                 speak(s.msg);
                 break;
             case 'failed':
-            case 'error':
-                addMsg('robot', '✖ ' + (s.msg || t.status.error), 'err');
-                speak(t.status.error + '. ' + (s.msg || ''));
-                activity('error', 'LLM: ' + (s.msg || s.state));
-                toast(s.msg || t.status.error, 'error');
+            case 'error': {
+                // Older cached snapshots may contain exception strings.
+                const text = s.error_kind && s.msg ? s.msg : (s.state === 'failed'
+                    ? (lang === 'vi' ? 'Xe chưa báo nhiệm vụ hoàn tất.' : 'The mission did not report completion.')
+                    : (lang === 'vi' ? 'Trợ lý chưa xử lý được yêu cầu này.' : 'The assistant could not process the request.'));
+                notice(text, JSON.stringify([s.state, s.run_id, s.operation_id, s.step, s.error_id, s.msg]), true);
                 break;
+            }
             case 'busy':
                 addMsg('sys', s.msg || t.status.busy + '.');
                 break;

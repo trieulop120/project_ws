@@ -1,16 +1,16 @@
 import {createContactShadows} from './contact_shadows.js';
-import {createNavPlanLayer} from './nav_plan_layer.js';
+import {createNavPlanLayer} from './nav_plan_layer.js?v=2';
 import {createRouteMarkerLayer} from './route_marker_layer.js?v=1.4.0';
 import * as THREE from 'three';
 import { OrbitControls } from '../vendor/three/OrbitControls.js';
 import { buildWallSurfaceData, createCloudBoundary, createDisplayVariants, decodeMap, mapWorldCorners,
          normalizeMapInfo, occupiedFootprintCells, rackWallClipping, resolveObstacles } from './map_geometry.js?v=2.8.0';
 import { normalizeSemanticLayout } from './semantic_layout.js?v=1.5.0';
-import { createSemanticScene } from './semantic_scene.js?v=1.8.0';
+import { createSemanticScene } from './semantic_scene.js?v=1.9.0';
 import { createPointCloudLayer } from './point_cloud_layer.js?v=2.5.0';
 import {createLaserObstacleLayer} from './laser_obstacle_layer.js';
 import {laserCoverage} from './laser_obstacles.js?v=1.1.0';
-import { createRobotModel } from './robot_model.js?v=1.3.0';
+import { createRobotModel } from './robot_model.js?v=1.4.0';
 
 // Viewer owns only its WebGL resources. ROS data and the existing 2D canvas stay elsewhere.
 export function createViewer(onError = () => {}, onModelStatus = () => {}, onFollowChange = () => {}) {
@@ -53,6 +53,7 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
     let displayedYaw = 0;
     let hasDisplayedPose = false;
     let liftHeightM = null;
+    let shownLiftM = null;
     let cameraMode = 'free';
     let followPosition = null;
     let lastRenderTime = 0;
@@ -71,7 +72,12 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
         lastRenderTime = timestamp;
         updateRobot(dt);
         cloudLayer?.tick(timestamp);
-        semanticScene?.tick(timestamp);
+        if (liftHeightM !== null) {
+            shownLiftM += (liftHeightM-shownLiftM)*(1-Math.exp(-dt/.16));
+            applyLiftHeight(shownLiftM);
+        }
+        semanticScene?.tick(timestamp, shownLiftM);
+        planLayer?.tick(timestamp);
         if (semanticScene?.hasCarried() && timestamp - lastCargoRefresh >= 120) {
             lastCargoRefresh = timestamp;
             refreshScanStrip();
@@ -142,7 +148,7 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
         contactShadows.setRobotModel(result.object);
         robotRoot.add(result.object);
         semanticScene?.setRobotAttachment(result.kind === 'glb' ? result.cargoAttachment : null);
-        if (liftHeightM !== null) setLiftHeight(liftHeightM);
+        if (shownLiftM !== null) applyLiftHeight(shownLiftM);
         onModelStatus({kind: result.kind, reason: result.reason});
     }
 
@@ -190,7 +196,7 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
                 contactShadows?.setSemantic(semanticScene.getFootprints(false));
                 refreshScanStrip();
                 cloudLayer?.refresh();
-            }, () => !!targetPose && hasDisplayedPose);
+            }, () => robotVisible && !!targetPose && hasDisplayedPose);
             cloudLayer = createPointCloudLayer(scene, reconcileObstacles, {
                 acceptPoint: (point, sensorOrigin) =>
                     cloudBoundary?.allowsObservation(point, sensorOrigin) === true,
@@ -335,6 +341,10 @@ export function createViewer(onError = () => {}, onModelStatus = () => {}, onFol
     function setLiftHeight(value) {
         if (!Number.isFinite(value) || value < 0 || value > 0.8) return;
         liftHeightM = value;
+        shownLiftM ??= value;
+    }
+
+    function applyLiftHeight(value) {
         if (robotModel?.liftNode) robotModel.liftNode.position.y = robotModel.liftBaseY + value;
         else if (robotModel?.cargoAttachment && Number.isFinite(robotModel.cargoBaseZ)) {
             robotModel.cargoAttachment.position.z = robotModel.cargoBaseZ + value;

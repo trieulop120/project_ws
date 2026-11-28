@@ -1706,8 +1706,7 @@
 
     window.resetSessionUI = function () {
         window.retrievalResumePending = null;
-        // Recent Missions is history, not current Nav2 session state.
-        // It is refreshed from the persistent Bridge snapshot on reconnect.
+        // Stop keeps the last Nav2 session selected for Recent Missions.
         if (typeof window.resetLLMSession === 'function') window.resetLLMSession();
     };
 
@@ -1806,7 +1805,8 @@
 
         window.notifyMissionError(owner, view);
         const recentStatus = window.currentMissionSupervisorStatus;
-        const recentHistory = recentStatus?.navigation_session_id === window.currentNavigationSessionId
+        const recentHistory = window.currentNavigationSessionId &&
+                recentStatus?.navigation_session_id === window.currentNavigationSessionId
             ? recentStatus.recent_missions : null;
         renderRecentMissions(Array.isArray(recentHistory) ? recentHistory : []);
         updateMissionButtons();
@@ -1991,11 +1991,7 @@
         navState.received_at = Date.now();
         window.latestNavState = navState;
         window.navigation3D?.onNavState?.(navState);
-        if (data.navigation_session_id &&
-                data.navigation_session_id !== window.currentNavigationSessionId) {
-            window.currentNavigationSessionId = data.navigation_session_id;
-            renderRecentMissions([]);
-        }
+        window.currentNavigationSessionId = data.navigation_session_id ?? null;
         if (currentOpMode === 'MANUAL' && Number.isFinite(data.elapsed_s)) {
             missionElapsedMs = Math.max(0, data.elapsed_s * 1000);
             missionStartedAt = data.goal_active ? Date.now() - missionElapsedMs : 0;

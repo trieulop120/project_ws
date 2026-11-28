@@ -113,10 +113,15 @@ export async function createRobotModel() {
                 const bottomCenter = new THREE.Vector3(rear+PALLET_SIZE.width/2,
                     (left.minY+left.maxY+right.minY+right.maxY)/4,
                     Math.max(left.z,right.z)-underDeck);
+                // In the display, lift readings and rack release heights use the
+                // pallet support plane as their zero. Remove the CAD home offset
+                // from the moving carriage so the fork and load share that datum.
+                const homeSupportZ = bottomCenter.z;
                 cargoAttachment = new THREE.Group();
                 cargoAttachment.position.copy(liftNode.worldToLocal(bottomCenter));
                 cargoAttachment.quaternion.copy(liftNode.getWorldQuaternion(new THREE.Quaternion()).invert());
                 liftNode.add(cargoAttachment);
+                liftNode.position.y -= homeSupportZ;
             }
         }
         return {

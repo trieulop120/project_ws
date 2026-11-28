@@ -37,7 +37,7 @@ from tf2_ros import (Buffer, StaticTransformBroadcaster, TransformBroadcaster,
 
 from aruco_b1_package.anchor_policy import (
     ObservationWindow, acknowledgement_matches, bounded_pose_update,
-    compose_pose, correction_reason, map_odom_from_marker)
+    compose_pose, correction_reason, inverse_pose, map_odom_from_marker)
 
 
 def quat_matrix(q):
@@ -148,6 +148,7 @@ class ArucoB1Localizer(Node):
         # travel segment only. The gate must be refreshed periodically.
         p('mission_gated_detection', True)
         p('mission_enable_topic', '/aruco_b1/enable')
+        p('mission_route_topic', '')  # When set, the supervisor sends owner and grant atomically.
         p('mission_enable_timeout_s', 3.0)
         p('track_hold_s', 1.5)
         p('max_reproj_px', 1.5)
@@ -187,6 +188,10 @@ class ArucoB1Localizer(Node):
         p('moving_anchor_max_step_yaw_deg', 2.0)
         p('moving_anchor_min_interval_s', 5.0)
         p('moving_anchor_retry_interval_s', 5.0)
+        p('placement_anchor_min_xy_m', 0.02)
+        p('placement_anchor_min_yaw_deg', 1.0)
+        p('placement_anchor_min_interval_s', 1.5)
+        p('placement_anchor_ack_cooldown_s', 1.5)
         p('moving_anchor_stationary_linear_mps', 0.02)
         p('moving_anchor_stationary_angular_rps', 0.04)
         p('moving_odom_tf_max_age_s', 0.12)
@@ -231,6 +236,8 @@ class ArucoB1Localizer(Node):
         self.mission_enabled = False
         self.mission_gate_last_wall = -1e30
         self.mission_gate_effective = False
+        self.route = ''
+        self.placement_anchor = None
         dic_name = str(gp('dictionary'))
         if not hasattr(cv2, 'aruco'):
             raise RuntimeError('OpenCV ArUco module missing; install an OpenCV contrib build')
@@ -304,8 +311,11 @@ class ArucoB1Localizer(Node):
         gate_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
                               reliability=ReliabilityPolicy.RELIABLE,
                               durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(Bool, str(gp('mission_enable_topic')),
-                                 self.on_mission_enable, gate_qos)
+        if gp('mission_route_topic'):
+            self.create_subscription(String, gp('mission_route_topic'), self.on_route, gate_qos)
+        else:
+            self.create_subscription(Bool, str(gp('mission_enable_topic')),
+                                     self.on_mission_enable, gate_qos)
         # Avoid even deserializing 30Hz RGB frames while this leg is OFF.
         self.image_sub = None
         self.image_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
@@ -367,18 +377,32 @@ class ArucoB1Localizer(Node):
         self.last_frame_stamp = None
         self.last_quality = {}
         self.last_found_wall = -1e30
-        self.pending_anchor = None
-        self.pending_amcl_ack = None
-        self.last_anchor_result = 'mission_disabled'
+        if self.pending_anchor is None or self.pending_anchor['placement'] is None:
+            self.pending_anchor = None
+            self.pending_amcl_ack = None
+            self.last_anchor_result = 'mission_disabled'
         self.mission_gate_effective = False
 
+    def on_route(self, msg):
+        route = msg.data
+        self._update_gate(route.startswith('placement:') or route == 'retrieval', route)
+
     def on_mission_enable(self, msg):
-        self.mission_enabled = bool(msg.data)
+        self._update_gate(bool(msg.data), '')
+
+    def _update_gate(self, enabled, route):
+        new_leg = not self.mission_gate_effective or route != self.route or not self._gate_open()
+        self.route = route
+        self.mission_enabled = enabled
         self.mission_gate_last_wall = time.monotonic()
         if self._gate_open():
-            if not self.mission_gate_effective:
+            if new_leg:
                 # Start with empty evidence before subscribing to live frames.
                 self._clear_detection_for_gate()
+                self.placement_anchor = (
+                    {'leg': route, 'state': 'no_marker'}
+                    if route.startswith('placement:') else None)
+                self.last_relocalization_accepted = False
                 self.mission_gate_effective = True
                 self.last_detect_wall = -1e30
             self._ensure_image_subscription()
@@ -444,6 +468,7 @@ class ArucoB1Localizer(Node):
         Compare expected poses at the *AMCL message timestamp*, preventing
         robot movement between publish and feedback from looking like a reset.
         """
+        self._check_pending_anchor(time.monotonic())
         pending = self.pending_anchor
         if pending is None or msg.header.frame_id != self.map_frame:
             return
@@ -452,11 +477,14 @@ class ArucoB1Localizer(Node):
         # Save this ACK until the EKF transform at its timestamp arrives.
         # A future-extrapolation error of a few milliseconds is not an ACK
         # failure, nor a reason to reset the confirmation window.
-        self.pending_amcl_ack = msg
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        if stamp < pending['sent_ros'] - float(
-                self.get_parameter('anchor_ack_stamp_slack_s').value):
+        placement = pending['placement']
+        slack = 0.0 if placement is not None else float(
+            self.get_parameter('anchor_ack_stamp_slack_s').value)
+        if (stamp <= 0 or stamp < pending['sent_ros'] - slack
+                or stamp > self.get_clock().now().nanoseconds * 1e-9 + 0.1):
             return
+        self.pending_amcl_ack = msg
         q = msg.pose.pose.orientation
         amcl_pose = (float(msg.pose.pose.position.x),
                      float(msg.pose.pose.position.y),
@@ -475,11 +503,18 @@ class ArucoB1Localizer(Node):
             self.last_correction_ros_time = self.get_clock().now().nanoseconds * 1e-9
             retry_interval = (gp('moving_anchor_retry_interval_s')
                               if pending['bounded'] else gp('anchor_retry_interval_s'))
+            if placement is not None:
+                retry_interval = gp('placement_anchor_ack_cooldown_s')
+                # Use measured AMCL at the ACK timestamp, never the commanded reset.
+                placement.update(state='acknowledged', ack_stamp=stamp,
+                                 odom_map=inverse_pose(map_odom_from_marker(amcl_pose, odom_at_ack)))
             self.retry_block_until = self.last_correction_wall + retry_interval
             self.last_relocalization_accepted = True
             self.last_anchor_result = 'accepted_bounded_step' if pending['bounded'] else 'accepted'
             self.pending_anchor = None
             self.pending_amcl_ack = None
+            self.get_logger().info(f"ArUco AMCL ACK leg={pending['leg']} stamp={stamp:.6f}")
+            self.status(force=True, state='amcl_ack')
 
     def warn_throttled(self, message):
         now = time.monotonic()
@@ -487,9 +522,9 @@ class ArucoB1Localizer(Node):
             self.get_logger().warn(message)
             self.last_error_wall = now
 
-    def status(self, **data):
+    def status(self, force=False, **data):
         now = time.monotonic()
-        if now-self.last_status_wall < 0.4:
+        if not force and now-self.last_status_wall < 0.4:
             return
         self.last_status_wall = now
         out = String()
@@ -506,6 +541,7 @@ class ArucoB1Localizer(Node):
         data.setdefault('queued_images', len(self.image_queue))
         ros_now = self.get_clock().now().nanoseconds * 1e-9
         data.setdefault('marker_detected', self.detected)
+        data['placement_anchor'] = self.placement_anchor
         data.setdefault('confirmed', self.confirmed and self.last_frame_stamp is not None
                         and 0 <= ros_now - self.last_frame_stamp <=
                         float(self.get_parameter('anchor_max_age_s').value))
@@ -517,9 +553,13 @@ class ArucoB1Localizer(Node):
         data.setdefault('correction_mode', self.last_anchor_mode)
         data.setdefault('requested_step_xy_m', self.last_requested_xy_m)
         data.setdefault('requested_step_yaw_deg', self.last_requested_yaw_deg)
-        data.setdefault('relocalization_attempted', self.pending_anchor is not None or
-                        self.last_attempt_stamp > 0)
-        data.setdefault('relocalization_accepted', self.last_relocalization_accepted)
+        if self.placement_anchor is not None:
+            state = self.placement_anchor['state']
+            data['relocalization_attempted'] = state in ('pending', 'ack_timeout', 'acknowledged')
+            data['relocalization_accepted'] = state == 'acknowledged'
+        else:
+            data['relocalization_attempted'] = self.pending_anchor is not None or self.last_attempt_stamp > 0
+            data['relocalization_accepted'] = self.last_relocalization_accepted
         data.setdefault('rejection_reason', None if self.last_anchor_result in
                         ('accepted', 'accepted_bounded_step', 'anchor_sent') else self.last_anchor_result)
         data.setdefault('last_correction_time', None if self.last_correction_wall is None
@@ -706,6 +746,9 @@ class ArucoB1Localizer(Node):
 
     def tick(self):
         now = time.monotonic()
+        self._check_pending_anchor(now)
+        if self.pending_amcl_ack is not None:
+            self.on_amcl_pose(self.pending_amcl_ack)
         if not self._gate_open():
             self._remove_image_subscription()
             if self.mission_gate_effective:
@@ -718,9 +761,6 @@ class ArucoB1Localizer(Node):
             self._clear_detection_for_gate()
             self.mission_gate_effective = True
             self.last_detect_wall = -1e30
-        self._check_pending_anchor(now)
-        if self.pending_anchor is not None and self.pending_amcl_ack is not None:
-            self.on_amcl_pose(self.pending_amcl_ack)
         active = now-self.last_found_wall < float(self.get_parameter('track_hold_s').value)
         hz = self.track_hz if active else self.search_hz
         if now-self.last_detect_wall < 1.0/hz:
@@ -822,6 +862,8 @@ class ArucoB1Localizer(Node):
                 self._publish_debug_image(bgr, msg.header, 'SEARCHING')
                 return
             self.detected = True
+            if self.placement_anchor and self.placement_anchor['state'] == 'no_marker':
+                self.placement_anchor['state'] = 'marker_seen'
             self.last_frame_stamp = image_stamp
             side = float(np.mean(np.linalg.norm(corners-np.roll(corners,-1,axis=0),axis=1)))
             if side < float(self.get_parameter('min_edge_px').value):
@@ -910,10 +952,14 @@ class ArucoB1Localizer(Node):
         if (self.pending_anchor is not None and
                 now - self.pending_anchor['sent_wall'] >
                 float(self.get_parameter('anchor_ack_timeout_s').value)):
+            placement = self.pending_anchor['placement']
+            if placement is not None:
+                placement['state'] = 'ack_timeout'
             self.pending_anchor = None
             self.pending_amcl_ack = None
             self.last_anchor_result = 'amcl_ack_timeout'
             self.retry_block_until = now + float(self.get_parameter('anchor_retry_interval_s').value)
+            self.status(force=True, state='amcl_ack_timeout')
 
     def _maybe_update_amcl(self, pose, now):
         if not self._gate_open():
@@ -1017,12 +1063,18 @@ class ArucoB1Localizer(Node):
 
         # A stopped robot can still be inside a pallet operation. Without a
         # reliable mission-idle signal, never assume a large reset is safe.
-        bounded = moving or not bool(self.get_parameter('allow_full_stationary_reset').value)
+        placement = self.placement_anchor if self.route.startswith('placement:') else None
+        bounded = (placement is not None or moving
+                   or not bool(self.get_parameter('allow_full_stationary_reset').value))
         min_interval = (gp('moving_anchor_min_interval_s') if bounded
                         else gp('anchor_min_interval_s'))
+        min_xy, min_yaw = gp('anchor_min_xy_m'), gp('anchor_min_yaw_deg')
+        if placement is not None:
+            min_interval = gp('placement_anchor_min_interval_s')
+            min_xy, min_yaw = gp('placement_anchor_min_xy_m'), gp('placement_anchor_min_yaw_deg')
         reason = correction_reason(
             error_xy, error_yaw_deg, age_s, now - self.last_anchor_wall,
-            gp('anchor_min_xy_m'), gp('anchor_min_yaw_deg'),
+            min_xy, min_yaw,
             gp('anchor_max_xy_m'), gp('anchor_max_yaw_deg'),
             gp('anchor_max_age_s'), min_interval,
             strong_confirmation=strong)
@@ -1070,7 +1122,12 @@ class ArucoB1Localizer(Node):
         self.last_anchor_wall = now
         self.last_attempt_stamp = image_stamp
         self.pending_amcl_ack = None
+        if placement is not None:
+            placement = self.placement_anchor = {
+                'leg': self.route, 'state': 'pending', 'image_stamp': image_stamp,
+                'map_frame': self.map_frame, 'odom_frame': self.odom_frame}
         self.pending_anchor = {
+            'leg': self.route, 'placement': placement,
             'sent_wall': now,
             'sent_ros': self.get_clock().now().nanoseconds * 1e-9,
             'map_odom': requested_map_odom,
@@ -1083,6 +1140,7 @@ class ArucoB1Localizer(Node):
         self.last_requested_yaw_deg = step_actual_yaw
         self.last_relocalization_accepted = False
         self.last_anchor_result = 'anchor_sent'
+        self.status(force=True, state='anchor_sent')
         self.get_logger().info(
             'ArUco B1 -> AMCL (%s): full_delta=%.3fm/%.1fdeg; request=%.3fm/%.1fdeg' %
             (mode, error_xy, error_yaw_deg, step_actual_xy, step_actual_yaw))

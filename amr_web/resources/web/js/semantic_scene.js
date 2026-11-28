@@ -151,6 +151,41 @@ export function createSemanticScene(scene, onChange, hasMapPose = () => false) {
 
     const palletMeshes = new Map();
     let carriedPallets = [];
+    let transfer = null;
+    let shownLift = null;
+
+    function forkPose() {
+        attachment.getWorldPosition(carriedPosition);
+        attachment.getWorldQuaternion(carriedRotation);
+        const {x, y, z} = carriedPosition;
+        const yaw = carriedEuler.setFromQuaternion(carriedRotation, 'ZYX').z;
+        return {x, y, z, yaw};
+    }
+
+    function updateTransfer() {
+        if (!transfer) return;
+        const {pallet, mesh, motion, support} = transfer;
+        const picking = motion.action === 'pick_backoff';
+        mesh.visible = hasMapPose() || picking;
+        if (!hasMapPose()) {
+            transfer.pose = support;
+        } else {
+            const fork = composePose(forkPose(), pallet.offset);
+            const h = shownLift ?? motion.height_m;
+            const progress = THREE.MathUtils.clamp((h-motion.start_m)/(motion.goal_m-motion.start_m), 0, 1);
+            const weight = picking ? progress : 1-progress;
+            const angle = fork.yaw-support.yaw;
+            // The deck rises on contact with the tines and rests on the shelf
+            // once the tines descend below it. Both are in map coordinates.
+            transfer.pose = {
+                x: THREE.MathUtils.lerp(support.x, fork.x, weight),
+                y: THREE.MathUtils.lerp(support.y, fork.y, weight),
+                z: Math.max(support.z, fork.z),
+                yaw: support.yaw + weight*Math.atan2(Math.sin(angle), Math.cos(angle)),
+            };
+        }
+        place(mesh, transfer.pose);
+    }
     function renderCargo() {
         for (const [id, surface] of slotSurfaces) {
             const state = warehouse?.slots?.[id];
@@ -160,6 +195,7 @@ export function createSemanticScene(scene, onChange, hasMapPose = () => false) {
         cargoFootprints = [];
         cargoVolumes = [];
         carriedPallets = [];
+        transfer = null;
         const active = new Set();
         fitIssues = [];
         for (const candidate of visiblePallets()) {
@@ -167,7 +203,16 @@ export function createSemanticScene(scene, onChange, hasMapPose = () => false) {
             fitIssues.push(...issues);
             if (!pallet) continue;
             const carried = pallet.state === 'carried';
-            const root = carried ? attachment : cargoRoot;
+            const motion = warehouse?.lift_transfer;
+            let support = null;
+            if (attachment && motion && motion.id === pallet.id) {
+                if (motion.action === 'pick_backoff' && pallet.selected) support = pallet.pose;
+                if (motion.action === 'drop_release' && carried) {
+                    support = layout.objects.filter(obj => obj.type === 'rack')
+                        .flatMap(rack => rack.slots).find(slot => slot.shelf_slot_id === motion.slot);
+                }
+            }
+            const root = carried && !support ? attachment : cargoRoot;
             active.add(pallet.id);
             let existing = palletMeshes.get(pallet.id);
             // A slow GLB load can delay attachment, without leaving the
@@ -194,7 +239,11 @@ export function createSemanticScene(scene, onChange, hasMapPose = () => false) {
             updateCartons(mesh, boxes, pallet);
             if (mesh.parent !== root) root.add(mesh);
             place(mesh, carried ? pallet.offset : pallet.pose);
-            if (carried) {
+            mesh.visible = true;
+            if (support) {
+                transfer = {pallet, mesh, support, motion};
+                updateTransfer();
+            } else if (carried) {
                 carriedPallets.push(pallet);
             } else {
                 const parts = palletFootprints(pallet, pallet.pose);
@@ -222,13 +271,16 @@ export function createSemanticScene(scene, onChange, hasMapPose = () => false) {
     }
 
     function carriedFootprints(robotVisible) {
-        if (!robotVisible || !attachment || !carriedPallets.length) return [];
-        attachment.getWorldPosition(carriedPosition);
-        attachment.getWorldQuaternion(carriedRotation);
-        const {x, y, z} = carriedPosition;
-        const yaw = carriedEuler.setFromQuaternion(carriedRotation, 'ZYX').z;
-        return carriedPallets.map(pallet =>
-            palletFootprints(pallet, composePose({x, y, z, yaw}, pallet.offset), true));
+        const parts = [];
+        if (transfer?.mesh.visible && (robotVisible || !hasMapPose() && transfer.pallet.selected)) {
+            parts.push(palletFootprints(transfer.pallet, transfer.pose, true));
+        }
+        if (robotVisible && attachment && carriedPallets.length) {
+            const fork = forkPose();
+            parts.push(...carriedPallets.map(pallet =>
+                palletFootprints(pallet, composePose(fork, pallet.offset), true)));
+        }
+        return parts;
     }
 
     function getFootprints(robotVisible) {
@@ -315,10 +367,7 @@ export function createSemanticScene(scene, onChange, hasMapPose = () => false) {
         if (!carried?.run || !attachment || !hasMapPose()) return;
         const pallet = carriedPallets.find(item => item.id === carried.id);
         if (!pallet) return;
-        attachment.getWorldPosition(carriedPosition);
-        attachment.getWorldQuaternion(carriedRotation);
-        const {x, y, z} = carriedPosition;
-        const yaw = carriedEuler.setFromQuaternion(carriedRotation, 'ZYX').z;
+        const {x,y,z,yaw} = forkPose();
         if (![x,y,z,yaw].every(Number.isFinite)) return;
         if (!forkTrack || forkTrack.run !== carried.run || forkTrack.pallet.id !== pallet.id) {
             forkTrack = {run:carried.run, pallet, samples:[]};
@@ -394,7 +443,9 @@ export function createSemanticScene(scene, onChange, hasMapPose = () => false) {
         return true;
     }
 
-    function tick(now) {
+    function tick(now, liftMeters = null) {
+        shownLift = liftMeters;
+        updateTransfer();
         if (floorRelease && now >= floorRelease.deadline) expireFloorRelease();
         if (!warehouse && forkTrack && now - forkTrack.samples.at(-1).at >= releaseWindowMs) forkTrack = null;
         rememberForkPose(now);
@@ -413,5 +464,5 @@ export function createSemanticScene(scene, onChange, hasMapPose = () => false) {
 
     return {setLayout, setState, setWarehouse, setRobotAttachment, getFootprints, getCloudFootprints,
             getFitIssues: () => fitIssues,
-            hasCarried: () => carriedPallets.length > 0, tick, dispose};
+            hasCarried: () => carriedPallets.length > 0 || !!transfer, tick, dispose};
 }

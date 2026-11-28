@@ -146,4 +146,13 @@ def acknowledgement_matches(observed, before, requested, max_xy_m, max_yaw_deg):
                 if desired_xy >= 0.025 else max_xy_m)
     yaw_limit = (min(max_yaw_deg, max(0.6, 0.45 * desired_yaw_deg))
                  if desired_yaw_deg >= 0.7 else max_yaw_deg)
+    # Small residuals on the placement leg can be below both noise cutoffs.
+    # Require progress on the dominant component even for these requests.
+    if desired_xy < 0.025 and desired_yaw_deg < 0.7:
+        if desired_xy == 0 and desired_yaw_deg == 0:
+            return False
+        if desired_xy / 0.025 >= desired_yaw_deg / 0.7:
+            xy_limit = min(xy_limit, 0.45 * desired_xy)
+        else:
+            yaw_limit = min(yaw_limit, 0.45 * desired_yaw_deg)
     return error_xy <= xy_limit and error_yaw <= yaw_limit

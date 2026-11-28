@@ -447,6 +447,11 @@ function handleCommandResponse(d) {
 
     console.log('Command response:', cmd, status, message);
 
+    if (cmd && cmd.startsWith('llm_')) {
+        window.handleLLMCommandResponse?.(d);
+        return;
+    }
+
     if (cmd && cmd.startsWith('mission_cycle_')) {
         if (d.handled_by_request && window.autoMissionRequest?.command === cmd) return;
         if (typeof window.handleMissionCycleCommandResponse === 'function') {
